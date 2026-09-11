@@ -1,7 +1,7 @@
 +++
 date = '2026-09-11T20:56:46+08:00'
-draft = true
-title = 'Two_note'
+draft = false
+title = 'one_note'
 +++
 # 我的 Hugo 博客搭建记录
 
