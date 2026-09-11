@@ -1,0 +1,52 @@
+baseURL = 'https://rainanow.github.io/'
+locale = 'zh-cn'
+title = '雨落的小屋'
+theme = "PaperMod"
+
+[params]
+  # --- 基础信息 ---
+  author = "雨落"                     # 文章和 RSS 中显示的作者名 [citation:1][citation:9]
+  description = "存放一些日志"            # 用于 SEO 和社交分享
+  
+  # --- 明暗模式 ---
+  defaultTheme = "auto"                 # "auto"(跟随系统), "light"(强制浅色), "dark"(强制深色) [citation:4][citation:5]
+  disableThemeToggle = false            # 是否隐藏“明暗切换”按钮，true 为隐藏 [citation:9][citation:10]
+  
+  # --- 文章列表与详情页 ---
+  ShowReadingTime = true                # 显示预估阅读时长 [citation:7][citation:9]
+  ShowShareButtons = false               # 显示社交分享按钮 [citation:9]
+  ShowPostNavLinks = true               # 文章底部显示“上一篇/下一篇”导航 [citation:9]
+  ShowBreadCrumbs = true                # 显示面包屑导航（如：首页 > 文章 > xxx） [citation:9]
+  ShowCodeCopyButtons = true            # 代码块右上角显示“复制”按钮 [citation:7][citation:9]
+  ShowToc = true                        # 为文章自动生成目录（需在文章 front matter 中也可单独控制） [citation:8][citation:9]
+  comments = false                      # 是否启用评论，需要配合第三方评论系统 [citation:9]
+  socialIcons = [
+    { name = "github", url = "https://github.com/rainanow" }
+  ]
+
+  # 首页模式
+  profileMode = {
+    enabled = true,
+    title = "雨落",
+    imageUrl = "/img/touxiang.jpg",
+    imageWidth = 120,
+    imageHeight = 120,
+    buttons = [
+      { name = "文章", url = "/posts" },
+      { name = "关于", url = "/about" }
+    ]
+  }
+
+[menu]
+  [[menu.main]]
+    name = "文章"
+    url = "/posts/"
+    weight = 10
+  [[menu.main]]
+    name = "标签"
+    url = "/tags/"
+    weight = 20
+  [[menu.main]]
+    name = "关于"
+    url = "/about/"
+    weight = 30
