@@ -1,8 +1,9 @@
----
-title: 搭建博客
-date: 2026-09-11 8:50:29
-tags: 折腾
----
++++
+title = 'hello word'
+date = 2026-09-10
+draft = false
+tags = ["折腾"]
++++
 
 ### 第一阶段：本地环境准备
 - 安装 **Node.js**（验证 `node -v` 正常）
