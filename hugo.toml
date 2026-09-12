@@ -1,4 +1,4 @@
-baseURL = 'https://rainanow.github.io/'
++baseURL = 'https://rainanow.github.io/'
 locale = 'zh-cn'
 title = '雨落的小屋'
 theme = "PaperMod"
@@ -14,7 +14,7 @@ theme = "PaperMod"
   
   # --- 文章列表与详情页 ---
   ShowReadingTime = true                # 显示预估阅读时长 [citation:7][citation:9]
-  ShowShareButtons = false               # 显示社交分享按钮 [citation:9]
+  ShowShareButtons = false              # 显示社交分享按钮 [citation:9]
   ShowPostNavLinks = true               # 文章底部显示“上一篇/下一篇”导航 [citation:9]
   ShowBreadCrumbs = true                # 显示面包屑导航（如：首页 > 文章 > xxx） [citation:9]
   ShowCodeCopyButtons = true            # 代码块右上角显示“复制”按钮 [citation:7][citation:9]
@@ -37,16 +37,30 @@ theme = "PaperMod"
     ]
   }
 
+  [params.busuanzi]
+    enable = true
+
 [menu]
   [[menu.main]]
     name = "文章"
     url = "/posts/"
     weight = 10
   [[menu.main]]
+    name = "归档"
+    url = "/archives/"
+    weight = 20
+  [[menu.main]]
     name = "标签"
     url = "/tags/"
-    weight = 20
+    weight = 30
+  [[menu.main]]
+    name = "搜索"
+    url = "/search/"
+    weight = 40
   [[menu.main]]
     name = "关于"
     url = "/about/"
-    weight = 30
+    weight = 50
+
+[minify]
+  minifyOutput = true
