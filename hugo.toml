@@ -1,4 +1,4 @@
-+baseURL = 'https://rainanow.github.io/'
+baseURL = 'https://rainanow.github.io/'
 locale = 'zh-cn'
 title = '雨落的小屋'
 theme = "PaperMod"
@@ -64,3 +64,6 @@ theme = "PaperMod"
 
 [minify]
   minifyOutput = true
+
+[outputs]
+  home = ["HTML", "RSS", "JSON"]

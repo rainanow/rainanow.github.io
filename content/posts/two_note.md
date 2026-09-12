@@ -2,6 +2,7 @@
 date = '2026-09-11T20:56:46+08:00'
 draft = false
 title = 'one_note'
+tags = ["折腾"]
 +++
 # 我的 Hugo 博客搭建记录
 
