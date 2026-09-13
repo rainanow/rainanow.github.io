@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <title>雨落的小屋</title>
+  <!-- Safari 固定标签页图标（monochrome mask）：颜色由 Safari 自行着色，这里只需形状 -->
+  <path fill="#000000" d="M14 20h72v10h-31v10h25v10h-25v10h25v10h-25v14a6 6 0 0 1-12 0v-14h-25v-10h25v-10h-25v-10h25v-10h-29z"/>
+</svg>

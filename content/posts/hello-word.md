@@ -1,19 +1,21 @@
 +++
-title = 'hello word'
+title = 'Hello World'
 date = 2026-09-10
 draft = false
 tags = ["折腾"]
 +++
 
 ### 第一阶段：本地环境准备
-- 安装 **Node.js**（验证 `node -v` 正常）
+- 安装 **Node.js**（用 `node -v` 验证是否正常）
 - 安装 **Git**（用 `git --version` 验证，注意是两个短横线）
+
+<!--more-->
 
 ### 第二阶段：本地搭建 Hexo
 - 全局安装 Hexo 命令行工具：`npm install -g hexo-cli`
 - 初始化博客：`hexo init my-blog`（中途 GitHub 连接失败，Hexo 自动用了备用方案）
 - 安装依赖：`npm install`
-- 本地预览：`hexo server`，浏览器访问 `http://localhost:4000` 成功
+- 本地预览：`hexo server`，浏览器访问 `http://localhost:4000`，成功
 - 把博客文件夹挪到 `c:\Users\rain\Documents\blog`，并改了名字
 
 ### 第三阶段：创建 GitHub 仓库
@@ -35,7 +37,7 @@ tags = ["折腾"]
   - 底部 `deploy` 部分改成 git 类型，指向你的仓库
 - 配置 Git 身份：`git config --global user.name` 和 `user.email`
 - 一键部署：`hexo clean && hexo g && hexo d`
-- 访问 `https://rainanow.github.io` 成功
+- 访问 `https://rainanow.github.io`，成功
 
 ### 📌 过程中踩过的坑
 | 问题 | 原因 | 解决 |
@@ -55,4 +57,4 @@ hexo clean && hexo g && hexo d    # 一键发布
 
 ---
 
-整个过程你从完全不懂，到最后有了一个可以访问的线上博客。接下来如果还想优化，可以考虑换主题、绑域名、加评论系统，随时可以继续。
+整个过程我从完全不懂，到最后有了一个可以访问的线上博客。接下来如果还想优化，可以考虑换主题、绑域名、加评论系统，随时可以继续。

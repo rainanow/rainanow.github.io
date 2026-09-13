@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="雨落的小屋">
+  <title>雨落的小屋</title>
+  <rect width="64" height="64" rx="14" fill="#1f6feb"/>
+  <text x="32" y="32" text-anchor="middle" dominant-baseline="central"
+        font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Noto Sans SC, sans-serif"
+        font-size="42" font-weight="600" fill="#ffffff">雨</text>
+</svg>

@@ -1,33 +1,68 @@
-baseURL = 'https://rainanow.github.io/'
-locale = 'zh-cn'
+baseURL = 'https://yulo.top/'
 title = '雨落的小屋'
 theme = "PaperMod"
+defaultContentLanguage = 'zh'
+
+# 中文分词：Hugo 默认按「空格」数词，中文没有空格，会把整篇日记当成 1 个词，
+# 于是「阅读时长」永远显示 1 分钟（实测：打开后同一篇从 1 分钟变成 2 分钟）。
+# 注意：这个开关只修阅读时长/字数，不修列表页摘要——摘要要用 <!--more--> 控制。
+hasCJKLanguage = true
+
+# 语言设置：key 必须是 zh，才能匹配 PaperMod 的 i18n/zh.yaml
+# （主题没有 zh-cn.yaml，之前 locale='zh-cn' 导致界面全是英文）
+[languages]
+  [languages.zh]
+    languageCode = 'zh-CN'
+    languageName = '简体中文'
+    locale = 'zh-cn'
+    title = '雨落的小屋'
+    weight = 1
 
 [params]
   # --- 基础信息 ---
-  author = "雨落"                     # 文章和 RSS 中显示的作者名 [citation:1][citation:9]
+  author = "雨落"                        # 文章和 RSS 中显示的作者名
   description = "存放一些日志"            # 用于 SEO 和社交分享
-  
+  DateFormat = "2006年1月2日"            # 日期显示格式，不写会显示英文 September 10, 2026
+  images = ["/img/touxiang.jpg"]         # 分享到微信/QQ/Twitter 时的默认缩略图（og:image）
+
   # --- 明暗模式 ---
-  defaultTheme = "auto"                 # "auto"(跟随系统), "light"(强制浅色), "dark"(强制深色) [citation:4][citation:5]
-  disableThemeToggle = false            # 是否隐藏“明暗切换”按钮，true 为隐藏 [citation:9][citation:10]
-  
+  defaultTheme = "auto"                 # "auto"(跟随系统), "light"(强制浅色), "dark"(强制深色)
+  disableThemeToggle = false            # 是否隐藏“明暗切换”按钮，true 为隐藏
+
   # --- 文章列表与详情页 ---
-  ShowReadingTime = true                # 显示预估阅读时长 [citation:7][citation:9]
-  ShowShareButtons = false              # 显示社交分享按钮 [citation:9]
-  ShowPostNavLinks = true               # 文章底部显示“上一篇/下一篇”导航 [citation:9]
-  ShowBreadCrumbs = true                # 显示面包屑导航（如：首页 > 文章 > xxx） [citation:9]
-  ShowCodeCopyButtons = true            # 代码块右上角显示“复制”按钮 [citation:7][citation:9]
-  ShowToc = true                        # 为文章自动生成目录（需在文章 front matter 中也可单独控制） [citation:8][citation:9]
-  comments = false                      # 是否启用评论，需要配合第三方评论系统 [citation:9]
+  ShowReadingTime = true                # 显示预估阅读时长
+  ShowWordCount = true                  # 显示字数（中文按字计，比阅读时长更有参考价值）
+  ShowShareButtons = false              # 显示社交分享按钮
+  ShowPostNavLinks = true               # 文章底部显示“上一篇/下一篇”导航
+  ShowBreadCrumbs = true                # 显示面包屑导航（如：首页 > 文章 > xxx）
+  ShowCodeCopyButtons = true            # 代码块右上角显示“复制”按钮
+  ShowToc = true                        # 为文章自动生成目录（单篇文章可在 front matter 里覆盖）
+  comments = true                       # 启用评论（具体渲染见 layouts/partials/comments.html）
   socialIcons = [
-    { name = "github", url = "https://github.com/rainanow" }
+    { name = "github", url = "https://github.com/rainanow" },
+    { name = "bilibili", url = "https://space.bilibili.com/3546734554778324" },
+    { name = "email", url = "mailto:2418331674@qq.com" },
+    { name = "rss", url = "/index.xml" }
   ]
+
+  # --- 结构化数据（SEO）---
+  schema = { publisherType = "Person" } # 个人博客，告诉搜索引擎这是「人」而不是「组织」
+
+  # --- 站点图标 ---
+  # 主题原版固定输出 5 条图标链接，这里主图标换成 SVG，其余 4 个文件也已补齐，不再有 404。
+  assets = { favicon = "/favicon.svg" }
+
+  # --- 文章底部「编辑本文」链接 ---
+  editPost = {
+    URL = "https://github.com/rainanow/rainanow.github.io/edit/main/content",
+    appendFilePath = true               # 自动拼上文章的 md 路径，点进去就是 GitHub 网页编辑器
+  }
 
   # 首页模式
   profileMode = {
     enabled = true,
     title = "雨落",
+    subtitle = "喜欢数码，热爱生活，喜欢到处乱逛",
     imageUrl = "/img/touxiang.jpg",
     imageWidth = 120,
     imageHeight = 120,
@@ -39,6 +74,21 @@ theme = "PaperMod"
 
   [params.busuanzi]
     enable = true
+
+  # --- Giscus 评论（基于仓库的 GitHub Discussions）---
+  # repoId 取自 https://api.github.com/repos/rainanow/rainanow.github.io 的 node_id
+  # categoryId 对应仓库 Discussions 里的 "General" 分类，如需换分类可在
+  #   GitHub 仓库 → Discussions → 分类右侧编辑，或访问 https://giscus.app 自动生成配置
+  [params.giscus]
+    enable = true
+    repo = "rainanow/rainanow.github.io"
+    repoId = "R_kgDOUU9-cg"
+    category = "General"
+    categoryId = "DIC_kwDOUU9-cs4Cw2w5"
+    mapping = "pathname"                  # 用页面路径关联评论
+    reactionsEnabled = "1"                # 允许表情回应
+    inputPosition = "bottom"              # 评论框放在评论列表下方
+    theme = "preferred_color_scheme"      # 跟随系统明暗模式
 
 [menu]
   [[menu.main]]
@@ -62,8 +112,35 @@ theme = "PaperMod"
     url = "/about/"
     weight = 50
 
+# 代码高亮：noClasses = false 让 Hugo 输出 class 而不是内联样式，
+# 这样代码配色才会跟着明暗模式切换（默认的内联样式会把颜色写死成 Monokai 深色）。
+# 配色直接复用 PaperMod 自带的 chroma 样式表，不需要额外下载或配置。
+[markup]
+  [markup.highlight]
+    noClasses = false
+
 [minify]
   minifyOutput = true
 
 [outputs]
   home = ["HTML", "RSS", "JSON"]
+
+# --- 博客还在测试期，先不启用；以后想开就把上面那行换成下面这行 ---
+# 说明：Hugo 不会平白生成这两个文件——主题里虽然自带模板，
+#       但必须在 outputs 里显式声明对应的输出格式，才会渲染出来。
+#
+#   home = ["HTML", "RSS", "JSON", "robotsTXT", "LLMS"]
+#
+# 同时还要在文件末尾追加这两种自定义输出格式（Hugo 没有内置它们）：
+#
+# [outputFormats.robotsTXT]
+#   mediaType = "text/plain"
+#   baseName = "robots"
+#   isPlainText = true
+#   notAlternative = true
+#
+# [outputFormats.LLMS]
+#   mediaType = "text/plain"
+#   baseName = "llms"
+#   isPlainText = true
+#   notAlternative = true

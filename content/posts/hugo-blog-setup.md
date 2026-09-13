@@ -1,10 +1,10 @@
 +++
-date = '2026-09-11T20:56:46+08:00'
+date = '2026-09-12T20:56:46+08:00'
 draft = false
-title = 'one_note'
+title = '我的 Hugo 博客搭建记录'
 tags = ["折腾"]
+categories = ["折腾"]
 +++
-# 我的 Hugo 博客搭建记录
 
 ## 🎯 最终成果
 
@@ -18,6 +18,8 @@ tags = ["折腾"]
 | **部署方式** | GitHub Actions 自动构建 |
 | **本地路径** | `C:\Users\rain\Documents\yulo` |
 
+<!--more-->
+
 ---
 
 ## 📖 我是怎么一步步搭起来的
@@ -28,8 +30,8 @@ tags = ["折腾"]
 
 ### 2. 创建站点
 
-```cmd
-cd /d C:\Users\rain\Documents\yulo
+```powershell
+cd C:\Users\rain\Documents\yulo
 hugo new site . --force
 ```
 
@@ -37,7 +39,7 @@ hugo new site . --force
 
 选的是 PaperMod，因为用的人多、文档全、遇到问题好搜。
 
-```cmd
+```bash
 git init
 git submodule add https://gitee.com/hitweston/paper-mod.git themes/PaperMod
 ```
@@ -54,7 +56,7 @@ git submodule add https://gitee.com/hitweston/paper-mod.git themes/PaperMod
 
 ### 5. 写文章
 
-```cmd
+```bash
 hugo new content content/posts/文章名.md
 ```
 
@@ -62,7 +64,7 @@ hugo new content content/posts/文章名.md
 
 ### 6. 本地预览
 
-```cmd
+```bash
 hugo server -D
 ```
 
@@ -70,7 +72,7 @@ hugo server -D
 
 ### 7. 推送到 GitHub
 
-```cmd
+```bash
 git add . && git commit -m "first commit" && git branch -M main && git remote add origin git@github.com:rainanow/rainanow.github.io.git && git push -u origin main
 ```
 
@@ -82,7 +84,7 @@ git add . && git commit -m "first commit" && git branch -M main && git remote ad
 
 ### 9. 绑定自己的域名
 
-- 在 `yulo/static/` 下建了个 `CNAME` 文件，里面只写我的域名
+- 在 `static/` 下建了个 `CNAME` 文件，里面只写我的域名
 - 在 GitHub 仓库 `Settings` → `Pages` → Custom domain 填上域名
 - 去域名平台加了 4 条 A 记录和 1 条 CNAME 记录
 - 等 DNS 生效后勾了 **Enforce HTTPS**
@@ -91,13 +93,13 @@ git add . && git commit -m "first commit" && git branch -M main && git remote ad
 
 ## ✍️ 我以后怎么发文章
 
-```cmd
+```bash
 hugo new content content/posts/新文章.md
 ```
 
 编辑保存后：
 
-```cmd
+```bash
 git add . && git commit -m "发布新文章" && git push
 ```
 
@@ -114,7 +116,7 @@ git add . && git commit -m "发布新文章" && git push
 | **Git Submodule** | 主题用子模块方式装，以后更新方便 |
 | **GitHub Actions** | 我 push 之后，GitHub 自动帮我构建部署，不用本地手动生成 |
 | **CNAME** | 告诉 GitHub 我的自定义域名是什么 |
-| **DNS 解析** | A 记录指向 GitHub 的 IP，CNAME 指向 `rainanow.github.io` |
+| **DNS 解析** | A 记录指向 GitHub 的 IP，CNAME 指向 `rainanow.github.io`，最后再把自定义域名填进 `baseURL` |
 
 ---
 

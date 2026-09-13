@@ -1,0 +1,27 @@
+{{- /*
+  Giscus 评论（基于 GitHub Discussions）
+  配置位于 hugo.toml 的 [params.giscus]
+  想关掉评论：hugo.toml 里把 comments 改成 false；
+  想单独关掉某一篇：在那篇的 front matter 里加 comments = false
+*/ -}}
+{{- if site.Params.giscus.enable -}}
+  {{- $g := site.Params.giscus -}}
+  <div class="giscus-wrapper" style="margin-top:2rem">
+    <script src="https://giscus.app/client.js"
+            data-repo="{{ $g.repo }}"
+            data-repo-id="{{ $g.repoId }}"
+            data-category="{{ $g.category }}"
+            data-category-id="{{ $g.categoryId }}"
+            data-mapping="{{ $g.mapping | default "pathname" }}"
+            data-strict="{{ $g.strict | default "0" }}"
+            data-reactions-enabled="{{ $g.reactionsEnabled | default "1" }}"
+            data-emit-metadata="0"
+            data-input-position="{{ $g.inputPosition | default "bottom" }}"
+            data-theme="{{ $g.theme | default "preferred_color_scheme" }}"
+            data-lang="zh-CN"
+            data-loading="lazy"
+            crossorigin="anonymous"
+            async>
+    </script>
+  </div>
+{{- end -}}
