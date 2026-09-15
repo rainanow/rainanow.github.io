@@ -1,8 +1,9 @@
 +++
-title = 'Hello World'
 date = 2026-09-10
 draft = false
-tags = ["折腾"]
+title = 'hexo 折腾记录'
+tags = ["博客"]
+categories = ["技术"]
 +++
 
 ### 第一阶段：本地环境准备

@@ -22,8 +22,8 @@
 {{- end }}
 {{- end }}
 
-{{- if .Site.Params.busuanzi.enable -}}
-{{- $scratch.Add "meta" (slice (printf "<span id='busuanzi_container_page_pv'>本文阅读量 <span id='busuanzi_value_page_pv'></span> 次</span>")) }}
+{{- if .Site.Params.vercount.enable -}}
+{{- $scratch.Add "meta" (slice (printf "<span id='vercount_container_page_pv'>本文阅读量 <span id='vercount_value_page_pv'>Loading</span> 次</span>")) }}
 {{- end }}
 
 {{- with ($scratch.Get "meta") }}

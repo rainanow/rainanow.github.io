@@ -12,9 +12,8 @@ hasCJKLanguage = true
 # （主题没有 zh-cn.yaml，之前 locale='zh-cn' 导致界面全是英文）
 [languages]
   [languages.zh]
-    languageCode = 'zh-CN'
-    languageName = '简体中文'
-    locale = 'zh-cn'
+    label = '简体中文'
+    locale = 'zh-CN'
     title = '雨落的小屋'
     weight = 1
 
@@ -62,7 +61,7 @@ hasCJKLanguage = true
   profileMode = {
     enabled = true,
     title = "雨落",
-    subtitle = "喜欢数码，热爱生活，喜欢到处乱逛",
+    subtitle = "所念即所达",
     imageUrl = "/img/touxiang.jpg",
     imageWidth = 120,
     imageHeight = 120,
@@ -72,7 +71,7 @@ hasCJKLanguage = true
     ]
   }
 
-  [params.busuanzi]
+  [params.vercount]
     enable = true
 
   # --- Giscus 评论（基于仓库的 GitHub Discussions）---
@@ -107,10 +106,6 @@ hasCJKLanguage = true
     name = "搜索"
     url = "/search/"
     weight = 40
-  [[menu.main]]
-    name = "关于"
-    url = "/about/"
-    weight = 50
 
 # 代码高亮：noClasses = false 让 Hugo 输出 class 而不是内联样式，
 # 这样代码配色才会跟着明暗模式切换（默认的内联样式会把颜色写死成 Monokai 深色）。

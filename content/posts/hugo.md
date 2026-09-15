@@ -1,9 +1,9 @@
 +++
 date = '2026-09-12T20:56:46+08:00'
 draft = false
-title = '我的 Hugo 博客搭建记录'
-tags = ["折腾"]
-categories = ["折腾"]
+title = 'Hugo 折腾记录'
+tags = ["博客"]
+categories = ["技术"]
 +++
 
 ## 🎯 最终成果
