@@ -39,9 +39,9 @@ hasCJKLanguage = true
   comments = true                       # 启用评论（具体渲染见 layouts/partials/comments.html）
   socialIcons = [
     { name = "github", url = "https://github.com/rainanow" },
-    { name = "bilibili", url = "https://space.bilibili.com/3546734554778324" },
-    { name = "email", url = "mailto:2418331674@qq.com" },
-    { name = "rss", url = "/index.xml" }
+    #{ name = "bilibili", url = "https://space.bilibili.com/3546734554778324" },
+    #{ name = "email", url = "mailto:2418331674@qq.com" },
+    #{ name = "rss", url = "/index.xml" }
   ]
 
   # --- 结构化数据（SEO）---
