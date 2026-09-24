@@ -38,6 +38,18 @@ jobs:
       - name: Setup Pages
         id: pages
         uses: actions/configure-pages@v5
+      
+      - name: Checkout wiki source
+        uses: actions/checkout@v4
+        with:
+          repository: rainanow/wiki
+          token: ${{ secrets.WIKI_REPO_TOKEN }}
+          path: wiki-source
+
+      - name: Copy wiki into content
+        run: |
+          mkdir -p content/posts/wiki
+          cp -r wiki-source/*.md content/posts/wiki/
 
       - name: Build with Hugo
         env:
@@ -47,6 +59,13 @@ jobs:
           hugo \
             --minify \
             --baseURL "${{ steps.pages.outputs.base_url }}/"
+      
+      - name: Encrypt wiki
+        run: |
+          npm install -g staticrypt
+          staticrypt public/posts/wiki/ -r -p "${{ secrets.WIKI_PASSWORD }}"
+          cp -r public/posts/wiki/encrypted/* public/posts/wiki/
+          rm -rf public/posts/wiki/encrypted
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
