@@ -50,6 +50,23 @@ jobs:
         run: |
           mkdir -p content/posts/wiki
           cp -r wiki-source/*.md content/posts/wiki/
+          # 生成的 _index.md：wiki 页面照常渲染，但不进入列表 / 搜索索引 / RSS / sitemap
+          cat > content/posts/wiki/_index.md <<'EOF'
+          ---
+          title: 'wiki'
+          build:
+            render: always
+            list: never
+          cascade:
+            build:
+              render: always
+              list: never
+            searchHidden: true
+            sitemap:
+              disable: true
+          ---
+          EOF
+          ls -la content/posts/wiki/
 
       - name: Build with Hugo
         env:
@@ -63,9 +80,27 @@ jobs:
       - name: Encrypt wiki
         run: |
           npm install -g staticrypt
-          staticrypt public/posts/wiki/ -r -p "${{ secrets.WIKI_PASSWORD }}"
-          cp -r public/posts/wiki/encrypted/* public/posts/wiki/
-          rm -rf public/posts/wiki/encrypted
+          if [ ! -d public/posts/wiki ]; then
+            echo "::error::Hugo did not generate public/posts/wiki"
+            ls -la public/posts || true
+            exit 1
+          fi
+          ls -la public/posts/wiki
+          staticrypt public/posts/wiki -r -p "${{ secrets.WIKI_PASSWORD }}" --short
+          if [ ! -d encrypted ]; then
+            echo "::error::staticrypt did not create the encrypted/ output dir"
+            exit 1
+          fi
+          ls -la encrypted
+          # staticrypt output layout is encrypted/<input dir name>/..., merge it back
+          cp -r encrypted/*/. public/posts/wiki/
+          rm -rf encrypted
+          if grep -rL --include='*.html' 'staticrypt' public/posts/wiki | grep -q .; then
+            echo "::error::these pages are not encrypted:"
+            grep -rL --include='*.html' 'staticrypt' public/posts/wiki
+            exit 1
+          fi
+          ls -la public/posts/wiki
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
