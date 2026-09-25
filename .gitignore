@@ -2,4 +2,6 @@ public/
 resources/
 .hugo_cache/
 .hugo_build.lock
+.staticrypt.json
 content/posts/wiki/
+交接文档.txt
