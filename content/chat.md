@@ -2,9 +2,6 @@
 title: "聊天室"
 summary: "本站的实时聊天室：注册一个账号就能进来说话。"
 date: 2026-09-28
-# chat: true 是给 layouts/partials/extend_footer.html 看的开关：
-# 只有带这个标记的页面才会加载 assets/js/chat.js。
-chat: true
 # 聊天室是工具页，不需要这些文章配件
 hideMeta: true
 ShowToc: false

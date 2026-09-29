@@ -1,15 +1,33 @@
 {{- /*
-  聊天室的 DOM 骨架。
+  聊天室：DOM 骨架 + 前端脚本。
 
   只提供结构和挂载点，所有行为都在 assets/js/chat.js 里。
-  放在短代码而不是 layouts/_default/chat.html，是为了不用复制主题的 single.html：
+  用短代码而不是 layouts/_default/chat.html，是为了不用复制主题的 single.html：
   页面照常走 PaperMod 的文章模板，只是正文里多了这一块。
 
-  用法：在 content/chat.md 的正文里写一行 chat 短代码调用即可。
-  依赖 hugo.toml 里的 [params.chat]（apiBase / room）。
+  用法：在 content/chat.md 正文里写一行 chat 短代码调用。依赖 hugo.toml 的 [params.chat]。
+
+  ⚠️ 为什么脚本也在这里输出，而不是放 extend_footer.html —— 这是一个线上事故换来的：
+
+  PaperMod 的 baseof.html 里 footer 是 **partialCached**：
+      {{ partialCached "footer.html" . .Layout .Kind (.Param "hideFooter") ... }}
+  缓存键里**没有页面路径**。所以 /chat/ 和每一篇普通文章页（Layout 都是 ""、Kind 都是
+  "page"）共用同一个缓存条目——谁先渲染，谁就决定了那一整组页面的 footer 内容。
+
+  实测后果：本地构建时正好 /chat/ 先渲染，脚本被泄漏到 about/ 和所有文章页上，
+  /chat/ 自己有脚本，看起来一切正常；而上线后 CI 里换成别的页面先渲染，
+  /chat/ 反而拿不到脚本 —— 页面骨架在、但一行 JS 都不执行，
+  表现为「状态停在『正在加载…』、注册按钮点不动」。
+
+  写在短代码里之后，骨架和脚本由同一个条件（同一个短代码调用）产出，
+  结构上不可能再对不上，也不受任何 partial 缓存策略影响。
 */ -}}
+{{- if not site.Params.chat.enable -}}
+  <p class="chat__notice">聊天室暂时关闭。</p>
+{{- else -}}
 {{- $apiBase := site.Params.chat.apiBase | default "" -}}
 {{- $room := site.Params.chat.room | default "general" -}}
+{{- $script := resources.Get "js/chat.js" | resources.Minify | resources.Fingerprint -}}
 <div class="chat" id="chat-app" data-api="{{ $apiBase }}" data-room="{{ $room }}">
 
   <div class="chat__bar">
@@ -64,3 +82,7 @@
     <p class="chat__notice">聊天室需要 JavaScript 才能工作。</p>
   </noscript>
 </div>
+
+{{- /* defer：脚本在正文中间也没关系，浏览器会等文档解析完再执行 */ -}}
+<script defer src="{{ $script.RelPermalink }}" integrity="{{ $script.Data.Integrity }}"></script>
+{{- end -}}
