@@ -1,0 +1,34 @@
+{
+  "name": "yulo-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "generate": "nanoka generate",
+    "migrate:local": "wrangler d1 migrations apply yulo-chat --local",
+    "migrate:remote": "wrangler d1 migrations apply yulo-chat --remote",
+    "tail": "wrangler tail",
+    "smoke": "node scripts/smoke.mjs",
+    "frontend-test": "node scripts/frontend-test.mjs",
+    "inspect-d1": "node scripts/inspect-d1.mjs"
+  },
+  "dependencies": {
+    "@nanokajs/auth": "^2.0.0",
+    "@nanokajs/core": "^2.0.0",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.10",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@types/node": "^24.19.0",
+    "drizzle-kit": "^0.31.11",
+    "jsdom": "^30.1.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.142.0",
+    "ws": "^8.22.0"
+  }
+}

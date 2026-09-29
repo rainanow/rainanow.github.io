@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+.dev.vars
+.npm-cache/
+.tmp/
+worker-configuration.d.ts

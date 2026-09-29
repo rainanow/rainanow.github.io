@@ -89,6 +89,16 @@ hasCJKLanguage = true
     inputPosition = "bottom"              # 评论框放在评论列表下方
     theme = "preferred_color_scheme"      # 跟随系统明暗模式
 
+  # --- 聊天室（后端在 workers/chat，见那里的 README）---
+  # apiBase 指向那个 Worker 绑的自定义域。选 api.yulo.top 而不是 xxx.workers.dev 是有原因的：
+  # 它与站点同属 yulo.top，属于「同站」，HttpOnly 会话 Cookie 用 SameSite=Lax 就能正常工作；
+  # 挂到 workers.dev 就变成跨站，会被浏览器的第三方 Cookie 策略拦掉。
+  # room 要与后端 src/config.ts 里的 DEFAULT_ROOM 一致。
+  [params.chat]
+    enable = true
+    apiBase = "https://api.yulo.top"
+    room = "general"
+
 [menu]
   [[menu.main]]
     name = "文章"
@@ -102,6 +112,10 @@ hasCJKLanguage = true
     name = "标签"
     url = "/tags/"
     weight = 30
+  [[menu.main]]
+    name = "聊天室"
+    url = "/chat/"
+    weight = 35
   [[menu.main]]
     name = "搜索"
     url = "/search/"

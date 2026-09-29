@@ -8,3 +8,11 @@
   </span>
 </div>
 {{- end }}
+
+{{- /* 聊天室前端脚本：只在实际带 chat: true 的页面上加载。
+       走 Hugo Pipes（Minify + Fingerprint）而不是丢进 static/，
+       这样能拿到压缩和带内容哈希的缓存键。 */ -}}
+{{- if and .Params.chat .Site.Params.chat.enable -}}
+{{- $chat := resources.Get "js/chat.js" | resources.Minify | resources.Fingerprint -}}
+<script defer src="{{ $chat.RelPermalink }}" integrity="{{ $chat.Data.Integrity }}"></script>
+{{- end }}

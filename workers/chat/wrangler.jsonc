@@ -1,0 +1,50 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "yulo-chat",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  // src/hasher.ts 用 node:crypto 的 scrypt 做密码哈希（原因见那个文件的注释：
+  // WebCrypto 的 PBKDF2 要 40ms，超过免费套餐 10ms 的 CPU 上限）。
+  // node:crypto 需要这个 flag。免费套餐同样支持 nodejs_compat。
+  "compatibility_flags": ["nodejs_compat"],
+
+  // 自定义域：绑定后 api.yulo.top 与站点 yulo.top 属于同一个可注册域，
+  // 于是 HttpOnly Cookie 是「同站」的，SameSite=Lax 就能正常工作，
+  // 不会被浏览器的第三方 Cookie 策略拦掉。
+  // 前提：yulo.top 这个 zone 在同一个 Cloudflare 账号里（已确认 NS 指向 Cloudflare）。
+  "routes": [{ "pattern": "api.yulo.top", "custom_domain": true }],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "yulo-chat",
+      // TODO(部署): 运行 `npx wrangler d1 create yulo-chat` 后把真实的 database_id 填到这里。
+      // 本地 `wrangler dev` / `--local` 迁移只用本地 SQLite，不会读这个 id。
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "drizzle/migrations"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "CHAT_ROOM", "class_name": "ChatRoom" }]
+  },
+
+  // 免费套餐只支持 SQLite 后端的 Durable Object，所以必须是 new_sqlite_classes。
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ChatRoom"]
+    }
+  ],
+
+  "vars": {
+    // 允许跨域携带 Cookie 的来源白名单（逗号分隔）。localhost 是给 `hugo server` 本地预览用的。
+    "ALLOWED_ORIGINS": "https://yulo.top,http://localhost:1313"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+
+  // AUTH_SECRET 是机密，不要写在这里，用 `npx wrangler secret put AUTH_SECRET` 注入。
+}
