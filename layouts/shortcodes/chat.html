@@ -1,0 +1,66 @@
+{{- /*
+  聊天室的 DOM 骨架。
+
+  只提供结构和挂载点，所有行为都在 assets/js/chat.js 里。
+  放在短代码而不是 layouts/_default/chat.html，是为了不用复制主题的 single.html：
+  页面照常走 PaperMod 的文章模板，只是正文里多了这一块。
+
+  用法：在 content/chat.md 的正文里写一行 chat 短代码调用即可。
+  依赖 hugo.toml 里的 [params.chat]（apiBase / room）。
+*/ -}}
+{{- $apiBase := site.Params.chat.apiBase | default "" -}}
+{{- $room := site.Params.chat.room | default "general" -}}
+<div class="chat" id="chat-app" data-api="{{ $apiBase }}" data-room="{{ $room }}">
+
+  <div class="chat__bar">
+    <span class="chat__status" data-chat-status>正在加载…</span>
+    <span class="chat__self">
+      <span data-chat-me hidden></span>
+      <button type="button" class="chat__button chat__button--ghost" data-chat-logout hidden>退出</button>
+    </span>
+  </div>
+
+  <p class="chat__notice" data-chat-notice hidden></p>
+
+  {{- /* 未登录：登录 / 注册 */ -}}
+  <section class="chat__auth" data-chat-auth hidden>
+    <div class="chat__tabs" role="tablist">
+      <button type="button" class="chat__tab is-active" data-chat-mode="login" role="tab">登录</button>
+      <button type="button" class="chat__tab" data-chat-mode="register" role="tab">注册</button>
+    </div>
+
+    <form class="chat__form" data-chat-form>
+      <label class="chat__field">
+        用户名
+        <input type="text" name="username" data-chat-username autocomplete="username"
+               minlength="2" maxlength="20" required>
+      </label>
+      <label class="chat__field">
+        密码
+        <input type="password" name="password" data-chat-password autocomplete="current-password"
+               minlength="8" maxlength="128" required>
+      </label>
+      <button type="submit" class="chat__button chat__button--primary" data-chat-submit>登录</button>
+    </form>
+
+    <p class="chat__hint" data-chat-hint></p>
+  </section>
+
+  {{- /* 已登录：消息列表 + 输入框 */ -}}
+  <section class="chat__room" data-chat-room hidden>
+    <div class="chat__messages" data-chat-messages>
+      <button type="button" class="chat__button chat__more" data-chat-more hidden>加载更早的消息</button>
+      <p class="chat__empty" data-chat-empty>还没有人说话，来开场吧。</p>
+    </div>
+
+    <form class="chat__composer" data-chat-composer>
+      <textarea data-chat-input rows="2" maxlength="500" required
+                placeholder="说点什么…（Enter 发送，Shift + Enter 换行）"></textarea>
+      <button type="submit" class="chat__button chat__button--primary" data-chat-send>发送</button>
+    </form>
+  </section>
+
+  <noscript>
+    <p class="chat__notice">聊天室需要 JavaScript 才能工作。</p>
+  </noscript>
+</div>

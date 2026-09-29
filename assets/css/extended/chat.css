@@ -1,0 +1,320 @@
+/*
+ * 聊天室样式。
+ *
+ * 放在 assets/css/extended/ 下是 PaperMod 的既定扩展点：
+ * 主题的 head.html 会 `resources.Match "css/extended/*.css"` 把所有文件
+ * 打进同一张 stylesheet，自动享受压缩 + 指纹 + 长缓存，不用额外的 <link>。
+ *
+ * 颜色一律取主题的 CSS 变量（--theme / --entry / --primary / --secondary / --border），
+ * 这样明暗模式切换是免费的，不用为 dark 写第二套规则。
+ * 每个变量都给了 fallback，避免哪天主题改名变成一堆透明块。
+ */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 1.25rem 0 2rem;
+}
+
+/* --- 顶栏：连接状态 + 当前用户 --- */
+
+.chat__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: var(--secondary, #6b7280);
+}
+
+.chat__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* 用一个小圆点表达连接状态 */
+.chat__status::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.45;
+}
+
+.chat__status[data-state="online"]::before {
+  background: #22c55e;
+  opacity: 1;
+}
+
+.chat__status[data-state="connecting"]::before {
+  background: #f59e0b;
+  opacity: 1;
+}
+
+.chat__status[data-state="offline"]::before {
+  background: #ef4444;
+  opacity: 1;
+}
+
+.chat__self {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* --- 提示条 / 报错 --- */
+
+.chat__notice {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: var(--radius, 6px);
+  border: 1px solid var(--border, #e5e7eb);
+  background: var(--entry, #f9fafb);
+  font-size: 0.85rem;
+}
+
+.chat__notice[data-kind="error"] {
+  border-color: #ef4444;
+  color: #ef4444;
+}
+
+.chat__notice[data-kind="success"] {
+  border-color: #22c55e;
+  color: #22c55e;
+}
+
+/* --- 登录 / 注册面板 --- */
+
+.chat__auth {
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 6px);
+  background: var(--entry, #f9fafb);
+  padding: 1rem;
+}
+
+.chat__tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 0.85rem;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+
+.chat__tab {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--secondary, #6b7280);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-family: inherit;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.chat__tab.is-active {
+  color: var(--primary, #111827);
+  border-bottom-color: var(--primary, #111827);
+}
+
+.chat__form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-width: 22rem;
+}
+
+.chat__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--secondary, #6b7280);
+}
+
+.chat__field input {
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--primary, #111827);
+  background: var(--theme, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 6px);
+  padding: 0.45rem 0.6rem;
+  width: 100%;
+}
+
+.chat__field input:focus-visible {
+  outline: 2px solid var(--primary, #111827);
+  outline-offset: 1px;
+}
+
+/* --- 按钮 --- */
+
+.chat__button {
+  appearance: none;
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+  padding: 0.45rem 0.9rem;
+  border-radius: var(--radius, 6px);
+  border: 1px solid var(--border, #e5e7eb);
+  background: var(--theme, #fff);
+  color: var(--primary, #111827);
+  transition: opacity 0.15s ease;
+}
+
+.chat__button:hover:not(:disabled) {
+  opacity: 0.8;
+}
+
+.chat__button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.chat__button--primary {
+  background: var(--primary, #111827);
+  color: var(--theme, #fff);
+  border-color: var(--primary, #111827);
+}
+
+.chat__button--ghost {
+  border-color: transparent;
+  background: none;
+  color: var(--secondary, #6b7280);
+  padding: 0.25rem 0.4rem;
+  font-size: 0.8rem;
+}
+
+.chat__hint {
+  margin: 0.7rem 0 0;
+  font-size: 0.78rem;
+  color: var(--secondary, #6b7280);
+}
+
+/* --- 消息区 --- */
+
+.chat__room {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.chat__messages {
+  height: min(58vh, 34rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 6px);
+  background: var(--theme, #fff);
+}
+
+.chat__more {
+  align-self: center;
+  margin-bottom: 0.25rem;
+}
+
+.chat__empty {
+  margin: auto;
+  color: var(--secondary, #6b7280);
+  font-size: 0.85rem;
+}
+
+.chat__message {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius, 6px);
+  background: var(--entry, #f9fafb);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.chat__message.is-mine {
+  background: var(--code-bg, #eef2ff);
+}
+
+.chat__message-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--secondary, #6b7280);
+}
+
+.chat__author {
+  font-weight: 600;
+  color: var(--primary, #111827);
+}
+
+.chat__time {
+  font-variant-numeric: tabular-nums;
+}
+
+.chat__delete {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--secondary, #6b7280);
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0 0.2rem;
+  margin-left: auto;
+}
+
+.chat__delete:hover {
+  color: #ef4444;
+}
+
+.chat__body {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  color: var(--content, #374151);
+}
+
+/* --- 输入区 --- */
+
+.chat__composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+}
+
+.chat__composer textarea {
+  flex: 1;
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 2.6rem;
+  max-height: 9rem;
+  color: var(--primary, #111827);
+  background: var(--theme, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 6px);
+  padding: 0.5rem 0.65rem;
+}
+
+.chat__composer textarea:focus-visible {
+  outline: 2px solid var(--primary, #111827);
+  outline-offset: 1px;
+}
+
+@media (max-width: 600px) {
+  .chat__messages {
+    height: 60vh;
+    padding: 0.55rem;
+  }
+}
