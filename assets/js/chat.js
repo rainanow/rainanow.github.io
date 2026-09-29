@@ -13,6 +13,13 @@
 ;(function () {
   'use strict'
 
+  // 同一页面被引入两次时只初始化一次。
+  // 脚本现在由 chat 短代码输出，正常只出现一次；这层保护是防短代码被误用两次，
+  // 或者将来有人又把这个脚本挪回 <head> 里加载——重复执行会让事件监听器绑两遍，
+  // 表现为「点一次发两条」这种很难查的问题。
+  if (window.__yuloChatBooted === true) return
+  window.__yuloChatBooted = true
+
   var root = document.getElementById('chat-app')
   if (root === null) return
 

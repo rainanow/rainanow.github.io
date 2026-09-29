@@ -18,9 +18,11 @@
     {
       "binding": "DB",
       "database_name": "yulo-chat",
-      // TODO(部署): 运行 `npx wrangler d1 create yulo-chat` 后把真实的 database_id 填到这里。
-      // 本地 `wrangler dev` / `--local` 迁移只用本地 SQLite，不会读这个 id。
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // 这个 id 是 `npx wrangler d1 create yulo-chat` 建出来的线上库。
+      // 注意：Miniflare 的本地 D1 文件名按它派生，所以**改了这个 id，
+      // 本地就要重新跑一次 `npm run migrate:local`**，否则本地库是空的，
+      // 接口会全部 500 并报 `no such table`（线上不受影响）。
+      "database_id": "29dab35b-2549-40f6-8430-d5b826093b05",
       "migrations_dir": "drizzle/migrations"
     }
   ],

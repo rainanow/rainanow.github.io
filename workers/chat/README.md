@@ -93,15 +93,19 @@ npm run dev                  # http://127.0.0.1:8787
 npm run typecheck            # TypeScript 全量检查
 npm run smoke                # 后端 43 项
 npm run frontend-test        # 前端 23 项（需要先 hugo 构建出 public/chat/index.html）
+npm run verify-build         # 构建产物归属 5 项（不需要 dev server，hugo 构建完就能跑）
 npm run inspect-d1           # 打印本地 D1 里的表结构、账号、限流、吊销名单
+npm run probe-production     # 探线上 api.yulo.top + /chat/ 页面是否健康
 ```
 
-> `npm run smoke` 会真的注册账号。本地 D1 的注册限额是「同一 IP 每小时 5 次」，
-> 反复跑会撞上 429 —— 用 `npm run inspect-d1` 看一眼，或者删掉 `.wrangler/state` 重来。
-> 想手工清一下计数：
-> ```bash
-> node -e "const{DatabaseSync}=require('node:sqlite'),fs=require('fs');const p='.wrangler/state/v3/d1/miniflare-D1DatabaseObject';const f=fs.readdirSync(p).find(n=>n.endsWith('.sqlite')&&n!=='metadata.sqlite');new DatabaseSync(p+'/'+f).exec('DELETE FROM rate_limits')"
-> ```
+> `npm run smoke` 会真的注册账号。注册限额是「同一 IP 每小时 5 次」，而这个脚本一轮要用掉 3 次，
+> 所以它**开始前会自动清掉本地 `rate_limits`**（只在目标是 `127.0.0.1` / `localhost` 时才动手，
+> 指向远端时直接跳过，不会碰生产数据）。想看当前计数就 `npm run inspect-d1`。
+
+> **改了 `wrangler.jsonc` 里的 `database_id` 之后，本地要重新跑一次 `npm run migrate:local`。**
+> Miniflare 的本地 D1 文件名是按 database_id 派生的，换了 id 等于换了一个空库，
+> 旧文件还留在 `.wrangler/state` 里但已经没人用了。症状是接口全 500、
+> 日志报 `D1_ERROR: no such table: ...`。（`npm run inspect-d1` 会自动挑最近修改的那个库并提示。）
 
 本地联调前端：
 
@@ -110,7 +114,23 @@ npm run inspect-d1           # 打印本地 D1 里的表结构、账号、限流
 hugo server            # http://localhost:1313/chat/
 ```
 
-`wrangler.jsonc` 的 `ALLOWED_ORIGINS` 已经包含 `http://localhost:1313`，开箱可用。
+默认情况下页面里的 `data-api` 指向 `https://api.yulo.top`，也就是**线上后端**
+——`ALLOWED_ORIGINS` 里已经放了 `http://localhost:1313`，所以改前端时直接对着线上 API 调是可行的。
+代价是注册的账号、发的消息都会真的写进线上 D1。
+
+想让本地页面连本地 Worker，用 Hugo 的环境变量覆盖，不用改文件：
+
+```powershell
+# PowerShell
+$env:HUGO_PARAMS_CHAT_APIBASE = "http://127.0.0.1:8787"; hugo server
+```
+
+```bash
+# bash / zsh
+HUGO_PARAMS_CHAT_APIBASE=http://127.0.0.1:8787 hugo server
+```
+
+改完前端记得重建一次并跑 `npm run verify-build`，它守的是这次线上事故的那两个不变式。
 
 ---
 
@@ -338,6 +358,42 @@ SQLite 的比较和唯一索引都跟随列的排序规则。列声明成 NOCASE
 靠限流 + 管理员撤回兜底。想关掉就把 `src/routes/auth.ts` 里的 `/auth/register`
 改成校验一个环境变量里的邀请码。
 
+### 11. 聊天室的 `<script>` 必须由短代码输出，不能放 `extend_footer.html`
+
+**这条是上线后真实故障换来的，后果最严重，改动前务必读完。**
+
+PaperMod 的 `baseof.html` 这样调用 footer：
+
+```
+{{ partialCached "footer.html" . .Layout .Kind (.Param "hideFooter") (.Param "ShowCodeCopyButtons") }}
+```
+
+`partialCached` 的缓存键是后面那几个参数，**里面没有页面路径**。
+而 `/chat/` 和每一篇普通文章页的 `.Layout` 都是空、`.Kind` 都是 `page`，
+于是它们**共用同一个缓存条目**——谁先渲染，谁就决定了那一整组页面的 footer 内容。
+
+当初把 `<script src=chat.js>` 写在 `extend_footer.html` 里，结果：
+
+- **本地构建**恰好 `/chat/` 先渲染，脚本被泄漏到 `about/` 和所有文章页上，`/chat/` 自己有脚本 → 看起来一切正常；
+- **CI 构建**换成别的页面先渲染，`/chat/` 反而拿不到脚本 → 页面骨架在、状态永远停在「正在加载…」，
+  一行 JS 都不执行，表现为「注册按钮点不动」。
+
+现在脚本由 `layouts/shortcodes/chat.html` 输出，和骨架用同一个条件、同一次渲染，
+结构上不可能再对不上，也不受任何 partial 缓存策略影响。
+`npm run verify-build` 把这两个不变式固定成了自动检查：
+**`/chat/` 必须有 chat.js，其它任何页面都不许有**。
+
+另外 `assets/js/chat.js` 开头加了一个 `window.__yuloChatBooted` 幂等保护，
+万一短代码被误用两次（或有人把脚本挪回 head），也不会把事件监听器绑两遍。
+
+### 12. 改 `database_id` 会让本地 D1 变成空库
+
+Miniflare 的本地 D1 文件名是按 `database_id` 派生的哈希。把 `wrangler.jsonc` 里的占位
+UUID 换成真实的之后，本地会多出一个**空**的库文件，旧文件还在但已无人使用。
+症状是本地接口全部 500、日志报 `D1_ERROR: no such table: rate_limits`，很容易误判成代码坏了。
+
+本地重新 `npm run migrate:local` 即可（线上不受影响，线上是 `migrate:remote` 管的那一份）。
+
 ---
 
 ## 测试覆盖
@@ -362,3 +418,10 @@ SQLite 的比较和唯一索引都跟随列的排序规则。列声明成 NOCASE
 - 「自己发的消息」既走 HTTP 响应又走 WebSocket 广播，只渲染一条（去重）
 - 消息里的 HTML 被当成纯文本，不会创建元素、不会触发行内事件
 - 撤回后前端跟着移除、退出后回到登录面板、无未捕获 JS 错误
+
+`npm run verify-build`（5 项，只检查 Hugo 构建产物，不需要 dev server）：
+
+- `/chat/` 存在、加载了 `chat.js`、有聊天室骨架
+- **其它任何页面都没有** `chat.js`、也没有聊天室骨架
+  —— 专门守第 11 条那个 `partialCached` 事故，跑一次就能发现脚本串页或丢失
+

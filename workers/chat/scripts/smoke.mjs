@@ -8,10 +8,45 @@
  * 用法：先 `npx wrangler dev`（另开一个终端），再 `node scripts/smoke.mjs`
  */
 
+import { readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import WebSocket from 'ws'
 
 const BASE = process.env.CHAT_BASE_URL ?? 'http://127.0.0.1:8787'
 const ORIGIN = 'https://yulo.top'
+
+/**
+ * 跑之前清掉本地限流计数。
+ *
+ * 注册限额是「同一 IP 每小时 5 次」，而这个脚本一轮就要用掉 3 次
+ * （成功 1 次 + 非法输入 1 次 + 重名 1 次），连跑两遍必然撞 429 ——
+ * 表现成一片红，很容易被误判成代码坏了。
+ *
+ * 只在本机地址上动手，指向远端时直接跳过，绝不会去清生产环境的数据。
+ */
+function resetLocalRateLimits() {
+  if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(BASE)) return
+
+  try {
+    const dir = join(process.cwd(), '.wrangler/state/v3/d1/miniflare-D1DatabaseObject')
+    // 本地库文件名按 database_id 派生，改过 id 会留下旧文件，所以要挑最新的那个
+    const newest = readdirSync(dir)
+      .filter((name) => name.endsWith('.sqlite') && name !== 'metadata.sqlite')
+      .map((name) => ({ name, mtime: statSync(join(dir, name)).mtimeMs }))
+      .sort((left, right) => right.mtime - left.mtime)[0]
+
+    if (newest === undefined) return
+    const db = new DatabaseSync(join(dir, newest.name))
+    db.exec('DELETE FROM rate_limits')
+    db.close()
+    console.log('（已清空本地限流计数）')
+  } catch (error) {
+    console.log(`（跳过清理本地限流计数：${error.message}）`)
+  }
+}
+
+resetLocalRateLimits()
 
 let passed = 0
 const failures = []
