@@ -17,12 +17,33 @@
   margin: 1.25rem 0 2rem;
 }
 
+/*
+ * hidden 属性必须能压住作者样式里的 display。
+ *
+ * 浏览器默认样式表里是 `[hidden] { display: none }`，但它的优先级最低——
+ * 只要作者给同一个元素写了 `display: flex`，hidden 就会失效、元素照样显示。
+ * 这个坑实际踩到过：.chat__room 是 flex，没登录时它明明带着 hidden 却还是露出来。
+ */
+.chat [hidden] {
+  display: none !important;
+}
+
+/*
+ * 这一页本身就叫「聊天室」，正文顶上再挂一个大标题是重复的。
+ *
+ * 用 :has() 把范围锁死在「正文里含聊天室」的那一页——主题的 single.html 没有
+ * 隐藏标题的开关，而直接改主题模板会波及全部文章页。:has() 在新版浏览器里都支持，
+ * 不支持的话只是退化成「标题还在」，不会影响别的排版。
+ */
+.post-single:has(#chat-app) .post-title {
+  display: none;
+}
+
 /* --- 顶栏：连接状态 + 当前用户 --- */
 
 .chat__bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
   font-size: 0.85rem;
@@ -60,10 +81,12 @@
   opacity: 1;
 }
 
+/* 顶栏不再用 space-between：状态和「成员列表」要挨在一起，用户名/退出自己贴右 */
 .chat__self {
   display: inline-flex;
   align-items: center;
   gap: 0.6rem;
+  margin-left: auto;
 }
 
 /* --- 提示条 / 报错 --- */
@@ -210,16 +233,32 @@
   overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: var(--radius, 6px);
-  background: var(--theme, #fff);
+  gap: 0.6rem;
+  /* 消息区不画成一张卡片：没有边框、没有底色、没有圆角，
+     消息直接落在博客正文的背景上，和文章排版连成一片。
+     只留上下两条淡线，标出这块能滚动的区域到哪儿为止。 */
+  padding: 0.6rem 0.25rem;
+  border-top: 1px solid var(--border, #eee);
+  border-bottom: 1px solid var(--border, #eee);
 }
 
+/*
+ * order: -1 是必需的，不是装饰。
+ *
+ * chat.js 的 insertMessage() 在列表为空时会 `insertBefore(node, firstChild)`，
+ * 而 firstChild 正是这个「加载更早」按钮 —— 于是第一条消息被插到了按钮**前面**，
+ * 后续消息又都排在它之后，最终 DOM 顺序是 [msg1 … msgN, moreBtn]。
+ * 而 .chat__messages 是 flex column，默认按 DOM 顺序排，按钮就掉到列表**底部**去了：
+ * 消息一多就得滚到底才能看见它，和「更早」的语义完全相反。
+ *
+ * 用 order 而不是去改 JS 那套插入逻辑，是因为插入顺序还决定了
+ * 「自己发的 HTTP 响应」和「WebSocket 广播」乱序到达时的排序正确性，
+ * 那是被 frontend-test 覆盖过的行为，不动它更稳。
+ */
 .chat__more {
   align-self: center;
   margin-bottom: 0.25rem;
+  order: -1;
 }
 
 .chat__empty {
@@ -228,39 +267,59 @@
   font-size: 0.85rem;
 }
 
+/*
+ * 一条消息 = 上面一行（用户名 + 时间 + 撤回），下面一个气泡。
+ * 排版沿用博客正文：同样的字体、行高、文字颜色，明暗模式白拿。
+ */
 .chat__message {
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
-  padding: 0.45rem 0.6rem;
-  border-radius: var(--radius, 6px);
-  background: var(--entry, #f9fafb);
+  gap: 0.2rem;
   max-width: 100%;
-  overflow-wrap: anywhere;
-}
-
-.chat__message.is-mine {
-  background: var(--code-bg, #eef2ff);
 }
 
 .chat__message-head {
   display: flex;
   align-items: baseline;
   gap: 0.5rem;
+  /* 撑满整行，下面的撤回按钮才能靠 margin-left:auto 落到最右边 */
+  width: 100%;
   font-size: 0.75rem;
   color: var(--secondary, #6b7280);
 }
 
 .chat__author {
+  font-weight: 500;
+  color: var(--secondary, #6b7280);
+  white-space: nowrap;
+}
+
+/* 尖括号交给 CSS 拼，JS 里那句 textContent 只管放用户名本身 */
+.chat__author::before {
+  content: "<";
+}
+
+.chat__author::after {
+  content: ">";
+}
+
+/* 自己发的：用户名用正文主色并加重，别人的淡一档 */
+.chat__message.is-mine .chat__author {
   font-weight: 600;
   color: var(--primary, #111827);
 }
 
 .chat__time {
+  color: var(--secondary, #6b7280);
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * 撤回按钮：每条消息都有、始终可见，位置在那一行最右。
+ * 没有权限的置成 disabled（灰掉），后端还有一道 403 兜底。
+ */
 .chat__delete {
+  margin-left: auto;
   appearance: none;
   border: none;
   background: none;
@@ -269,20 +328,184 @@
   font-size: 0.95rem;
   line-height: 1;
   padding: 0 0.2rem;
-  margin-left: auto;
+  transition: color 0.12s ease;
 }
 
-.chat__delete:hover {
+.chat__delete:hover:not(:disabled) {
   color: #ef4444;
 }
 
+.chat__delete:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/*
+ * 气泡：align-self 让它只占内容那么宽（短消息就是小小一个），
+ * max-width 防止长文本把版面撑破。
+ */
 .chat__body {
+  align-self: flex-start;
+  max-width: min(100%, 34rem);
   margin: 0;
+  padding: 0.4rem 0.65rem;
+  border-radius: var(--radius, 6px);
+  background: var(--entry, #f9fafb);
+  /* 字体不指定，直接继承博客正文——这是「和博客一致」最省事也最准的做法 */
   font-size: 0.92rem;
-  line-height: 1.55;
+  line-height: 1.6;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   color: var(--content, #374151);
 }
+
+/* 自己发的换个底色区分 */
+.chat__message.is-mine .chat__body {
+  background: var(--code-bg, #f5f5f5);
+}
+
+/* --- 行内 markdown 会渲染出的那几种元素 --- */
+
+.chat__body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--code-bg, #f5f5f5);
+}
+
+.chat__body a {
+  color: var(--primary, #111827);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* --- 成员名单（挂在在线人数右边的折叠开关） --- */
+
+/*
+ * 开关做得轻一些：它是「在线 N 人」的附属说明，不是页面上的主要操作，
+ * 所以不套按钮边框，就跟状态文字一个体量。
+ */
+.chat__members-toggle {
+  display: inline-flex;
+  align-items: center;
+  appearance: none;
+  border: none;
+  background: none;
+  /* 里面只有一个三角，全靠内边距把它撑成一个够点的目标 */
+  padding: 0.1rem 0.3rem;
+  color: var(--secondary, #6b7280);
+  cursor: pointer;
+}
+
+.chat__members-toggle:hover {
+  color: var(--primary, #111827);
+}
+
+/*
+ * 展开后是一横条，位置在登录/注册框和聊天框之上（DOM 顺序决定），
+ * 把下面两块顶下去。max-height + 滚动兜住人多的情况。
+ */
+.chat__members-panel {
+  max-height: 14rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border, #eee);
+  border-radius: var(--radius, 6px);
+  background: var(--entry, #f9fafb);
+  font-size: 0.85rem;
+}
+
+.chat__members-status {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--secondary, #6b7280);
+}
+
+.chat__members-status[data-kind="error"] {
+  color: #ef4444;
+}
+
+.chat__members-group + .chat__members-group {
+  margin-top: 0.5rem;
+}
+
+.chat__members-title {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--secondary, #6b7280);
+}
+
+/* 离线那一行的标题本身就是折叠按钮 */
+.chat__members-title--toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  width: 100%;
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--secondary, #6b7280);
+  cursor: pointer;
+}
+
+/* 折叠箭头，展开时翻过来 */
+.chat__members-caret {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  transition: transform 0.15s ease;
+}
+
+/* 展开时三角翻过来：朝下＝还能拉开，朝上＝点一下收回去 */
+.chat__members-toggle[aria-expanded="true"] .chat__members-caret,
+.chat__members-title--toggle[aria-expanded="true"] .chat__members-caret {
+  transform: rotate(180deg);
+}
+
+/* 一人一行，和「在线 3」这个标题对齐成一列 */
+.chat__members-list {
+  list-style: none;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.chat__member {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--content, #374151);
+  overflow-wrap: anywhere;
+}
+
+/* 名字前面那个小圆点：在线绿、离线灰 */
+.chat__member::before {
+  content: "";
+  flex: none;
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--border, #d1d5db);
+}
+
+.chat__member.is-online::before {
+  background: #22c55e;
+}
+
+.chat__member.is-me {
+  font-weight: 600;
+  color: var(--primary, #111827);
+}
+
 
 /* --- 输入区 --- */
 

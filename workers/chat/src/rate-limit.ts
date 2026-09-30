@@ -23,6 +23,24 @@ export interface RateLimitState {
 const TABLE = 'rate_limits'
 const FREE: RateLimitState = { blocked: false, retryAfterSeconds: 0 }
 
+/**
+ * 每这么多次写入顺手清一次过期行。和 blacklist.ts 一个思路：
+ * 单独为清理跑一条 SQL 不划算，搭着已有的写入做就行。
+ */
+const CLEANUP_INTERVAL = 32
+
+/**
+ * 窗口开始多久之后才算「可以删」。
+ *
+ * 表里只存了 windowStart、没存这一行用的是多长的窗口，所以只能取一个上界。
+ * 目前最长的窗口是注册限流的 1 小时，给到 24 小时再删——宁可多留一会儿，
+ * 也绝不能把还在生效的计数删掉（那等于把限流重置了）。
+ * 将来要是加了更长的窗口，这个值必须跟着调大。
+ */
+const RETENTION_SECONDS = 24 * 60 * 60
+
+let cleanupCounter = 0
+
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -71,6 +89,14 @@ export async function consumeRateLimit(
     )
     .bind(key, now, windowSeconds)
     .all<{ hits: number; windowStart: number }>()
+
+  cleanupCounter += 1
+  if (cleanupCounter % CLEANUP_INTERVAL === 0) {
+    await db
+      .prepare(`DELETE FROM ${TABLE} WHERE windowStart + ?1 < ?2`)
+      .bind(RETENTION_SECONDS, now)
+      .run()
+  }
 
   const row = result.results?.[0]
   if (row === undefined) return FREE

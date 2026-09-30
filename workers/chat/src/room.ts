@@ -20,6 +20,7 @@ import { readAccessToken } from './origins'
 import type { BroadcastRequest, ChatServerEvent, SocketAttachment } from './types'
 
 const BROADCAST_PATH = '/broadcast'
+const ONLINE_PATH = '/online'
 
 function unauthorized(reason: string): Response {
   return new Response(reason, { status: 401 })
@@ -38,7 +39,16 @@ export class ChatRoom implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const { pathname } = new URL(request.url)
     if (pathname === BROADCAST_PATH) return this.handleBroadcast(request)
+    if (pathname === ONLINE_PATH) return this.handleOnline()
     return this.handleUpgrade(request)
+  }
+
+  /**
+   * Worker 问「现在谁连着」。和 /broadcast 一样，是给 Worker 调的内部端点，
+   * DO 自己没有对外路由，外面碰不到。
+   */
+  private async handleOnline(): Promise<Response> {
+    return Response.json({ userIds: this.onlineUserIds() })
   }
 
   /** Worker 校验并落库之后，把事件丢过来广播。DO 没有对外的 route，只有 Worker 能调到这里。 */
@@ -132,8 +142,25 @@ export class ChatRoom implements DurableObject {
     if (attachment !== null) this.publishPresence('leave', attachment.username)
   }
 
+  /**
+   * 在线人数：按 userId 去重，而不是直接数连接。
+   *
+   * 一个人开三个标签页是三条 WebSocket，但屏幕上显示「在线 3 人」是骗人的。
+   * 代价是每次统计都要把挂在每个连接上的 attachment 读出来——
+   * 房间就几十个人，这点开销可以忽略，而且这些调用本来就发生在 DO 已经被唤醒的时候。
+   */
+  /** 当前连着的用户 id，按人算不按连接算（同一个人开三个标签页只出现一次）。 */
+  private onlineUserIds(): string[] {
+    const userIds = new Set<string>()
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as SocketAttachment | null
+      if (attachment !== null && attachment.userId.length > 0) userIds.add(attachment.userId)
+    }
+    return [...userIds]
+  }
+
   private onlineCount(): number {
-    return this.ctx.getWebSockets().length
+    return this.onlineUserIds().length
   }
 
   private publish(event: ChatServerEvent): void {

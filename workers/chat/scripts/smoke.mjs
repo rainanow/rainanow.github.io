@@ -340,6 +340,22 @@ section('实时收发')
   const pageAfter = await after.json()
   check('撤回后历史里不再出现', !pageAfter.messages.some((item) => item.id === message.id))
 
+  // 成员名单。放在这里是因为 WebSocket 还连着——正好能验证「在线」这一栏不是写死的。
+  const anonymous = await request('/api/members')
+  check('未登录访问成员名单返回 401', anonymous.status === 401, `实际 ${anonymous.status}`)
+
+  const memberRes = await request('/api/members', { jar })
+  check('登录后能拿到成员名单', memberRes.status === 200, `实际 ${memberRes.status}`)
+  const memberList = await memberRes.json()
+  check('名单里有自己', memberList.members.some((item) => item.username === username))
+  check(
+    '自己连着 WebSocket 时标记为在线',
+    memberList.members.find((item) => item.username === username)?.online === true,
+  )
+  check('每条都带 online 布尔值', memberList.members.every((item) => typeof item.online === 'boolean'))
+  check('名单里没有密码字段', memberList.members.every((item) => item.password === undefined))
+  check('名单回显了房间名', memberList.room === 'general', `实际 ${memberList.room}`)
+
   client.socket.close()
 }
 

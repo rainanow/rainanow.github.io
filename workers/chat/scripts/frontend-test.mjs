@@ -221,6 +221,93 @@ try {
   check('没有真的创建出 <img> 元素', $('[data-chat-messages]').querySelector('img') === null)
   check('内联事件处理器没有被触发', window.__pwned === undefined)
 
+  // --- 行内 markdown ---
+  // 注意：渲染之后语法字符（** ` []()）会被吃掉，所以 textContent 不再等于原文，
+  // 这里靠消息里那个时间戳来定位自己发的那条。
+  section('行内 markdown')
+  const mdStamp = String(Date.now())
+  const md = '**粗体** 与 `代码` 与 [链接](https://example.com) ' + mdStamp
+  await sleep(1600) // 绕开发言间隔限制
+  $('[data-chat-input]').value = md
+  submitForm('[data-chat-composer]')
+
+  await waitFor('markdown 消息被渲染', () =>
+    [...document.querySelectorAll('.chat__body')].some((node) =>
+      node.textContent.includes(mdStamp),
+    ),
+  )
+  const mdNode = [...document.querySelectorAll('.chat__body')].find((node) =>
+    node.textContent.includes(mdStamp),
+  )
+  check('**粗体** 渲染成 <strong>', mdNode?.querySelector('strong')?.textContent === '粗体')
+  check('`代码` 渲染成 <code>', mdNode?.querySelector('code')?.textContent === '代码')
+  const anchor = mdNode?.querySelector('a')
+  check('[链接](url) 渲染成 <a>', anchor?.textContent === '链接')
+  check('链接指向原地址', anchor?.getAttribute('href') === 'https://example.com')
+  check('外链带 noopener / nofollow', (anchor?.getAttribute('rel') ?? '').includes('noopener'))
+
+  // 不安全的协议不能变成链接，也不能被执行
+  const badStamp = String(Date.now())
+  const bad = '[点我](javascript:window.__pwned2=1) ' + badStamp
+  await sleep(1600)
+  $('[data-chat-input]').value = bad
+  submitForm('[data-chat-composer]')
+
+  await waitFor('伪协议消息被渲染', () =>
+    [...document.querySelectorAll('.chat__body')].some((node) =>
+      node.textContent.includes(badStamp),
+    ),
+  )
+  const badNode = [...document.querySelectorAll('.chat__body')].find((node) =>
+    node.textContent.includes(badStamp),
+  )
+  check('javascript: 不会被渲染成 <a>', badNode?.querySelector('a') === null)
+  check('javascript: 没有被执行', window.__pwned2 === undefined)
+
+  // --- 成员名单 ---
+  section('成员名单')
+  check('成员面板默认折叠', !visible('[data-chat-members-panel]'))
+  $('[data-chat-members-toggle]').dispatchEvent(new window.Event('click', { bubbles: true }))
+  await waitFor(
+    '成员名单加载出来',
+    () => ($('[data-chat-online-list]')?.textContent ?? '').includes(username),
+  )
+  check('展开后在线列表里有自己', ($('[data-chat-online-list]')?.textContent ?? '').includes(username))
+  check('在线分组默认展开', visible('[data-chat-online-list]'))
+  check('离线分组默认折叠', !visible('[data-chat-offline-list]'))
+  $('[data-chat-offline-toggle]').dispatchEvent(new window.Event('click', { bubbles: true }))
+  check('点击后离线分组展开', visible('[data-chat-offline-list]'))
+  check(
+    '展开后箭头状态翻成 expanded',
+    $('[data-chat-members-toggle]')?.getAttribute('aria-expanded') === 'true',
+  )
+
+  // --- 撤回按钮 ---
+  // 要求：每条消息都渲染出 ×（不管是不是自己的），但只有有权限的能点。
+  section('撤回按钮')
+  const articles = [...document.querySelectorAll('.chat__message')]
+  check(
+    '每条消息都带撤回按钮',
+    articles.length > 0 && articles.every((node) => node.querySelector('.chat__delete') !== null),
+  )
+
+  const mine = articles.filter((node) => node.classList.contains('is-mine'))
+  check(
+    '自己的消息撤回按钮可点',
+    mine.length > 0 && mine.every((node) => node.querySelector('.chat__delete')?.disabled === false),
+  )
+
+  // 本地库里有历史遗留的他人消息时顺便验一下置灰；
+  // 一条都没有的话 every 返回 true，等于跳过（不硬造数据）。
+  const others = articles.filter((node) => !node.classList.contains('is-mine'))
+  check(
+    '别人的消息按钮存在但置灰',
+    others.every((node) => {
+      const button = node.querySelector('.chat__delete')
+      return button !== null && button.disabled === true
+    }),
+  )
+
   // --- 撤回 ---
   section('撤回')
   const target = [...document.querySelectorAll('.chat__message')].find(

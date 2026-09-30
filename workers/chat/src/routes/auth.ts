@@ -77,16 +77,6 @@ export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
 
   app.post('/auth/register', async (c) => {
     const ip = clientIp(c)
-    const attempt = await consumeRateLimit(
-      c.env.DB,
-      `register:${ip}`,
-      REGISTER_LIMIT,
-      REGISTER_WINDOW_SECONDS,
-    )
-    if (attempt.blocked) {
-      c.header('Retry-After', String(attempt.retryAfterSeconds))
-      return c.json({ error: '注册太频繁了，请过一会儿再试' }, 429)
-    }
 
     const body = (await c.req.json().catch(() => null)) as {
       username?: unknown
@@ -99,6 +89,20 @@ export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
     })
     if (!parsed.success) {
       return c.json({ error: parsed.error.issues[0]?.message ?? '输入不合法' }, 400)
+    }
+
+    // 记账放在格式校验**之后**：限流的目的是挡「反复建号」，不是挡「手滑输错」。
+    // 之前顺序反了，一个人试 5 次不合格的用户名/密码就把自己锁满一小时，
+    // 而那 5 次连一个账号都没建出来 —— 纯粹是误伤。
+    const attempt = await consumeRateLimit(
+      c.env.DB,
+      `register:${ip}`,
+      REGISTER_LIMIT,
+      REGISTER_WINDOW_SECONDS,
+    )
+    if (attempt.blocked) {
+      c.header('Retry-After', String(attempt.retryAfterSeconds))
+      return c.json({ error: '注册太频繁了，请过一会儿再试' }, 429)
     }
 
     const { username, password } = parsed.data

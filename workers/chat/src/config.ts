@@ -23,5 +23,12 @@ export const MAX_MESSAGE_LENGTH = 500
 /** 历史消息一页的条数。 */
 export const HISTORY_PAGE_SIZE = 50
 
+/**
+ * 成员名单一次最多返回多少个账号。
+ * users 本来就是小表，这个上限纯粹是防呆：D1 按「读取行数」计费，
+ * 哪天账号真的涨到几千个，也不至于一次名单请求就把额度吃掉。
+ */
+export const MEMBER_LIST_LIMIT = 500
+
 /** 用户名规则：中文 / 字母 / 数字 / 下划线，2-20 位。 */
 export const USERNAME_PATTERN = /^[\w\u4e00-\u9fa5]{2,20}$/
