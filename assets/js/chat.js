@@ -36,7 +36,7 @@
    */
   var MEDIA_BASE = (root.dataset.mediaBase || '').replace(/\/+$/, '')
   /** 单文件上限，和后端 MAX_UPLOAD_BYTES 保持一致。 */
-  var MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+  var MAX_UPLOAD_BYTES = 16 * 1024 * 1024
   /** 图片压缩后的最长边。1600 够看清内容，又不至于把手机流量吃光。 */
   var IMAGE_MAX_EDGE = 1600
 
@@ -348,6 +348,19 @@
     }
   }
 
+  /**
+   * 是不是「纯媒体」消息 —— 整条内容就是图片/视频/文件，没有夹别的文字。
+   *
+   * 这种消息不套气泡（渲染时加 `.is-media`，由 CSS 去掉底色和内边距）：
+   * 图片自己就是主体，外面再包一层灰底反而把画面框小了，看着也笨重。
+   * 把媒体标记整体抠掉、剩下只有空白，就算纯媒体。
+   */
+  var MEDIA_MARKUP = /!?\[[^\]]*\]\([^)\s]+\)/g
+
+  function isMediaOnly(body) {
+    return body.replace(MEDIA_MARKUP, '').trim() === ''
+  }
+
   function renderMessage(message) {
     var article = document.createElement('article')
     article.className = 'chat__message'
@@ -391,6 +404,7 @@
 
     var body = document.createElement('p')
     body.className = 'chat__body'
+    if (isMediaOnly(message.body)) body.classList.add('is-media')
     renderInline(body, message.body)
 
     article.appendChild(head)
@@ -651,7 +665,7 @@
     if (me === null) return
 
     if (file.size > MAX_UPLOAD_BYTES) {
-      notice('文件超过 8 MB，先压缩或裁剪一下再传', 'error')
+      notice('文件超过 16 MB，先压缩或裁剪一下再传', 'error')
       return
     }
 

@@ -27,7 +27,7 @@ export const HISTORY_PAGE_SIZE = 50
  * 单个上传文件的上限。浏览器的 canvas 压缩会把手机原图压到这个数以下，
  * 所以实际上只有「文档」类会真的顶到这个上限。
  */
-export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+export const MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 
 /**
  * 上传和读取媒体的路径前缀。

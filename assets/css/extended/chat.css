@@ -353,6 +353,17 @@
   background: var(--code-bg, #f5f5f5);
 }
 
+/*
+ * 纯媒体消息（整条就是一张图 / 一个视频 / 一个文件）不套气泡。
+ * 图片自己就是主体，外面再包一层底色和内边距，画面被框小了，看着也笨重。
+ * 自己发的那条要单独写一遍，否则会被上面那条 `is-mine` 的底色盖回来。
+ */
+.chat__body.is-media,
+.chat__message.is-mine .chat__body.is-media {
+  padding: 0;
+  background: none;
+}
+
 /* --- 行内 markdown 会渲染出的那几种元素 --- */
 
 .chat__body code {
@@ -375,7 +386,8 @@
 .chat__body img {
   display: block;
   max-width: 100%;
-  max-height: 20rem;
+  /* 尺寸刻意收着：聊天流里图片是"看一眼"，占满屏会把对话顶散，想看细节点开放大 */
+  max-height: 13rem;
   margin: 0.3rem 0;
   border-radius: var(--radius, 6px);
   border: 1px solid var(--border, #eee);
@@ -386,7 +398,8 @@
 .chat__body video {
   display: block;
   max-width: 100%;
-  max-height: 22rem;
+  /* 比图片稍大一点：视频要看动作，太小就真看不清了 */
+  max-height: 15rem;
   margin: 0.3rem 0;
   border-radius: var(--radius, 6px);
   background: #000;
@@ -395,7 +408,7 @@
 .chat__body audio {
   display: block;
   width: 100%;
-  max-width: 22rem;
+  max-width: 18rem;
   margin: 0.3rem 0;
 }
 
