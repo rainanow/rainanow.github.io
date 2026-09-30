@@ -73,7 +73,11 @@ export function buildChatApp(env: Env): ChatContext {
       // 通配符会被浏览器直接拒掉（而且那等于什么来源都放行）。
       origin: (origin, c) => (isAllowedOrigin(c.env.ALLOWED_ORIGINS, origin) ? origin : undefined),
       allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', 'Authorization'],
+      // 上传接口用 `X-Filename` 带原始文件名，它属于**自定义头**，
+      // 浏览器会先发预检（OPTIONS）问一句「这个头能发吗」。没在这里声明的话
+      // 预检就被判失败，请求根本发不出去，前端只能看到一个 fetch 层的 NetworkError
+      // —— 服务器那边连日志都不会有，特别容易误判成网络问题。
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Filename'],
       credentials: true,
       maxAge: 86400,
     }),
