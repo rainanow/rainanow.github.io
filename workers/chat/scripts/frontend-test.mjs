@@ -350,6 +350,11 @@ try {
   )
   check('自家媒体的图片渲染成 <img>', rendered !== undefined)
   check('图片带 lazy 加载', rendered?.getAttribute('loading') === 'lazy')
+  // 纯媒体消息不套气泡：图片自己就是主体，外面再加底色就把画面框小了
+  check(
+    '纯媒体消息不套气泡（拿到 .is-media）',
+    rendered?.parentElement?.classList.contains('is-media') === true,
+  )
 
   rendered?.dispatchEvent(new window.Event('click', { bubbles: true }))
   check('点图片能放大（遮罩出现）', visible('[data-chat-lightbox]'))
