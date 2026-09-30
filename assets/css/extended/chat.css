@@ -28,6 +28,16 @@
   display: none !important;
 }
 
+/*
+ * 这一页本身就叫「聊天室」，正文顶上再挂一个大标题是重复的。
+ *
+ * 用 :has() 把范围锁死在「正文里含聊天室」的那一页 —— 主题的 single.html
+ * 没有隐藏标题的开关，而直接改主题模板会波及全部文章页。
+ */
+.post-single:has(#chat-app) .post-title {
+  display: none;
+}
+
 /* --- 顶栏：连接状态 + 当前用户 --- */
 
 .chat__bar {
@@ -222,7 +232,8 @@
   overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  /* 消息之间的距离再收一半（0.6 → 0.3 → 0.15rem），聊天记录看着更连贯 */
+  gap: 0.15rem;
   /* 消息区不画成一张卡片：没有边框、没有底色、没有圆角，
      消息直接落在博客正文的背景上，和文章排版连成一片。
      只留上下两条淡线，标出这块能滚动的区域到哪儿为止。 */
@@ -263,7 +274,8 @@
 .chat__message {
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
+  /* 作者行和气泡之间也收紧（原来 0.2rem） */
+  gap: 0.1rem;
   max-width: 100%;
 }
 
@@ -277,24 +289,15 @@
   color: var(--secondary, #6b7280);
 }
 
+/* 用户名统一加粗，不再套尖括号 —— 就是个普通的昵称样式 */
 .chat__author {
-  font-weight: 500;
+  font-weight: 600;
   color: var(--secondary, #6b7280);
   white-space: nowrap;
 }
 
-/* 尖括号交给 CSS 拼，JS 里那句 textContent 只管放用户名本身 */
-.chat__author::before {
-  content: "<";
-}
-
-.chat__author::after {
-  content: ">";
-}
-
-/* 自己发的：用户名用正文主色并加重，别人的淡一档 */
+/* 自己发的：用户名用正文主色，别人的淡一档（这是唯一的区分方式了） */
 .chat__message.is-mine .chat__author {
-  font-weight: 600;
   color: var(--primary, #111827);
 }
 
@@ -540,8 +543,17 @@
   color: #ef4444;
 }
 
+/*
+ * 「在线」组和「离线」组之间那道缝。
+ *
+ * 它容易和行距混淆：看起来像「某一行上下留白特别大」，其实是两个分组的分界。
+ *
+ * 定在 0.15rem：比列表内部的行距（0.08rem）略大一点点。
+ * 归零的话「离线 18」会贴得比列表项之间还紧，看着像同一条列表的延续；
+ * 再放大又会回到「某一行上下特别空」的观感。这个值是试出来的。
+ */
 .chat__members-group + .chat__members-group {
-  margin-top: 0.5rem;
+  margin-top: 0.15rem;
 }
 
 .chat__members-title {
@@ -629,20 +641,23 @@
   color: var(--secondary, #6b7280);
 }
 
-/* 一人一行，和「在线 3」这个标题对齐成一列 */
+/* 一人一行，和「在线 3」这个标题对齐成一列。
+   行距 0.15 → 0.08rem；标题与列表之间 0.35 → 0.18rem（都再收了一半） */
 .chat__members-list {
   list-style: none;
-  margin: 0.35rem 0 0;
+  margin: 0.18rem 0 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
+  gap: 0.08rem;
 }
 
 .chat__member {
   display: flex;
   align-items: center;
   gap: 0.35rem;
+  /* 面板从正文继承了 line-height: 1.6，对一行一个的名单来说太松了 */
+  line-height: 1.35;
   color: var(--content, #374151);
   overflow-wrap: anywhere;
 }
