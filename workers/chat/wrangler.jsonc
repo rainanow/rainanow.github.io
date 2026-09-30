@@ -27,6 +27,15 @@
     }
   ],
 
+  // 聊天室上传的图片和文档。单独开一个 bucket 而不是复用博客那个 `image`，
+  // 因为这里的对象是「用户产生的内容」，将来要做清理策略（撤回、孤儿对象）会方便很多。
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "yulo-chat-media"
+    }
+  ],
+
   "durable_objects": {
     "bindings": [{ "name": "CHAT_ROOM", "class_name": "ChatRoom" }]
   },
@@ -41,7 +50,12 @@
 
   "vars": {
     // 允许跨域携带 Cookie 的来源白名单（逗号分隔）。localhost 是给 `hugo server` 本地预览用的。
-    "ALLOWED_ORIGINS": "https://yulo.top,http://localhost:1313"
+    "ALLOWED_ORIGINS": "https://yulo.top,http://localhost:1313",
+    // 媒体对象的公开访问前缀。走 R2 直连而不是 Worker 代理：
+    // ① 不消耗 Worker 请求额度；② 视频拖进度条要的 HTTP Range 由 R2 原生支持。
+    // 代价是这个域名下的对象**不需要登录就能访问**（UUID 文件名不可枚举）。
+    // 想换成自定义域（如 media.yulo.top）时只改这一行 + 博客侧的 params.chat.mediaBase。
+    "MEDIA_BASE_URL": "https://pub-916e60dd11884fca9d61e7dd1a9ed59a.r2.dev"
   },
 
   "observability": {

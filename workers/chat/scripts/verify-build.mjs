@@ -57,7 +57,15 @@ for (const page of pages) {
   if (CHAT_SHELL.test(html)) withShell.push(rel(page))
 }
 
-const isChatPage = (path) => path === 'chat/index.html'
+/**
+ * 聊天室页面 = /chat/ 本身，以及它下面的房间页 /chat/<房间>/。
+ *
+ * 早先这里写死成 `path === 'chat/index.html'`，是因为当时只有一个房间；
+ * 现在一个房间一个页面，再写死就会把新房间误判成「串页」。
+ * 判定标准仍然是「路径在 /chat/ 下」，而不是「必须有聊天室」，所以
+ * 万一脚本又漏到 about/ 或文章页上，还是会被抓出来。
+ */
+const isChatPage = (path) => path === 'chat/index.html' || /^chat\/[^/]+\/index\.html$/.test(path)
 const chatPages = pages.map(rel).filter(isChatPage)
 
 let passed = 0
@@ -75,14 +83,22 @@ function check(name, condition, detail = '') {
 
 console.log(`构建产物检查：共 ${pages.length} 个 HTML 文件\n`)
 
-console.log('聊天室页面')
-check('存在 /chat/ 页面', chatPages.length === 1, `实际找到 ${chatPages.length} 个`)
+console.log(`聊天室页面（共 ${chatPages.length} 个：${chatPages.join(', ')}）`)
+check('存在 /chat/ 页面', chatPages.includes('chat/index.html'))
+
+// 逐个房间页检查，而不是只看 /chat/ —— 新加的房间页漏了脚本同样要拦住
+const chatMissingScript = chatPages.filter((path) => !withScript.includes(path))
 check(
-  '/chat/ 加载了 chat.js',
-  withScript.some(isChatPage),
-  `实际加载 chat.js 的页面：${withScript.join(', ') || '（无）'}`,
+  '每个聊天室页面都加载了 chat.js',
+  chatMissingScript.length === 0,
+  chatMissingScript.length > 0 ? `缺脚本：${chatMissingScript.join(', ')}` : '',
 )
-check('/chat/ 里有聊天室骨架', withShell.some(isChatPage))
+const chatMissingShell = chatPages.filter((path) => !withShell.includes(path))
+check(
+  '每个聊天室页面都有聊天室骨架',
+  chatMissingShell.length === 0,
+  chatMissingShell.length > 0 ? `缺骨架：${chatMissingShell.join(', ')}` : '',
+)
 
 console.log('\n其它页面不该带聊天室资源')
 const strayScript = withScript.filter((path) => !isChatPage(path))

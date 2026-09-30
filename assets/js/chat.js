@@ -27,6 +27,18 @@
   var API = (root.dataset.api || '').replace(/\/+$/, '')
   var ROOM = root.dataset.room || 'general'
   var HEARTBEAT_MS = 45000
+  /**
+   * 上传文件的公开前缀（R2 直连域名）。
+   *
+   * 它同时是**安全白名单**：只有这个前缀开头的 URL 才会被渲染成图片/播放器。
+   * 不然别人往消息里写一个外站图片地址，就成了一条追踪访问者 IP 的探针。
+   * 空字符串表示没配，那就一律不渲染成媒体（只当普通链接）。
+   */
+  var MEDIA_BASE = (root.dataset.mediaBase || '').replace(/\/+$/, '')
+  /** 单文件上限，和后端 MAX_UPLOAD_BYTES 保持一致。 */
+  var MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+  /** 图片压缩后的最长边。1600 够看清内容，又不至于把手机流量吃光。 */
+  var IMAGE_MAX_EDGE = 1600
 
   var el = {
     status: root.querySelector('[data-chat-status]'),
@@ -54,7 +66,13 @@
     onlineCount: root.querySelector('[data-chat-online-count]'),
     offlineList: root.querySelector('[data-chat-offline-list]'),
     offlineToggle: root.querySelector('[data-chat-offline-toggle]'),
-    offlineCount: root.querySelector('[data-chat-offline-count]')
+    offlineCount: root.querySelector('[data-chat-offline-count]'),
+    roomsToggle: root.querySelector('[data-chat-rooms-toggle]'),
+    roomsPanel: root.querySelector('[data-chat-rooms-panel]'),
+    upload: root.querySelector('[data-chat-upload]'),
+    file: root.querySelector('[data-chat-file]'),
+    lightbox: root.querySelector('[data-chat-lightbox]'),
+    lightboxImage: root.querySelector('[data-chat-lightbox-image]')
   }
 
   if (API === '') {
@@ -194,13 +212,79 @@
     { pattern: /^\*([^\n*]+?)\*/, tag: 'em' },
     { pattern: /^~~([^\n]+?)~~/, tag: 'del' },
     { pattern: /^`([^`\n]+)`/, tag: 'code' },
+    // 图片要排在链接前面：虽然 `!` 前缀本身能区分，但顺序错了读起来容易岔
+    { pattern: /^!\[([^\]\n]*)\]\(([^)\s]+)\)/, tag: 'img' },
     { pattern: /^\[([^\]\n]+)\]\(([^)\s]+)\)/, tag: 'a' }
   ]
+
+  /** 按扩展名决定一个媒体 URL 该怎么展示。 */
+  var IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i
+  var VIDEO_EXT = /\.(mp4|webm)$/i
+  var AUDIO_EXT = /\.(m4a|mp3|ogg|wav|flac)$/i
 
   /** 只放行这几种协议，其它（javascript:、data:、vbscript: …）一律降级成纯文本。 */
   function safeHref(raw) {
     var value = String(raw).trim()
     return /^(https?:\/\/|mailto:)/i.test(value) ? value : null
+  }
+
+  /**
+   * 是不是本站上传的媒体？是就返回那个 URL，否则 null。
+   *
+   * 这是媒体渲染的**唯一入口**：不在白名单里的东西，永远不会被塞进
+   * `<img>` / `<video>` / `<audio>`。否则别人往消息里写一个外站图片地址，
+   * 就成了一条追踪访问者 IP 的探针。
+   */
+  function ownMediaUrl(raw) {
+    if (MEDIA_BASE === '') return null
+    var value = String(raw).trim()
+    return value.indexOf(MEDIA_BASE + '/') === 0 ? value : null
+  }
+
+  /** 外链一律新开窗口并断开 referrer。 */
+  function externalLink(href, text) {
+    var link = document.createElement('a')
+    link.href = href
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer nofollow'
+    link.textContent = text
+    return link
+  }
+
+  /** 视频/音频就地播放。preload 用 metadata：只取时长和首帧，不预下载整个文件。 */
+  function mediaPlayer(tag, src) {
+    var player = document.createElement(tag)
+    player.src = src
+    // 同样用 setAttribute：属性反射在 jsdom 里不一定生效
+    player.setAttribute('controls', '')
+    player.setAttribute('preload', 'metadata')
+    player.className = 'chat__player'
+    return player
+  }
+
+  /** 文档/压缩包：一个带文件名的下载条目（R2 那边响应头已经带了 attachment）。 */
+  function fileLink(src, text) {
+    var link = document.createElement('a')
+    link.href = src
+    link.rel = 'noopener noreferrer'
+    link.className = 'chat__file-link'
+    link.textContent = text.length > 0 ? text : '下载文件'
+    return link
+  }
+
+  /** 点图放大：把 src 丢进那块全屏遮罩里。 */
+  function openLightbox(event) {
+    if (el.lightbox === null || el.lightboxImage === null) return
+    var src = event.currentTarget.getAttribute('src')
+    if (src === null || src === '') return
+    el.lightboxImage.src = src
+    el.lightbox.hidden = false
+  }
+
+  function closeLightbox() {
+    if (el.lightbox === null) return
+    el.lightbox.hidden = true
+    if (el.lightboxImage !== null) el.lightboxImage.src = ''
   }
 
   /** 把一段文本按上面的规则塞进 parent，全程不经过 innerHTML。 */
@@ -215,16 +299,32 @@
         var matched = rule.pattern.exec(rest)
         if (matched === null) continue
 
-        if (rule.tag === 'a') {
-          var href = safeHref(matched[2])
-          // 协议不合法就不当链接，让这段按普通字符落下去
-          if (href === null) break
-          var link = document.createElement('a')
-          link.href = href
-          link.target = '_blank'
-          link.rel = 'noopener noreferrer nofollow'
-          link.textContent = matched[1]
-          parent.appendChild(link)
+        if (rule.tag === 'img') {
+          var imageSrc = ownMediaUrl(matched[2])
+          // 不是自家媒体、或者扩展名看着不像图片 —— 退回纯文本，绝不渲染
+          if (imageSrc === null || !IMAGE_EXT.test(matched[2])) break
+          var image = document.createElement('img')
+          image.src = imageSrc
+          image.alt = matched[1]
+          // 用 setAttribute 而不是 .loading = ：属性反射在部分环境（比如 jsdom）里不生效，
+          // 用 setAttribute 能保证属性真的落到 DOM 上，测试也才验得到
+          image.setAttribute('loading', 'lazy')
+          image.setAttribute('decoding', 'async')
+          image.addEventListener('click', openLightbox)
+          parent.appendChild(image)
+        } else if (rule.tag === 'a') {
+          var media = ownMediaUrl(matched[2])
+          if (media !== null) {
+            // 自家的媒体对象：按扩展名分派成播放器或下载条目
+            if (VIDEO_EXT.test(media)) parent.appendChild(mediaPlayer('video', media))
+            else if (AUDIO_EXT.test(media)) parent.appendChild(mediaPlayer('audio', media))
+            else parent.appendChild(fileLink(media, matched[1]))
+          } else {
+            var href = safeHref(matched[2])
+            // 协议不合法（javascript: 之类）就不当链接，让这段按普通字符落下去
+            if (href === null) break
+            parent.appendChild(externalLink(href, matched[1]))
+          }
         } else {
           var node = document.createElement(rule.tag)
           node.textContent = matched[1]
@@ -240,8 +340,9 @@
 
       // 没匹配上任何语法：一直吃到下一个「可能是标记起点」的字符为止。
       // 至少吞掉一个字符，保证 while 不会原地打转。
+      // 注意 `!` 也在这个集合里 —— 不然 `![图](url)` 会被拆开，`!` 当文本、剩下的当链接。
       var next = 1
-      while (next < rest.length && '*`~['.indexOf(rest.charAt(next)) === -1) next += 1
+      while (next < rest.length && '*`~!['.indexOf(rest.charAt(next)) === -1) next += 1
       parent.appendChild(document.createTextNode(rest.slice(0, next)))
       rest = rest.slice(next)
     }
@@ -428,12 +529,19 @@
       })
   }
 
-  function sendMessage() {
+  /**
+   * 发送一条消息。
+   *
+   * 不传参数 = 发输入框里的内容（用户手打）。
+   * 传参数 = 发这个字符串（上传文件后直接把 `![文件名](url)` 发出去，不经过输入框）。
+   */
+  function sendMessage(presetBody) {
     if (el.input === null) return
-    var body = el.input.value.trim()
+    var fromInput = presetBody === undefined
+    var body = (fromInput ? el.input.value : String(presetBody)).trim()
     if (body === '') return
 
-    el.input.value = ''
+    if (fromInput) el.input.value = ''
     el.send.disabled = true
     notice('')
 
@@ -459,12 +567,136 @@
       })
       .catch(function (error) {
         notice(error.message, 'error')
-        // 发失败就把内容还给用户，别让人白打一遍
-        el.input.value = body
+        // 手打的内容发失败就还回输入框，别让人白打一遍。
+        // 上传发出的内容不还 —— 还回去是一串 markdown，看着莫名其妙。
+        if (fromInput) el.input.value = body
       })
       .then(function () {
         el.send.disabled = false
         el.input.focus()
+      })
+  }
+
+  // --- 上传 -----------------------------------------------------------------
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B'
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB'
+    return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+  }
+
+  /**
+   * 图片压缩：最长边缩到 1600，再按 0.85 质量重新编码。
+   *
+   * 为什么必须在浏览器里做：Workers 免费套餐 CPU 上限 10ms，
+   * 服务端光是解码一张手机原图就要几十 ms，必超。所以压完再传。
+   *
+   * 三种情况直接放过：GIF（canvas 重绘会丢动画）、本来就不大的图、
+   * 以及压完反而更大的（直接比大小，不猜）。PNG 保持 PNG，免得丢透明通道。
+   */
+  function shrinkImage(file) {
+    if (file.type !== 'image/png' && file.type !== 'image/jpeg' && file.type !== 'image/webp') {
+      return Promise.resolve(file)
+    }
+    if (file.size <= 300 * 1024) return Promise.resolve(file)
+
+    return new Promise(function (resolve) {
+      var objectUrl = URL.createObjectURL(file)
+      var image = new Image()
+
+      image.onload = function () {
+        URL.revokeObjectURL(objectUrl)
+        var scale = Math.min(1, IMAGE_MAX_EDGE / Math.max(image.width, image.height))
+        if (scale === 1 && file.type === 'image/jpeg') {
+          resolve(file)
+          return
+        }
+
+        var canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.round(image.width * scale))
+        canvas.height = Math.max(1, Math.round(image.height * scale))
+
+        var context = canvas.getContext('2d')
+        if (context === null) {
+          resolve(file)
+          return
+        }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height)
+
+        canvas.toBlob(
+          function (blob) {
+            resolve(blob !== null && blob.size < file.size ? blob : file)
+          },
+          file.type === 'image/png' ? 'image/png' : 'image/jpeg',
+          0.85,
+        )
+      }
+
+      image.onerror = function () {
+        URL.revokeObjectURL(objectUrl)
+        resolve(file)
+      }
+
+      image.src = objectUrl
+    })
+  }
+
+  /**
+   * 把文件传上去，然后把它作为一条消息发出来。
+   *
+   * 请求体是文件的原始字节（不是 multipart），文件名放在 X-Filename 头里 ——
+   * 只传一个文件，没必要为它引入 multipart 解析。
+   */
+  function uploadFile(file) {
+    if (me === null) return
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      notice('文件超过 8 MB，先压缩或裁剪一下再传', 'error')
+      return
+    }
+
+    if (el.upload !== null) el.upload.disabled = true
+    notice('正在处理 ' + file.name + ' …')
+
+    shrinkImage(file)
+      .then(function (blob) {
+        notice('正在上传（' + formatBytes(blob.size) + '）…')
+        return api('/api/uploads', {
+          method: 'POST',
+          headers: {
+            'Content-Type': file.type || 'application/octet-stream',
+            'X-Filename': encodeURIComponent(file.name || 'file'),
+          },
+          body: blob,
+        })
+      })
+      .then(function (response) {
+        return response
+          .json()
+          .catch(function () {
+            return null
+          })
+          .then(function (payload) {
+            if (!response.ok) {
+              throw new Error((payload && payload.error) || '上传失败（' + response.status + '）')
+            }
+            return payload
+          })
+      })
+      .then(function (payload) {
+        notice('')
+        // 图片用 markdown 图片语法（内联展开），其它用链接（渲染成下载条目）
+        var line =
+          payload.kind === 'image'
+            ? '![' + payload.filename + '](' + payload.url + ')'
+            : '[' + payload.filename + '](' + payload.url + ')'
+        return sendMessage(line)
+      })
+      .catch(function (error) {
+        notice(error.message, 'error')
+      })
+      .then(function () {
+        if (el.upload !== null) el.upload.disabled = false
       })
   }
 
@@ -563,6 +795,18 @@
     }, 800)
   }
 
+  /**
+   * 房间菜单。列表本身是 Hugo 构建时就生成好的静态 HTML，
+   * 这里只负责开合——点房间是普通链接跳转，不归 JS 管。
+   */
+  function setRoomsExpanded(expanded) {
+    if (el.roomsPanel === null) return
+    el.roomsPanel.hidden = !expanded
+    if (el.roomsToggle !== null) {
+      el.roomsToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
+    }
+  }
+
   function setMembersExpanded(expanded) {
     if (el.membersPanel === null) return
     el.membersPanel.hidden = !expanded
@@ -573,7 +817,11 @@
       el.membersToggle.setAttribute('aria-label', label)
       el.membersToggle.title = label
     }
-    if (expanded) loadMembers()
+    if (expanded) {
+      // 两个面板占的是同一块位置，一次只留一个开着
+      setRoomsExpanded(false)
+      loadMembers()
+    }
   }
 
   function resetMembers() {
@@ -901,6 +1149,16 @@
     })
   }
 
+  // 「房间」菜单：和成员面板互斥，展开一个就把另一个收起来
+  if (el.roomsToggle !== null) {
+    el.roomsToggle.addEventListener('click', function () {
+      if (el.roomsPanel === null) return
+      var expanded = el.roomsPanel.hidden
+      if (expanded) setMembersExpanded(false)
+      setRoomsExpanded(expanded)
+    })
+  }
+
   // 「离线」那一行本身也是折叠按钮，展开方向朝下
   if (el.offlineToggle !== null) {
     el.offlineToggle.addEventListener('click', function () {
@@ -925,6 +1183,29 @@
         })
     })
   }
+
+  // 「+」只是去戳那个藏起来的 file input —— 原生 input 的样式改不动，不如藏起来自己画
+  if (el.upload !== null && el.file !== null) {
+    el.upload.addEventListener('click', function () {
+      el.file.click()
+    })
+
+    el.file.addEventListener('change', function () {
+      var picked = el.file.files !== null && el.file.files.length > 0 ? el.file.files[0] : null
+      // 立刻清空：否则连着选同一个文件不会再触发 change
+      el.file.value = ''
+      if (picked !== null) uploadFile(picked)
+    })
+  }
+
+  // 点遮罩的任意位置关掉大图
+  if (el.lightbox !== null) {
+    el.lightbox.addEventListener('click', closeLightbox)
+  }
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && el.lightbox !== null && !el.lightbox.hidden) closeLightbox()
+  })
 
   // 从后台切回前台时，如果连接已经掉了就立刻重连，不用等退避计时器
   document.addEventListener('visibilitychange', function () {
