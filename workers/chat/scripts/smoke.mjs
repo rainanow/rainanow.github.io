@@ -168,7 +168,7 @@ section('健康检查')
   check('服务名正确', payload.service === 'yulo-chat')
 }
 
-section('CORS 预检')
+section('CORS 预检（含上传用的自定义头）')
 {
   // 浏览器发跨域 POST + Content-Type: application/json 之前，一定会先发一个 OPTIONS 预检。
   // Node 的 fetch 不做预检，所以这一段必须手工构造，否则「本地全绿、一上浏览器就挂」。
@@ -195,6 +195,25 @@ section('CORS 预检')
     '允许 content-type 头',
     (preflight.headers.get('access-control-allow-headers') ?? '').toLowerCase().includes('content-type'),
     `实际 ${preflight.headers.get('access-control-allow-headers')}`,
+  )
+
+  // 上传接口带的是自定义头 X-Filename —— 它不在浏览器的「简单头」之列，
+  // 必须在 CORS 里显式放行。漏了的话预检直接失败，请求压根发不出去，
+  // 前端只看到 fetch 层的 NetworkError，服务端连日志都不会有（线上真踩过）。
+  const uploadPreflight = await fetch(`${BASE}/api/uploads`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: ORIGIN,
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'x-filename',
+    },
+  })
+  check(
+    '预检放行了上传用的 X-Filename 头',
+    (uploadPreflight.headers.get('access-control-allow-headers') ?? '')
+      .toLowerCase()
+      .includes('x-filename'),
+    `实际允许的头：${uploadPreflight.headers.get('access-control-allow-headers') ?? '（无）'}`,
   )
 
   const evil = await fetch(`${BASE}/auth/login`, {
