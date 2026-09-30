@@ -69,6 +69,8 @@
     offlineCount: root.querySelector('[data-chat-offline-count]'),
     roomsToggle: root.querySelector('[data-chat-rooms-toggle]'),
     roomsPanel: root.querySelector('[data-chat-rooms-panel]'),
+    exportButton: root.querySelector('[data-chat-export]'),
+    purgeButton: root.querySelector('[data-chat-purge]'),
     upload: root.querySelector('[data-chat-upload]'),
     file: root.querySelector('[data-chat-file]'),
     lightbox: root.querySelector('[data-chat-lightbox]'),
@@ -846,6 +848,123 @@
     setMembersStatus('')
   }
 
+  // --- 管理员操作：导出 / 清空 ----------------------------------------------
+
+  /** 导出文件里用的时间戳要带日期，不像界面上只显示时分。 */
+  function formatStamp(ms) {
+    var date = new Date(ms)
+    var pad = function (value) {
+      return value < 10 ? '0' + value : String(value)
+    }
+    return (
+      date.getFullYear() +
+      '-' + pad(date.getMonth() + 1) +
+      '-' + pad(date.getDate()) +
+      ' ' + pad(date.getHours()) +
+      ':' + pad(date.getMinutes())
+    )
+  }
+
+  /** 走 Blob + 一个临时 `<a>` 把文本存成文件。 */
+  function downloadText(filename, text) {
+    var blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+    var url = URL.createObjectURL(blob)
+    var link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    // 立刻 revoke 有可能把正在进行的下载掐断，挪到下一个事件循环再释放
+    setTimeout(function () {
+      URL.revokeObjectURL(url)
+    }, 0)
+  }
+
+  /** 把当前房间的全部消息导出成一份 markdown 存到本地。 */
+  function exportRoom() {
+    if (me === null) return
+    if (el.exportButton !== null) el.exportButton.disabled = true
+    notice('正在导出…')
+
+    api('/api/rooms/' + encodeURIComponent(ROOM) + '/export')
+      .then(function (response) {
+        if (!response.ok) throw new Error('导出失败（' + response.status + '）')
+        return response.json()
+      })
+      .then(function (payload) {
+        var lines = [
+          '# 聊天室记录 · ' + payload.room,
+          '',
+          '> 导出时间：' + formatStamp(Date.now()) + ' ｜ 共 ' + payload.count + ' 条',
+          '',
+        ]
+        if (payload.truncated) {
+          lines.push('> 注意：消息太多，这次只导出了最早的 ' + payload.count + ' 条。', '')
+        }
+
+        payload.messages.forEach(function (message) {
+          lines.push('**' + message.username + '** ' + formatStamp(message.createdAt))
+          lines.push('')
+          lines.push(message.body)
+          lines.push('')
+        })
+
+        downloadText(
+          'chat-' + payload.room + '-' + new Date().toISOString().slice(0, 10) + '.md',
+          lines.join('\n'),
+        )
+        notice('已导出 ' + payload.count + ' 条消息')
+      })
+      .catch(function (error) {
+        notice(error.message, 'error')
+      })
+      .then(function () {
+        if (el.exportButton !== null) el.exportButton.disabled = false
+      })
+  }
+
+  /**
+   * 清空整个房间。服务端是**硬删**，所以这里必须二次确认 —— 点下去没有撤销。
+   */
+  function purgeRoom() {
+    if (me === null) return
+
+    var confirmed = window.confirm(
+      '确定清空「' + ROOM + '」房间的全部消息吗？\n\n' +
+        '消息里的图片和文件会一起删除，无法恢复。',
+    )
+    if (!confirmed) return
+
+    if (el.purgeButton !== null) el.purgeButton.disabled = true
+    notice('正在清空…')
+
+    api('/api/rooms/' + encodeURIComponent(ROOM), { method: 'DELETE' })
+      .then(function (response) {
+        return response
+          .json()
+          .catch(function () {
+            return null
+          })
+          .then(function (payload) {
+            if (!response.ok) {
+              throw new Error((payload && payload.error) || '清空失败（' + response.status + '）')
+            }
+            return payload
+          })
+      })
+      .then(function (payload) {
+        clearMessages()
+        notice('已清空 ' + payload.removedMessages + ' 条消息、' + payload.removedMedia + ' 个文件')
+      })
+      .catch(function (error) {
+        notice(error.message, 'error')
+      })
+      .then(function () {
+        if (el.purgeButton !== null) el.purgeButton.disabled = false
+      })
+  }
+
   // --- WebSocket ------------------------------------------------------------
 
   function closeSocket() {
@@ -889,6 +1008,11 @@
     if (event.type === 'deleted') {
       var node = findByID(event.id)
       if (node !== null) node.remove()
+    }
+    if (event.type === 'purged') {
+      // 管理员清空了房间，别人那边也得跟着清，否则他们手上还留着已删除的内容
+      clearMessages()
+      notice('房间内容已被清空')
     }
   }
 
@@ -969,6 +1093,8 @@
     if (el.membersToggle !== null) el.membersToggle.hidden = true
     if (el.me !== null) el.me.hidden = true
     if (el.logout !== null) el.logout.hidden = true
+    if (el.exportButton !== null) el.exportButton.hidden = true
+    if (el.purgeButton !== null) el.purgeButton.hidden = true
     setStatus('未登录')
   }
 
@@ -982,6 +1108,12 @@
       el.me.textContent = me.username
     }
     if (el.logout !== null) el.logout.hidden = false
+
+    // 导出 / 清空只有管理员看得见。
+    // 藏按钮只是「别让人白点」，真正的门禁在服务端（非 admin 会拿到 403）。
+    var isAdmin = me.role === 'admin'
+    if (el.exportButton !== null) el.exportButton.hidden = !isAdmin
+    if (el.purgeButton !== null) el.purgeButton.hidden = !isAdmin
 
     // 每次进房间都把成员面板收回收起态（默认折叠），要用再点开
     setMembersExpanded(false)
@@ -1210,6 +1342,15 @@
       el.file.value = ''
       if (picked !== null) uploadFile(picked)
     })
+  }
+
+  // 管理员那两个图标按钮（未登录时是 hidden 的，但绑上无害）
+  if (el.exportButton !== null) {
+    el.exportButton.addEventListener('click', exportRoom)
+  }
+
+  if (el.purgeButton !== null) {
+    el.purgeButton.addEventListener('click', purgeRoom)
   }
 
   // 点遮罩的任意位置关掉大图

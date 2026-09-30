@@ -77,6 +77,13 @@ function clearUploadQuota() {
   withLocalDb((db) => db.exec('DELETE FROM upload_usage'))
 }
 
+/** 直接把本地账号提成管理员，用来验证权限门禁（比走接口/改 D1 快）。 */
+function setLocalRole(username, role) {
+  withLocalDb((db) => {
+    db.prepare('UPDATE users SET role = ? WHERE username = ?').run(role, username)
+  })
+}
+
 resetLocalRateLimits()
 
 let passed = 0
@@ -536,6 +543,56 @@ section('上传配额')
     bytes: pngBytes,
   })
   check('额度恢复后能继续上传', after.status === 201, `实际 ${after.status}`)
+}
+
+section('管理员：导出与清空')
+{
+  // 先确认「不是管理员就别想」—— 前端藏按钮只是省事，门禁必须在服务端
+  const forbiddenExport = await request('/api/rooms/general/export', { jar })
+  check('非管理员导出被拒（403）', forbiddenExport.status === 403, `实际 ${forbiddenExport.status}`)
+
+  const forbiddenPurge = await request('/api/rooms/smokeprobe', { method: 'DELETE', jar })
+  check('非管理员清空被拒（403）', forbiddenPurge.status === 403, `实际 ${forbiddenPurge.status}`)
+
+  setLocalRole(username, 'admin')
+
+  const exported = await request('/api/rooms/general/export', { jar })
+  check('管理员能导出房间', exported.status === 200, `实际 ${exported.status}`)
+  const dump = await exported.json()
+  check('导出里带上了消息', Array.isArray(dump.messages) && dump.messages.length > 0)
+  check(
+    '导出的是原始数据（格式交给前端定）',
+    dump.messages.every(
+      (item) => typeof item.username === 'string' && typeof item.body === 'string',
+    ),
+  )
+
+  // 清空拿一个临时房间试，别去动 general —— 那会毁掉别的用例
+  const probeRoom = 'smokeprobe'
+  await sleep(1600)
+  await request('/api/messages', { method: 'POST', jar, body: { body: '会被清掉的消息一', room: probeRoom } })
+  await sleep(1600)
+  await request('/api/messages', {
+    method: 'POST',
+    jar,
+    body: {
+      body: '![图](https://pub-x.r2.dev/2026-09/00000000-0000-0000-0000-000000000000.png)',
+      room: probeRoom,
+    },
+  })
+
+  const purged = await request(`/api/rooms/${probeRoom}`, { method: 'DELETE', jar })
+  check('管理员能清空房间', purged.status === 200, `实际 ${purged.status}`)
+  const purgedBody = await purged.json()
+  check('清空报告了删除条数', purgedBody.removedMessages === 2, `实际 ${purgedBody.removedMessages}`)
+
+  const afterPurge = await request(`/api/messages?room=${probeRoom}`, { jar })
+  const afterPage = await afterPurge.json()
+  check('清空后那个房间空了', afterPage.messages.length === 0, `实际 ${afterPage.messages.length}`)
+
+  const untouched = await request('/api/messages?room=general', { jar })
+  const untouchedPage = await untouched.json()
+  check('清空只影响目标房间，别的房间没被误伤', untouchedPage.messages.length > 0)
 }
 
 section('refresh 轮换与吊销')
