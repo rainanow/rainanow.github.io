@@ -5,6 +5,7 @@ import { z } from 'zod'
 
 import { DEFAULT_ROOM, HISTORY_PAGE_SIZE, MEMBER_LIST_LIMIT } from '../config'
 import { extractMediaKeys } from '../media'
+import { refundUpload } from '../quota'
 import type { AppEnv, ChatContext } from '../context'
 import type { Env } from '../env'
 import { cookieAuthBridge } from '../middleware'
@@ -268,12 +269,21 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
     for (const key of mediaKeys) {
       try {
         const object = await c.env.MEDIA.head(key)
-        if (object !== null && object.customMetadata?.['uploader'] === target.username) {
-          await c.env.MEDIA.delete(key)
+        if (object === null) continue
+        if (object.customMetadata?.['uploader'] !== target.username) continue
+
+        await c.env.MEDIA.delete(key)
+
+        // 顺手把当初占用的上传额度退回来。不退的话，用户「传了又删」几次
+        // 就把自己一天的额度耗光了，看着莫名其妙。
+        // 必须按**当初上传那天**退 —— 用今天的话，跨日撤回就等于凭空多出额度。
+        const day = object.customMetadata?.['day']
+        if (day !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(day)) {
+          await refundUpload(c.env.DB, target.userId, object.size, day)
         }
       } catch {
-        // 删文件失败不该让撤回本身失败：消息已经标记删除了，
-        // 最坏的结果是 R2 里留一个没人引用的孤儿对象。
+        // 删文件或退额度失败都不该让撤回本身失败：消息已经标记删除了，
+        // 最坏的结果是 R2 里留一个没人引用的孤儿对象，或者额度少退一次。
       }
     }
 

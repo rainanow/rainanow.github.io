@@ -40,6 +40,24 @@ export const MEDIA_PATH_PREFIX = '/api/media/'
 export const UPLOAD_MIN_INTERVAL_MS = 3000
 
 /**
+ * 上传配额。分两层，因为两道防线拦的东西不一样：
+ *
+ *  - 单人那层挡「一个人刷」。正常聊天一天传二三十张图已经很多了。
+ *  - 全站那层挡「注册一堆小号一起刷」—— 注册是开放的（免费套餐发不了验证邮件），
+ *    所以只按人限是不够的，这是必须有的兜底。
+ *
+ * 数额是按 R2 免费额度（10 GB 存储 / 100 万次写操作每月）倒推的：
+ * 全站每天 300 个文件 × 16 MB 顶格算也只有 4.8 GB，但那是全站同时发疯的极端值，
+ * 正常日子离得很远，而一旦真的发生，一天之内就会被日志看出来。
+ */
+export const DAILY_UPLOAD_COUNT_PER_USER = 30
+export const DAILY_UPLOAD_BYTES_PER_USER = 200 * 1024 * 1024
+
+/** 全站每日熔断。超出后所有上传都会 429，直到第二天。 */
+export const DAILY_UPLOAD_COUNT_GLOBAL = 300
+export const DAILY_UPLOAD_BYTES_GLOBAL = 1024 * 1024 * 1024
+
+/**
  * 成员名单一次最多返回多少个账号。
  * users 本来就是小表，这个上限纯粹是防呆：D1 按「读取行数」计费，
  * 哪天账号真的涨到几千个，也不至于一次名单请求就把额度吃掉。

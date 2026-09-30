@@ -25,25 +25,56 @@ const ORIGIN = 'https://yulo.top'
  *
  * 只在本机地址上动手，指向远端时直接跳过，绝不会去清生产环境的数据。
  */
+/** 只在目标是本机时才动手，指向远端一律跳过，绝不碰生产数据。 */
+function isLocalTarget() {
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(BASE)
+}
+
+/** 打开本地那份 D1 的 SQLite（Miniflare 用它当存储），跑一段同步操作。 */
+function withLocalDb(work) {
+  const dir = join(process.cwd(), '.wrangler/state/v3/d1/miniflare-D1DatabaseObject')
+  // 本地库文件名按 database_id 派生，改过 id 会留下旧文件，所以要挑最新的那个
+  const newest = readdirSync(dir)
+    .filter((name) => name.endsWith('.sqlite') && name !== 'metadata.sqlite')
+    .map((name) => ({ name, mtime: statSync(join(dir, name)).mtimeMs }))
+    .sort((left, right) => right.mtime - left.mtime)[0]
+
+  if (newest === undefined) return
+  const db = new DatabaseSync(join(dir, newest.name))
+  try {
+    work(db)
+  } finally {
+    db.close()
+  }
+}
+
 function resetLocalRateLimits() {
-  if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(BASE)) return
+  if (!isLocalTarget()) return
 
   try {
-    const dir = join(process.cwd(), '.wrangler/state/v3/d1/miniflare-D1DatabaseObject')
-    // 本地库文件名按 database_id 派生，改过 id 会留下旧文件，所以要挑最新的那个
-    const newest = readdirSync(dir)
-      .filter((name) => name.endsWith('.sqlite') && name !== 'metadata.sqlite')
-      .map((name) => ({ name, mtime: statSync(join(dir, name)).mtimeMs }))
-      .sort((left, right) => right.mtime - left.mtime)[0]
-
-    if (newest === undefined) return
-    const db = new DatabaseSync(join(dir, newest.name))
-    db.exec('DELETE FROM rate_limits')
-    db.close()
+    withLocalDb((db) => db.exec('DELETE FROM rate_limits'))
     console.log('（已清空本地限流计数）')
   } catch (error) {
     console.log(`（跳过清理本地限流计数：${error.message}）`)
   }
+}
+
+/**
+ * 直接把「上传配额」塞满，用来验证熔断。
+ *
+ * 不真传 30 个文件是因为那太慢，而且会把本地 R2 撑起来。
+ * 反正验的是「额度用完之后接口的态度」，账本怎么来的不重要。
+ */
+function forceUploadQuota(day) {
+  withLocalDb((db) => {
+    db.exec('DELETE FROM upload_usage')
+    const insert = db.prepare('INSERT INTO upload_usage (id, bytes, count) VALUES (?, ?, ?)')
+    insert.run(`global:${day}`, 8 * 1024 * 1024 * 1024, 99999)
+  })
+}
+
+function clearUploadQuota() {
+  withLocalDb((db) => db.exec('DELETE FROM upload_usage'))
 }
 
 resetLocalRateLimits()
@@ -461,6 +492,50 @@ section('上传与媒体')
     '撤回后历史里不再有这条',
     !gonePage.messages.some((item) => item.id === posted.message.id),
   )
+}
+
+section('上传配额')
+{
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
+  // 配额的日界是北京时间
+  const day = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
+
+  clearUploadQuota()
+  await sleep(3200) // 绕开上传间隔限流
+  const before = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'image/png',
+    filename: 'quota-a.png',
+    bytes: pngBytes,
+  })
+  check('额度充足时能正常上传', before.status === 201, `实际 ${before.status}`)
+
+  // 把全站今天的额度填满，模拟被人拿一群小号刷爆
+  forceUploadQuota(day)
+  await sleep(3200)
+  const blocked = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'image/png',
+    filename: 'quota-b.png',
+    bytes: pngBytes,
+  })
+  check('全站额度用完后上传被挡（429）', blocked.status === 429, `实际 ${blocked.status}`)
+  const blockedBody = await blocked.json()
+  check(
+    '回了一句能看懂的原因',
+    typeof blockedBody.error === 'string' && blockedBody.error.length > 0,
+    `实际 ${JSON.stringify(blockedBody)}`,
+  )
+
+  clearUploadQuota()
+  await sleep(3200)
+  const after = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'image/png',
+    filename: 'quota-c.png',
+    bytes: pngBytes,
+  })
+  check('额度恢复后能继续上传', after.status === 201, `实际 ${after.status}`)
 }
 
 section('refresh 轮换与吊销')

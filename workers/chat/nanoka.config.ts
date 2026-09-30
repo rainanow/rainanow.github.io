@@ -3,6 +3,7 @@ import { defineConfig } from '@nanokajs/core/config'
 import { authBlacklistFields, authBlacklistTableName } from './src/models/auth-blacklist'
 import { messageFields, messageTableName } from './src/models/message'
 import { rateLimitFields, rateLimitTableName } from './src/models/rate-limit'
+import { uploadUsageFields, uploadUsageTableName } from './src/models/upload-usage'
 import { userFields, userTableName } from './src/models/user'
 
 /**
@@ -15,6 +16,7 @@ export default defineConfig({
     { name: messageTableName, fields: messageFields },
     { name: authBlacklistTableName, fields: authBlacklistFields },
     { name: rateLimitTableName, fields: rateLimitFields },
+    { name: uploadUsageTableName, fields: uploadUsageFields },
   ],
   output: './drizzle/schema.ts',
 })

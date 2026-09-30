@@ -32,3 +32,9 @@ export const rate_limits = sqliteTable('rate_limits', {
   hits: integer('hits').notNull().default(0),
   windowStart: integer('windowStart').notNull().default(0),
 })
+
+export const upload_usage = sqliteTable('upload_usage', {
+  id: text('id').primaryKey().notNull(),
+  bytes: integer('bytes').notNull().default(0),
+  count: integer('count').notNull().default(0),
+})

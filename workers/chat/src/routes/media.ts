@@ -5,6 +5,7 @@ import { MAX_UPLOAD_BYTES, UPLOAD_MIN_INTERVAL_MS } from '../config'
 import type { AppEnv, ChatContext } from '../context'
 import { buildMediaKey, detectMedia, isMediaKey, sanitizeFilename } from '../media'
 import { cookieAuthBridge } from '../middleware'
+import { checkUploadQuota, markUpload, quotaDay } from '../quota'
 
 function requireSubject(c: Context<AppEnv>): string {
   const sub = c.get('user')['sub']
@@ -81,9 +82,18 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
       return c.json({ error: '不支持这种文件类型（支持图片 / 音视频 / pdf / 压缩包 / 文本）' }, 415)
     }
 
+    // 配额检查放在类型判定之后：前面那些关卡（没登录、太大、类型不对）本来就不该
+    // 消耗额度，这里才是「确实要落库了」的位置。
+    const quota = await checkUploadQuota(c.env.DB, sub, buffer.byteLength)
+    if (!quota.allowed) {
+      return c.json({ error: quota.reason ?? '今天的上传额度用完了' }, 429)
+    }
+
     const filename = sanitizeFilename(c.req.header('x-filename'))
     const key = buildMediaKey(detected.ext)
     const encodedName = encodeURIComponent(filename)
+    // 记下是哪天传的：撤回时要按**那一天**的账退还额度，不能退到今天
+    const day = quotaDay()
 
     await c.env.MEDIA.put(key, buffer, {
       httpMetadata: {
@@ -96,9 +106,13 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
         // key 里带 uuid，内容永不改变，所以可以放心长缓存
         cacheControl: 'public, max-age=31536000, immutable',
       },
-      // 撤回时靠 uploader 判断「这个对象是不是这条消息的作者传的」，防止误删别人的文件
-      customMetadata: { filename, uploader: user.username },
+      // uploader 用来判断「这个对象是不是这条消息的作者传的」，防止误删别人的文件；
+      // day 用来在撤回时把额度退回到正确的那一天
+      customMetadata: { filename, uploader: user.username, day },
     })
+
+    // 存进 R2 之后才记账 —— 反过来会让失败的上传也吃掉用户额度
+    await markUpload(c.env.DB, sub, buffer.byteLength)
 
     return c.json(
       {
