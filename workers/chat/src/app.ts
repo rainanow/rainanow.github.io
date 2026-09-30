@@ -18,6 +18,7 @@ import { userFields, userTableName } from './models/user'
 import { isAllowedOrigin } from './origins'
 import { registerAuthRoutes } from './routes/auth'
 import { registerChatRoutes } from './routes/chat'
+import { registerMediaRoutes } from './routes/media'
 
 export function buildChatApp(env: Env): ChatContext {
   if (typeof env.AUTH_SECRET !== 'string' || env.AUTH_SECRET.length < 32) {
@@ -52,7 +53,12 @@ export function buildChatApp(env: Env): ChatContext {
       // api.yulo.top 和 yulo.top 属于同一个可注册域，所以是「同站」请求，
       // Lax 既能正常带上 Cookie，又能挡住跨站发起的写操作（CSRF）。
       sameSite: 'Lax',
-      secure: true,
+      // 线上必须是 true —— 会话 Cookie 只在 HTTPS 上传输。
+      // 但本地是 http://localhost，带 Secure 的 Cookie 会被 Chrome 直接丢掉
+      // （浏览器明确拒绝「http + Secure」），症状是登录返回 200、紧接着 /api/me 却 401。
+      // 所以留一个只在本地生效的开关：.dev.vars 里写 COOKIE_SECURE=false。
+      // 线上没有这个变量，`undefined !== 'false'` 成立，Secure 保持开启，不可能被误关。
+      secure: env.COOKIE_SECURE !== 'false',
       path: '/',
       accessTokenName: ACCESS_TOKEN_COOKIE,
       refreshTokenName: REFRESH_TOKEN_COOKIE,
@@ -87,6 +93,7 @@ export function buildChatApp(env: Env): ChatContext {
   const context: ChatContext = { app, User, Message, auth }
   registerAuthRoutes(context)
   registerChatRoutes(context)
+  registerMediaRoutes(context)
   return context
 }
 

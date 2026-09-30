@@ -24,6 +24,22 @@ export const MAX_MESSAGE_LENGTH = 500
 export const HISTORY_PAGE_SIZE = 50
 
 /**
+ * 单个上传文件的上限。浏览器的 canvas 压缩会把手机原图压到这个数以下，
+ * 所以实际上只有「文档」类会真的顶到这个上限。
+ */
+export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+
+/**
+ * 上传和读取媒体的路径前缀。
+ * 消息正文里存的就是这个前缀开头的相对路径（如 `/api/media/2026-09/xxx.png`），
+ * 前端渲染时会校验前缀，只把自家 URL 变成图片/链接 —— 防止有人拿外链当图床或追踪访问者。
+ */
+export const MEDIA_PATH_PREFIX = '/api/media/'
+
+/** 上传间隔：同一个人两次上传至少隔这么久，防手滑和刷存储。 */
+export const UPLOAD_MIN_INTERVAL_MS = 3000
+
+/**
  * 成员名单一次最多返回多少个账号。
  * users 本来就是小表，这个上限纯粹是防呆：D1 按「读取行数」计费，
  * 哪天账号真的涨到几千个，也不至于一次名单请求就把额度吃掉。

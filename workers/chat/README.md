@@ -394,6 +394,24 @@ UUID 换成真实的之后，本地会多出一个**空**的库文件，旧文�
 
 本地重新 `npm run migrate:local` 即可（线上不受影响，线上是 `migrate:remote` 管的那一份）。
 
+### 13. 本地 `http://localhost` 上不能带 Secure Cookie
+
+会话 Cookie 配了 `Secure`（线上必须），但浏览器**会直接拒绝「http + Secure」这个组合**——
+Chrome 把这种 `Set-Cookie` 丢掉，只在 Network 面板的 Response Headers 里留个痕迹。
+
+症状很迷惑：
+
+- 注册 / 登录接口都返回 **200**，但紧接着 `/api/me` 就是 **401**，前端提示「登录状态没拿到」；
+- **注册其实是成功的**，账号真的建好了（数据库里有），于是更容易误判成「密码记错了」。
+
+所以 `src/app.ts` 里 `secure` 改成读一个环境变量：`.dev.vars` 写 `COOKIE_SECURE=false` 就关掉，
+线上没有这个变量则保持 `true`。`.dev.vars` 已被 gitignore，生产读不到，不存在被误关的风险。
+
+**同一个坑的另一面**：Cookie 的 host 必须前后一致。`localhost:1313` 配 `localhost:8787`
+属于同站（SameSite 只比 scheme + 域名，**不看端口**），Cookie 正常；
+但只要有一边写成 `127.0.0.1`，就变成跨站，`SameSite=Lax` 的 Cookie 一样不会被带上，
+表现和上面一模一样。所以本地预览的两个地址都用 `localhost`。
+
 ---
 
 ## 测试覆盖

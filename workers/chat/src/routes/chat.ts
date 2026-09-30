@@ -4,6 +4,7 @@ import type { Context } from 'hono'
 import { z } from 'zod'
 
 import { DEFAULT_ROOM, HISTORY_PAGE_SIZE, MEMBER_LIST_LIMIT } from '../config'
+import { extractMediaKeys } from '../media'
 import type { AppEnv, ChatContext } from '../context'
 import type { Env } from '../env'
 import { cookieAuthBridge } from '../middleware'
@@ -257,6 +258,25 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
     }
 
     await Message.update(id, { deleted: true })
+
+    // 撤回要连带把消息里引用的媒体对象也删掉（用户明确要求）。
+    //
+    // 删之前必须 head 一下确认 uploader 就是这条消息的作者 ——
+    // 否则有人可以在自己的消息里写上**别人图片的 URL**，然后撤回，
+    // 把别人的文件删了。这不是理论风险，是这一版必须堵的洞。
+    const mediaKeys = extractMediaKeys(target.body)
+    for (const key of mediaKeys) {
+      try {
+        const object = await c.env.MEDIA.head(key)
+        if (object !== null && object.customMetadata?.['uploader'] === target.username) {
+          await c.env.MEDIA.delete(key)
+        }
+      } catch {
+        // 删文件失败不该让撤回本身失败：消息已经标记删除了，
+        // 最坏的结果是 R2 里留一个没人引用的孤儿对象。
+      }
+    }
+
     await broadcast(c.env, target.room, { type: 'deleted', room: target.room, id })
     return c.json({ ok: true })
   })

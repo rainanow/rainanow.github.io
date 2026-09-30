@@ -98,6 +98,11 @@ hasCJKLanguage = true
     enable = true
     apiBase = "https://api.yulo.top"
     room = "general"
+    # 上传的图片/文件存在 R2 上，这里填它的公开访问前缀。
+    # **必须和 workers/chat/wrangler.jsonc 里的 MEDIA_BASE_URL 一模一样** ——
+    # 前端靠这个前缀判断「一个 URL 是不是本站上传的」，不是自家的就不会被
+    # 渲染成图片或播放器（否则别人发个外链就能追踪访问者的 IP）。
+    mediaBase = "https://pub-916e60dd11884fca9d61e7dd1a9ed59a.r2.dev"
 
 [menu]
   [[menu.main]]

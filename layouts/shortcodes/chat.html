@@ -26,9 +26,30 @@
   <p class="chat__notice">聊天室暂时关闭。</p>
 {{- else -}}
 {{- $apiBase := site.Params.chat.apiBase | default "" -}}
-{{- $room := site.Params.chat.room | default "general" -}}
+{{- /*
+  房间名的优先级：短代码参数 > 当前页面的 front matter > 站点默认值。
+
+  有了这条，多房间就是「一个房间一个页面」：各自在自己 front matter 里写 room，
+  不用去动 hugo.toml；页面 URL 也因此可以做成 /chat/<房间名>/，链接即邀请。
+
+  三种写法都行：
+    {{< chat >}}                      → 跟着 hugo.toml 的 params.chat.room
+    {{< chat room="tech" >}}          → 就写在这里
+    front matter 里 room: "tech"      → 由这一行兜底
+*/ -}}
+{{- $room := .Get "room" | default (.Page.Params.room | default site.Params.chat.room) | default "general" -}}
+{{- /*
+  房间菜单的数据来源：所有在 front matter 里写了 room 的页面，按房间名排序。
+
+  「房间」在服务端是隐式的（messages 表里有这个 room 值就代表存在），
+  所以「有哪些房间」这件事，构建期唯一的依据就是这里——
+  加一间房 = 新写一个带 room 的页面，菜单会自动多出一项，不用改这个文件。
+*/ -}}
+{{- $rooms := sort (where site.RegularPages "Params.room" "!=" nil) "Params.room" -}}
+{{- $mediaBase := site.Params.chat.mediaBase | default "" -}}
 {{- $script := resources.Get "js/chat.js" | resources.Minify | resources.Fingerprint -}}
-<div class="chat" id="chat-app" data-api="{{ $apiBase }}" data-room="{{ $room }}">
+<div class="chat" id="chat-app" data-api="{{ $apiBase }}" data-room="{{ $room }}"
+     data-media-base="{{ $mediaBase }}">
 
   <div class="chat__bar">
     <span class="chat__status" data-chat-status>正在加载…</span>
@@ -42,6 +63,17 @@
             aria-expanded="false" aria-controls="chat-members-panel"
             aria-label="展开成员列表" title="展开成员列表" hidden>
       <span class="chat__members-caret" aria-hidden="true"></span>
+    </button>
+
+    {{- /*
+      房间菜单。房间列表是 **Hugo 构建时**遍历出来的（见下面 $rooms），
+      不是从后端接口拉的——所以它天然是静态的：新建房间要改文件 + 重新构建。
+      点某个房间是普通链接跳转（每个房间一个独立页面），不是页内切换，
+      所以前端不需要处理「断开重连、清空消息」那一套。
+    */ -}}
+    <button type="button" class="chat__rooms-toggle" data-chat-rooms-toggle
+            aria-expanded="false" aria-controls="chat-rooms-panel">
+      房间 <span class="chat__members-caret" aria-hidden="true"></span>
     </button>
 
     <span class="chat__self">
@@ -75,6 +107,22 @@
     </div>
   </div>
 
+  {{- /* 房间菜单：和成员面板同一位置（状态栏下方、登录框上方），两个面板互斥展开 */ -}}
+  <div class="chat__rooms-panel" id="chat-rooms-panel" data-chat-rooms-panel hidden>
+    <p class="chat__rooms-title">共 {{ len $rooms }} 个房间</p>
+    <ul class="chat__rooms-list" data-chat-rooms-list>
+      {{- range $rooms }}
+      <li>
+        <a class="chat__room-link{{ if eq .Params.room $room }} is-current{{ end }}"
+           href="{{ .RelPermalink }}"{{ if eq .Params.room $room }} aria-current="page"{{ end }}>
+          {{ .Title }}
+          <span class="chat__room-slug">{{ .Params.room }}</span>
+        </a>
+      </li>
+      {{- end }}
+    </ul>
+  </div>
+
   {{- /* 未登录：登录 / 注册 */ -}}
   <section class="chat__auth" data-chat-auth hidden>
     <div class="chat__tabs" role="tablist">
@@ -106,12 +154,27 @@
       <p class="chat__empty" data-chat-empty>还没有人说话，来开场吧。</p>
     </div>
 
-    <form class="chat__composer" data-chat-composer>
-      <textarea data-chat-input rows="2" maxlength="500" required
-                placeholder="说点什么…（Enter 发送，Shift + Enter 换行）"></textarea>
-      <button type="submit" class="chat__button chat__button--primary" data-chat-send>发送</button>
-    </form>
+      <form class="chat__composer" data-chat-composer>
+        {{- /* 「+」放在输入框内部左下角，所以 textarea 和它包在一个定位盒子里 */ -}}
+        <div class="chat__composer-box">
+          <textarea data-chat-input rows="2" maxlength="500" required
+                    placeholder="说点什么…（Enter 发送，Shift + Enter 换行）"></textarea>
+          <button type="button" class="chat__upload" data-chat-upload
+                  title="上传图片或文件（8 MB 以内）" aria-label="上传图片或文件">+</button>
+        </div>
+
+        {{- /* 真正干活的是这个藏起来的 file input，点 + 只是去戳它 */ -}}
+        <input type="file" class="chat__file" data-chat-file hidden
+               accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm,audio/mpeg,audio/mp4,audio/ogg,audio/wav,audio/flac,application/pdf,application/zip,text/plain">
+
+        <button type="submit" class="chat__button chat__button--primary" data-chat-send>发送</button>
+      </form>
   </section>
+
+  {{- /* 点图片放大用：一块铺满屏幕的遮罩，点任意位置关闭 */ -}}
+  <div class="chat__lightbox" data-chat-lightbox hidden>
+    <img class="chat__lightbox-image" data-chat-lightbox-image alt="">
+  </div>
 
   <noscript>
     <p class="chat__notice">聊天室需要 JavaScript 才能工作。</p>

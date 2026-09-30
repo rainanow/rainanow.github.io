@@ -218,7 +218,14 @@ try {
     [...document.querySelectorAll('.chat__body')].some((node) => node.textContent === payload),
   )
   check('HTML 标签被当成纯文本渲染', true)
-  check('没有真的创建出 <img> 元素', $('[data-chat-messages]').querySelector('img') === null)
+  // 只查这条载荷本身没变成 <img>：列表里可能本来就有合法的图片消息
+  const payloadBody = [...document.querySelectorAll('.chat__body')].find(
+    (node) => node.textContent === payload,
+  )
+  check(
+    'XSS 载荷没有创建出 <img> 元素',
+    payloadBody !== undefined && payloadBody.querySelector('img') === null,
+  )
   check('内联事件处理器没有被触发', window.__pwned === undefined)
 
   // --- 行内 markdown ---
@@ -282,6 +289,16 @@ try {
     $('[data-chat-members-toggle]')?.getAttribute('aria-expanded') === 'true',
   )
 
+  // --- 房间菜单 ---
+  section('房间菜单')
+  check('房间菜单默认折叠', !visible('[data-chat-rooms-panel]'))
+  $('[data-chat-rooms-toggle]').dispatchEvent(new window.Event('click', { bubbles: true }))
+  await sleep(50)
+  const roomLinks = [...document.querySelectorAll('.chat__room-link')]
+  check('菜单里列出了房间', roomLinks.length >= 1, `实际 ${roomLinks.length} 个`)
+  check('当前房间被标记出来', roomLinks.some((link) => link.classList.contains('is-current')))
+  check('展开房间菜单会把成员面板收起来（两个面板互斥）', !visible('[data-chat-members-panel]'))
+
   // --- 撤回按钮 ---
   // 要求：每条消息都渲染出 ×（不管是不是自己的），但只有有权限的能点。
   section('撤回按钮')
@@ -307,6 +324,88 @@ try {
       return button !== null && button.disabled === true
     }),
   )
+
+  // --- 图片与文件 ---
+  section('图片与文件')
+  check('输入框里有「+」上传按钮', $('[data-chat-upload]') !== null)
+  check('大图遮罩默认隐藏', !visible('[data-chat-lightbox]'))
+
+  const mediaBase = $('#chat-app')?.dataset.mediaBase ?? ''
+  const ownImage = mediaBase + '/2026-09/11111111-2222-3333-4444-555555555555.jpg'
+
+  await sleep(1600)
+  $('[data-chat-input]').value = '![图](' + ownImage + ')'
+  submitForm('[data-chat-composer]')
+
+  await waitFor(
+    '自家媒体的图片渲染成 <img>',
+    () =>
+      [...document.querySelectorAll('.chat__body img')].some(
+        (node) => node.getAttribute('src') === ownImage,
+      ),
+    12000,
+  )
+  const rendered = [...document.querySelectorAll('.chat__body img')].find(
+    (node) => node.getAttribute('src') === ownImage,
+  )
+  check('自家媒体的图片渲染成 <img>', rendered !== undefined)
+  check('图片带 lazy 加载', rendered?.getAttribute('loading') === 'lazy')
+
+  rendered?.dispatchEvent(new window.Event('click', { bubbles: true }))
+  check('点图片能放大（遮罩出现）', visible('[data-chat-lightbox]'))
+  $('[data-chat-lightbox]').dispatchEvent(new window.Event('click', { bubbles: true }))
+  check('点遮罩能关掉', !visible('[data-chat-lightbox]'))
+
+  // 外站图片绝不能被渲染成 <img>：那等于给每个人一条追踪访问者 IP 的探针
+  await sleep(1600)
+  $('[data-chat-input]').value = '![x](https://evil.example.com/track.png)'
+  submitForm('[data-chat-composer]')
+  // 外站图片会被降级成普通外链（URL 在 href 里，不在 textContent 里，所以按 href 等）
+  await waitFor(
+    '外站图片被降级成外链',
+    () =>
+      [...document.querySelectorAll('.chat__body a')].some((node) =>
+        (node.getAttribute('href') ?? '').includes('evil.example.com'),
+      ),
+    12000,
+  )
+  check(
+    '外站图片不会被渲染成 <img>',
+    [...document.querySelectorAll('.chat__body img')].every(
+      (node) => !(node.getAttribute('src') ?? '').includes('evil.example.com'),
+    ),
+  )
+
+  // 音视频按扩展名分派成播放器
+  await sleep(1600)
+  const videoUrl = mediaBase + '/2026-09/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.mp4'
+  $('[data-chat-input]').value = '[视频](' + videoUrl + ')'
+  submitForm('[data-chat-composer]')
+  await waitFor(
+    '视频渲染成 <video>',
+    () =>
+      [...document.querySelectorAll('.chat__body video')].some(
+        (node) => node.getAttribute('src') === videoUrl,
+      ),
+    12000,
+  )
+  const player = [...document.querySelectorAll('.chat__body video')].find(
+    (node) => node.getAttribute('src') === videoUrl,
+  )
+  check('视频渲染成 <video>', player !== undefined)
+  check('播放器带 controls', player?.hasAttribute('controls') === true)
+
+  // 文档 / 压缩包：下载条目
+  await sleep(1600)
+  const pdfUrl = mediaBase + '/2026-09/11111111-1111-1111-1111-111111111111.pdf'
+  $('[data-chat-input]').value = '[说明.pdf](' + pdfUrl + ')'
+  submitForm('[data-chat-composer]')
+  await waitFor(
+    '文档渲染成下载条目',
+    () => document.querySelectorAll('.chat__body a.chat__file-link').length > 0,
+    12000,
+  )
+  check('文档渲染成下载条目', document.querySelectorAll('.chat__body a.chat__file-link').length > 0)
 
   // --- 撤回 ---
   section('撤回')

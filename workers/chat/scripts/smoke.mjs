@@ -96,6 +96,19 @@ function request(path, { jar, method = 'GET', body, origin } = {}) {
   })
 }
 
+/**
+ * 上传接口的请求长得不一样：请求体是**原始字节**（不是 JSON），
+ * 文件名走 X-Filename 头。所以单独一个函数，别把 request 搞复杂。
+ */
+function uploadRequest(path, { jar, contentType, filename, bytes }) {
+  const headers = { 'Content-Type': contentType, Origin: ORIGIN }
+  if (filename !== undefined) headers['X-Filename'] = encodeURIComponent(filename)
+  if (jar !== undefined) headers['Cookie'] = cookieHeader(jar)
+  return fetch(`${BASE}${path}`, { method: 'POST', headers, body: bytes })
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 // --- 极简 WebSocket 客户端 -------------------------------------------------
 
 function openSocket({ jar, origin = ORIGIN, room = 'general' } = {}) {
@@ -357,6 +370,78 @@ section('实时收发')
   check('名单回显了房间名', memberList.room === 'general', `实际 ${memberList.room}`)
 
   client.socket.close()
+}
+
+section('上传与媒体')
+{
+  // 最小 PNG：8 字节魔数 + 一点点数据，足够让类型嗅探认出它是图片
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
+
+  const anonymous = await uploadRequest('/api/uploads', {
+    contentType: 'image/png',
+    filename: 'anon.png',
+    bytes: pngBytes,
+  })
+  check('未登录上传返回 401', anonymous.status === 401, `实际 ${anonymous.status}`)
+
+  const uploaded = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'image/png',
+    filename: '测试图.png',
+    bytes: pngBytes,
+  })
+  check('登录后能上传图片', uploaded.status === 201, `实际 ${uploaded.status}`)
+  const asset = await uploaded.json()
+  check('识别为 image', asset.kind === 'image', `实际 ${asset.kind}`)
+  check('返回了媒体 URL', typeof asset.url === 'string' && asset.url.includes('/api/media/'))
+  check('文件名原样保留（含中文）', asset.filename === '测试图.png', `实际 ${asset.filename}`)
+
+  const served = await fetch(asset.url, { headers: { Cookie: cookieHeader(jar) } })
+  check('上传后能读回来', served.status === 200, `实际 ${served.status}`)
+  check('图片以 image/png 内联返回', served.headers.get('content-type') === 'image/png')
+
+  // 换一个会被当成纯文本的 HTML：必须拒掉，
+  // 否则下载下来双击就能在浏览器里执行
+  await sleep(3200) // 绕开上传间隔限流
+  const htmlUpload = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'text/html',
+    filename: 'evil.html',
+    bytes: new TextEncoder().encode('<html><body>x</body></html>'),
+  })
+  check('HTML / SVG 这类标记文本被拒', htmlUpload.status === 415, `实际 ${htmlUpload.status}`)
+
+  await sleep(3200)
+  const svgUpload = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'image/svg+xml',
+    filename: 'evil.svg',
+    bytes: new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
+  })
+  check('SVG 被拒（它能在浏览器里执行脚本）', svgUpload.status === 415, `实际 ${svgUpload.status}`)
+
+  // 撤回要连带删掉媒体对象
+  await sleep(1600) // 绕开发言间隔限流
+  const withMedia = await request('/api/messages', {
+    method: 'POST',
+    jar,
+    body: { body: `![图](${asset.url})`, room: 'general' },
+  })
+  const posted = await withMedia.json()
+  check('带媒体的消息能发出去', withMedia.status === 201, `实际 ${withMedia.status}`)
+
+  const removed = await request(`/api/messages/${posted.message.id}`, { method: 'DELETE', jar })
+  check('撤回带媒体的消息返回 200', removed.status === 200, `实际 ${removed.status}`)
+
+  const afterDelete = await fetch(asset.url, { headers: { Cookie: cookieHeader(jar) } })
+  check('撤回后媒体对象也被删了', afterDelete.status === 404, `实际 ${afterDelete.status}`)
+
+  const gone = await request('/api/messages', { jar })
+  const gonePage = await gone.json()
+  check(
+    '撤回后历史里不再有这条',
+    !gonePage.messages.some((item) => item.id === posted.message.id),
+  )
 }
 
 section('refresh 轮换与吊销')

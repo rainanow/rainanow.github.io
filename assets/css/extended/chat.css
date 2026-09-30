@@ -28,17 +28,6 @@
   display: none !important;
 }
 
-/*
- * 这一页本身就叫「聊天室」，正文顶上再挂一个大标题是重复的。
- *
- * 用 :has() 把范围锁死在「正文里含聊天室」的那一页——主题的 single.html 没有
- * 隐藏标题的开关，而直接改主题模板会波及全部文章页。:has() 在新版浏览器里都支持，
- * 不支持的话只是退化成「标题还在」，不会影响别的排版。
- */
-.post-single:has(#chat-app) .post-title {
-  display: none;
-}
-
 /* --- 顶栏：连接状态 + 当前用户 --- */
 
 .chat__bar {
@@ -380,25 +369,103 @@
   text-underline-offset: 2px;
 }
 
+/* --- 消息里的媒体 --- */
+
+/* 图片：点了会放大到全屏遮罩 */
+.chat__body img {
+  display: block;
+  max-width: 100%;
+  max-height: 20rem;
+  margin: 0.3rem 0;
+  border-radius: var(--radius, 6px);
+  border: 1px solid var(--border, #eee);
+  cursor: zoom-in;
+}
+
+/* 视频就地播。R2 直连原生支持 HTTP Range，所以进度条拖得动 */
+.chat__body video {
+  display: block;
+  max-width: 100%;
+  max-height: 22rem;
+  margin: 0.3rem 0;
+  border-radius: var(--radius, 6px);
+  background: #000;
+}
+
+.chat__body audio {
+  display: block;
+  width: 100%;
+  max-width: 22rem;
+  margin: 0.3rem 0;
+}
+
+/* 文档 / 压缩包：做成一个个下载条目，而不是裸链接 */
+.chat__body a.chat__file-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  margin: 0.2rem 0;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--border, #eee);
+  border-radius: var(--radius, 6px);
+  background: var(--theme, #fff);
+  text-decoration: none;
+}
+
+.chat__body a.chat__file-link:hover {
+  border-color: var(--secondary, #6b7280);
+}
+
+.chat__file-meta {
+  font-size: 0.75rem;
+  color: var(--secondary, #6b7280);
+}
+
+/* --- 点图片放大的遮罩 --- */
+
+.chat__lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, 0.82);
+  cursor: zoom-out;
+}
+
+.chat__lightbox-image {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--radius, 6px);
+}
+
 /* --- 成员名单（挂在在线人数右边的折叠开关） --- */
 
 /*
  * 开关做得轻一些：它是「在线 N 人」的附属说明，不是页面上的主要操作，
  * 所以不套按钮边框，就跟状态文字一个体量。
  */
-.chat__members-toggle {
+/* 成员和房间两个开关长一个样，都挂在状态栏那一行里 */
+.chat__members-toggle,
+.chat__rooms-toggle {
   display: inline-flex;
   align-items: center;
+  gap: 0.25rem;
   appearance: none;
   border: none;
   background: none;
-  /* 里面只有一个三角，全靠内边距把它撑成一个够点的目标 */
+  /* 全靠内边距把它们撑成够点的目标（成员那个里面只有一个三角） */
   padding: 0.1rem 0.3rem;
+  font: inherit;
+  font-size: 0.8rem;
   color: var(--secondary, #6b7280);
   cursor: pointer;
 }
 
-.chat__members-toggle:hover {
+.chat__members-toggle:hover,
+.chat__rooms-toggle:hover {
   color: var(--primary, #111827);
 }
 
@@ -406,7 +473,8 @@
  * 展开后是一横条，位置在登录/注册框和聊天框之上（DOM 顺序决定），
  * 把下面两块顶下去。max-height + 滚动兜住人多的情况。
  */
-.chat__members-panel {
+.chat__members-panel,
+.chat__rooms-panel {
   max-height: 14rem;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -465,8 +533,55 @@
 
 /* 展开时三角翻过来：朝下＝还能拉开，朝上＝点一下收回去 */
 .chat__members-toggle[aria-expanded="true"] .chat__members-caret,
+.chat__rooms-toggle[aria-expanded="true"] .chat__members-caret,
 .chat__members-title--toggle[aria-expanded="true"] .chat__members-caret {
   transform: rotate(180deg);
+}
+
+/* --- 房间菜单 --- */
+
+.chat__rooms-title {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--secondary, #6b7280);
+}
+
+.chat__rooms-list {
+  list-style: none;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+/* 一间房一行，整行可点；点它是普通页面跳转，不在这里做页内切换 */
+.chat__room-link {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  color: var(--content, #374151);
+  text-decoration: none;
+}
+
+.chat__room-link:hover {
+  background: var(--theme, #fff);
+  color: var(--primary, #111827);
+}
+
+.chat__room-link.is-current {
+  font-weight: 600;
+  color: var(--primary, #111827);
+  background: var(--theme, #fff);
+}
+
+/* 房间名（URL 里用的那个 slug），用小字附在旁边 */
+.chat__room-slug {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--secondary, #6b7280);
 }
 
 /* 一人一行，和「在线 3」这个标题对齐成一列 */
@@ -515,8 +630,15 @@
   gap: 0.5rem;
 }
 
+/* 输入框和「+」包在一起，「+」才能绝对定位到输入框内部 */
+.chat__composer-box {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .chat__composer textarea {
-  flex: 1;
+  width: 100%;
   font: inherit;
   font-size: 0.9rem;
   line-height: 1.5;
@@ -527,12 +649,44 @@
   background: var(--theme, #fff);
   border: 1px solid var(--border, #e5e7eb);
   border-radius: var(--radius, 6px);
-  padding: 0.5rem 0.65rem;
+  /* 左边留一截给「+」，文字整体避开它 */
+  padding: 0.5rem 0.65rem 0.5rem 1.9rem;
 }
 
 .chat__composer textarea:focus-visible {
   outline: 2px solid var(--primary, #111827);
   outline-offset: 1px;
+}
+
+/* 上传入口：就在输入框里面、左下角，点它去触发那个藏起来的 file input */
+.chat__upload {
+  position: absolute;
+  left: 0.35rem;
+  bottom: 0.35rem;
+  width: 1.35rem;
+  height: 1.35rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  border: none;
+  background: none;
+  border-radius: 50%;
+  color: var(--secondary, #6b7280);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.chat__upload:hover:not(:disabled) {
+  color: var(--primary, #111827);
+  background: var(--entry, #f9fafb);
+}
+
+.chat__upload:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 @media (max-width: 600px) {
