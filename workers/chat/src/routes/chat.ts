@@ -3,7 +3,7 @@ import { HTTPException } from 'hono/http-exception'
 import type { Context } from 'hono'
 import { z } from 'zod'
 
-import { DEFAULT_ROOM, HISTORY_PAGE_SIZE, MEMBER_LIST_LIMIT } from '../config'
+import { DEFAULT_ROOM, EXPORT_LIMIT, HISTORY_PAGE_SIZE, MEMBER_LIST_LIMIT } from '../config'
 import { extractMediaKeys } from '../media'
 import { refundUpload } from '../quota'
 import type { AppEnv, ChatContext } from '../context'
@@ -42,6 +42,19 @@ function normalizeRoom(value: string | undefined): string {
   if (value === undefined) return DEFAULT_ROOM
   const trimmed = value.trim()
   return /^[a-z0-9_-]{1,32}$/.test(trimmed) ? trimmed : DEFAULT_ROOM
+}
+
+/**
+ * 管理员的门禁。
+ *
+ * 前端也会把按钮藏起来，但那只是「别让人白点」——真正的判定必须在这里，
+ * 否则任何人手上一发请求就能清空整个房间。
+ */
+async function requireAdmin(c: Context<AppEnv>, User: ChatContext['User']): Promise<void> {
+  const sub = requireSubject(c)
+  const user = await User.findOne(sub)
+  if (user === null) throw new HTTPException(401, { message: '账号不存在' })
+  if (user.role !== 'admin') throw new HTTPException(403, { message: '只有管理员能做这个操作' })
 }
 
 /**
@@ -289,6 +302,78 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
 
     await broadcast(c.env, target.room, { type: 'deleted', room: target.room, id })
     return c.json({ ok: true })
+  })
+
+  /**
+   * 导出房间的全部消息（仅管理员）。
+   *
+   * 返回**原始数据**，不在这里拼 markdown —— 格式是展示层的事，
+   * 后端猜错了就得改接口，不如让前端拿到之后想存成 md 还是 json 都行。
+   *
+   * 一次最多 `EXPORT_LIMIT` 条，超了截断并带 `truncated` 标记，
+   * 免得某个房间攒了几万条时把响应体撑爆。
+   */
+  app.get('/api/rooms/:room/export', cookieAuthBridge, auth.middleware(), async (c) => {
+    const room = normalizeRoom(c.req.param('room'))
+    await requireAdmin(c, User)
+
+    const rows = (await app.db
+      .select({
+        id: Message.table.id,
+        userId: Message.table.userId,
+        username: Message.table.username,
+        body: Message.table.body,
+        createdAt: Message.table.createdAt,
+      })
+      .from(Message.table)
+      .where(and(eq(Message.table.room, room), eq(Message.table.deleted, false)))
+      .orderBy(asc(Message.table.createdAt))
+      .limit(EXPORT_LIMIT)) as HistoryRow[]
+
+    return c.json({
+      room,
+      count: rows.length,
+      truncated: rows.length >= EXPORT_LIMIT,
+      messages: rows.map((row) => ({
+        id: row.id,
+        username: row.username,
+        body: row.body,
+        createdAt: row.createdAt.getTime(),
+      })),
+    })
+  })
+
+  /**
+   * 清空整个房间（仅管理员）。**硬删**，不是软删 —— 这是「清空」不是「撤回」。
+   *
+   * 消息里引用的媒体对象也一并删掉，否则它们会变成没人引用的孤儿：
+   * 白占 R2 空间，而且那些 URL 是公开的，等于内容其实没清干净。
+   */
+  app.delete('/api/rooms/:room', cookieAuthBridge, auth.middleware(), async (c) => {
+    const room = normalizeRoom(c.req.param('room'))
+    await requireAdmin(c, User)
+
+    const rows = (await app.db
+      .select({ body: Message.table.body })
+      .from(Message.table)
+      .where(eq(Message.table.room, room))) as { body: string }[]
+
+    let removedMedia = 0
+    for (const row of rows) {
+      for (const key of extractMediaKeys(row.body)) {
+        try {
+          await c.env.MEDIA.delete(key)
+          removedMedia += 1
+        } catch {
+          // 单个对象删失败不该让整个清空回滚，继续删剩下的
+        }
+      }
+    }
+
+    await app.db.delete(Message.table).where(eq(Message.table.room, room))
+    await broadcast(c.env, room, { type: 'purged', room })
+
+    return c.json({ ok: true, removedMessages: rows.length, removedMedia })
   })
 
   /**

@@ -299,6 +299,13 @@ try {
   check('当前房间被标记出来', roomLinks.some((link) => link.classList.contains('is-current')))
   check('展开房间菜单会把成员面板收起来（两个面板互斥）', !visible('[data-chat-members-panel]'))
 
+  // --- 管理员按钮 ---
+  // 这个账号是普通用户，所以那两个图标按钮不该露出来
+  //（服务端那道门禁由 smoke 的「非管理员导出/清空被拒（403）」守）
+  section('管理员按钮')
+  check('普通用户看不到「导出」按钮', !visible('[data-chat-export]'))
+  check('普通用户看不到「清空」按钮', !visible('[data-chat-purge]'))
+
   // --- 撤回按钮 ---
   // 要求：每条消息都渲染出 ×（不管是不是自己的），但只有有权限的能点。
   section('撤回按钮')

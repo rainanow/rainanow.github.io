@@ -483,6 +483,38 @@
 }
 
 /*
+ * 管理员专属的单图标按钮（导出 / 清空）。和上面两个开关一样是「轻操作」的体量：
+ * 没有边框、没有底色，就是个能点的图标。
+ */
+.chat__icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0.15rem;
+  border-radius: 4px;
+  color: var(--secondary, #6b7280);
+  cursor: pointer;
+  transition: color 0.12s ease;
+}
+
+.chat__icon-button:hover:not(:disabled) {
+  color: var(--primary, #111827);
+}
+
+/* 清空是破坏性操作，悬停时给红色，让人在点下去之前就掂量一下 */
+.chat__icon-button--danger:hover:not(:disabled) {
+  color: #ef4444;
+}
+
+.chat__icon-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/*
  * 展开后是一横条，位置在登录/注册框和聊天框之上（DOM 顺序决定），
  * 把下面两块顶下去。max-height + 滚动兜住人多的情况。
  */

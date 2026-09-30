@@ -24,6 +24,13 @@ export const MAX_MESSAGE_LENGTH = 500
 export const HISTORY_PAGE_SIZE = 50
 
 /**
+ * 导出房间内容时一次最多取多少条。
+ * 超了就截断并在响应里带 `truncated` 标记 —— 免得某个房间攒了几万条时
+ * 把响应体撑爆（Workers 的响应大小也有上限）。
+ */
+export const EXPORT_LIMIT = 5000
+
+/**
  * 单个上传文件的上限。浏览器的 canvas 压缩会把手机原图压到这个数以下，
  * 所以实际上只有「文档」类会真的顶到这个上限。
  */

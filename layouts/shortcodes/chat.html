@@ -76,6 +76,33 @@
       房间 <span class="chat__members-caret" aria-hidden="true"></span>
     </button>
 
+    {{- /*
+      管理员专属：导出 / 清空当前房间。单图标、不带文字，默认藏着，
+      登录之后由前端按 role 决定露不露出来。
+      注意：前端藏只是「别让人白点」，能不能真的执行由服务端判定 —— 否则
+      任何人手上一发请求就能清空整个房间。
+    */ -}}
+    <button type="button" class="chat__icon-button" data-chat-export
+            aria-label="导出本房间的全部内容" title="导出本房间的全部内容" hidden>
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none"
+           stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M8 2v8" />
+        <path d="M4.5 7 8 10.5 11.5 7" />
+        <path d="M3 13h10" />
+      </svg>
+    </button>
+
+    <button type="button" class="chat__icon-button chat__icon-button--danger" data-chat-purge
+            aria-label="清空本房间的全部内容" title="清空本房间的全部内容" hidden>
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none"
+           stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M2.5 4h11" />
+        <path d="M6 4V2.5h4V4" />
+        <path d="M4.2 4l.6 9h6.4l.6-9" />
+        <path d="M6.6 6.8v3.6M9.4 6.8v3.6" />
+      </svg>
+    </button>
+
     <span class="chat__self">
       <span data-chat-me hidden></span>
       <button type="button" class="chat__button chat__button--ghost" data-chat-logout hidden>退出</button>

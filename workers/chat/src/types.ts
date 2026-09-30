@@ -20,6 +20,8 @@ export type ChatServerEvent =
   | { type: 'presence'; online: number; event: 'join' | 'leave'; username: string }
   /** 某条消息被作者本人或管理员撤回 */
   | { type: 'deleted'; room: string; id: string }
+  /** 管理员把整个房间清空了 —— 所有客户端据此把消息列表抹掉 */
+  | { type: 'purged'; room: string }
 
 /** 挂在 WebSocket 上的身份信息，DO 休眠后靠它恢复（serializeAttachment）。 */
 export interface SocketAttachment {
