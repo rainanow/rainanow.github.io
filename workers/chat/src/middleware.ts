@@ -29,14 +29,31 @@ export const cookieAuthBridge: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next()
 }
 
-/** 取真实客户端 IP。本地 `wrangler dev` 没有 cf-connecting-ip，会落到 'unknown'。 */
+/**
+ * 取客户端 IP，用来当限流的桶键。
+ *
+ * 生产上请求一定经过 Cloudflare，`cf-connecting-ip` 由它写入，
+ * 客户端自带同名头会被覆盖掉 —— 这是唯一可信的来源，限流一律以它为准。
+ *
+ * 走到下面说明**没**经过 Cloudflare，正常只有本地 `wrangler dev` 属于这种情况。
+ * 此时 `x-forwarded-for` 是客户端想写什么就写什么的：拿它当桶键，
+ * 等于把「换桶」的钥匙交给对方，限流形同虚设。
+ * 所以只在它**不含逗号**（本地直连就是这种情形，本地也不需要防攻击）时才采信；
+ * 一旦出现逗号说明前面有代理链、里面混着别人能控制的字段，一律落 'unknown'。
+ * 共用同一个桶是 fail closed（只会更早触发 429），比让攻击者自己挑桶安全得多。
+ *
+ * 副作用：本地所有请求共用一个桶，注册 5 次就会被挡一小时。
+ * 想看当前计数 `npm run inspect-d1`；`npm run smoke` 自己会清本地 rate_limits。
+ */
 export function clientIp(c: { req: { header: (name: string) => string | undefined } }): string {
   const cloudflareIp = c.req.header('cf-connecting-ip')
   if (cloudflareIp !== undefined && cloudflareIp.length > 0) return cloudflareIp
 
   const forwarded = c.req.header('x-forwarded-for')
-  const first = forwarded?.split(',')[0]?.trim()
-  if (first !== undefined && first.length > 0) return first
+  if (forwarded !== undefined && forwarded.length > 0 && !forwarded.includes(',')) {
+    const trimmed = forwarded.trim()
+    if (trimmed.length > 0) return trimmed
+  }
 
   return 'unknown'
 }

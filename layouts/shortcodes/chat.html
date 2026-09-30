@@ -32,6 +32,18 @@
 
   <div class="chat__bar">
     <span class="chat__status" data-chat-status>正在加载…</span>
+
+    {{- /*
+      成员名单的折叠箭头，紧贴在「在线 N 人」右边，读起来就是一整句：
+      「已连接 · 在线 3 人 ▾」。点一下在下面展开名单，箭头翻成朝上。
+      按钮本身只有一个三角，所以 aria-label 是必需的（读屏用户看不到这个图形）。
+    */ -}}
+    <button type="button" class="chat__members-toggle" data-chat-members-toggle
+            aria-expanded="false" aria-controls="chat-members-panel"
+            aria-label="展开成员列表" title="展开成员列表" hidden>
+      <span class="chat__members-caret" aria-hidden="true"></span>
+    </button>
+
     <span class="chat__self">
       <span data-chat-me hidden></span>
       <button type="button" class="chat__button chat__button--ghost" data-chat-logout hidden>退出</button>
@@ -39,6 +51,29 @@
   </div>
 
   <p class="chat__notice" data-chat-notice hidden></p>
+
+  {{- /*
+    成员名单。展开时出现在这个位置：它在登录/注册框和聊天框**之前**，
+    所以一拉开，下面两块会被顶下去，看起来就是从那个箭头下面长出来的一横条。
+  */ -}}
+  <div class="chat__members-panel" id="chat-members-panel" data-chat-members-panel hidden>
+    <p class="chat__members-status" data-chat-members-status>正在加载…</p>
+
+    <div class="chat__members-group">
+      <p class="chat__members-title">在线 <span data-chat-online-count>0</span></p>
+      <ul class="chat__members-list" data-chat-online-list></ul>
+    </div>
+
+    {{- /* 离线默认再折一层（向下展开），人多时面板不会被撑得老长 */ -}}
+    <div class="chat__members-group">
+      <button type="button" class="chat__members-title chat__members-title--toggle"
+              data-chat-offline-toggle aria-expanded="false" aria-controls="chat-members-offline">
+        离线 <span data-chat-offline-count>0</span>
+        <span class="chat__members-caret" aria-hidden="true"></span>
+      </button>
+      <ul class="chat__members-list" id="chat-members-offline" data-chat-offline-list hidden></ul>
+    </div>
+  </div>
 
   {{- /* 未登录：登录 / 注册 */ -}}
   <section class="chat__auth" data-chat-auth hidden>

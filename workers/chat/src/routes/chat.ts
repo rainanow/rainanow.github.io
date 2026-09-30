@@ -1,9 +1,9 @@
-import { and, desc, eq, lt } from 'drizzle-orm'
+import { and, asc, desc, eq, lt } from 'drizzle-orm'
 import { HTTPException } from 'hono/http-exception'
 import type { Context } from 'hono'
 import { z } from 'zod'
 
-import { DEFAULT_ROOM, HISTORY_PAGE_SIZE } from '../config'
+import { DEFAULT_ROOM, HISTORY_PAGE_SIZE, MEMBER_LIST_LIMIT } from '../config'
 import type { AppEnv, ChatContext } from '../context'
 import type { Env } from '../env'
 import { cookieAuthBridge } from '../middleware'
@@ -91,6 +91,58 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
       username: user.username,
       role: user.role,
       createdAt: user.createdAt,
+    })
+  })
+
+  /**
+   * 成员名单：所有已注册账号，外加各自此刻在不在线。
+   *
+   * 在线状态只有 Durable Object 知道（连接握在它手里），所以这里问一次 DO 的 /online；
+   * 离线账号从 D1 取。两边的交集就是在线名单。
+   *
+   * 返回**扁平数组**而不是分好组的两份列表：排序是展示层的事，
+   * 前端想按在线优先排、还是加个搜索框筛，都不用再改后端。
+   */
+  app.get('/api/members', cookieAuthBridge, auth.middleware(), async (c) => {
+    const room = normalizeRoom(c.req.query('room'))
+    const me = await User.findOne(requireSubject(c))
+    if (me === null) throw new HTTPException(401, { message: '账号不存在' })
+
+    const stub = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(room))
+    let onlineIds: string[] = []
+    try {
+      const response = await stub.fetch('https://chat-room.internal/online')
+      if (response.ok) {
+        const payload = (await response.json()) as { userIds?: unknown }
+        if (Array.isArray(payload.userIds)) {
+          onlineIds = payload.userIds.filter((id): id is string => typeof id === 'string')
+        }
+      }
+    } catch {
+      // DO 临时拿不到就当作「没人在线」，不能因为这一处把整个名单接口拖挂。
+    }
+    const online = new Set(onlineIds)
+
+    // users 是小表，一次取完最省事；MEMBER_LIST_LIMIT 只是防呆上限。
+    const rows = (await app.db
+      .select({
+        id: User.table.id,
+        username: User.table.username,
+        role: User.table.role,
+      })
+      .from(User.table)
+      .orderBy(asc(User.table.username))
+      .limit(MEMBER_LIST_LIMIT)) as { id: string; username: string; role: string }[]
+
+    return c.json({
+      room,
+      total: rows.length,
+      members: rows.map((row) => ({
+        id: row.id,
+        username: row.username,
+        role: row.role,
+        online: online.has(row.id),
+      })),
     })
   })
 
