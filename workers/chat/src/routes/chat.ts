@@ -3,17 +3,21 @@ import { HTTPException } from 'hono/http-exception'
 import type { Context } from 'hono'
 import { z } from 'zod'
 
-import { DEFAULT_ROOM, EXPORT_LIMIT, HISTORY_PAGE_SIZE, MEMBER_LIST_LIMIT } from '../config'
+import {
+  DEFAULT_ROOM,
+  EXPORT_LIMIT,
+  HISTORY_PAGE_SIZE,
+  MEMBER_LIST_LIMIT,
+  MESSAGE_WINDOW_SECONDS,
+} from '../config'
 import { extractMediaKeys } from '../media'
 import { refundUpload } from '../quota'
+import { consumeRateLimit } from '../rate-limit'
 import type { AppEnv, ChatContext } from '../context'
 import type { Env } from '../env'
 import { cookieAuthBridge } from '../middleware'
 import { isAllowedOrigin } from '../origins'
 import type { ChatMessage, ChatServerEvent } from '../types'
-
-/** 同一个人的两条消息之间至少隔这么久。 */
-const MESSAGE_MIN_INTERVAL_MS = 1500
 
 const postMessageSchema = z.object({
   body: z.string().trim().min(1, '消息不能为空').max(500, '单条消息最多 500 字'),
@@ -58,31 +62,12 @@ async function requireAdmin(c: Context<AppEnv>, User: ChatContext['User']): Prom
 }
 
 /**
- * 发言频率限制放在 isolate 内存里，而不是 D1。
+ * 发言频率限制从 isolate 内存搬到了 D1（见 `consumeRateLimit`）。
  *
- * 理由：这条路径每条消息本来就有「读用户 + 写消息」两次 D1 往返了，
- * 再为限流加一次写，延迟和额度都不划算。内存版是**软限制**——
- * Workers 的 isolate 按 POP 分布，理论上用户跨 isolate 能绕过；
- * 但这个限制的目的是防手滑连点和简单刷屏，不是安全边界（安全边界是登录态 + 长度上限）。
+ * 内存那版挡手滑连点够用，但**换个接入点就绕过去了**：Workers 的 isolate 按 POP
+ * 分布、随时回收，攻击者每次请求落在不同 isolate 上，等于每次都是全新的空计数。
+ * 想真拦住就必须落库。代价是每条消息多一次 D1 写，这个换得值。
  */
-const lastPostAt = new Map<string, number>()
-
-function throttleMessage(userId: string): number | null {
-  const now = Date.now()
-  const last = lastPostAt.get(userId)
-  if (last !== undefined && now - last < MESSAGE_MIN_INTERVAL_MS) {
-    return Math.max(1, Math.ceil((MESSAGE_MIN_INTERVAL_MS - (now - last)) / 1000))
-  }
-  lastPostAt.set(userId, now)
-
-  // Map 会长大，顺手清掉过期的键（只在超过阈值时才做，避免每条消息都遍历）。
-  if (lastPostAt.size > 512) {
-    for (const [key, timestamp] of lastPostAt) {
-      if (now - timestamp > MESSAGE_MIN_INTERVAL_MS) lastPostAt.delete(key)
-    }
-  }
-  return null
-}
 
 /** 把事件交给该房间的 Durable Object 去推给所有在线连接。 */
 async function broadcast(env: Env, room: string, event: ChatServerEvent): Promise<void> {
@@ -223,10 +208,12 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
       return c.json({ error: parsed.error.issues[0]?.message ?? '输入不合法' }, 400)
     }
 
-    const retryAfter = throttleMessage(sub)
-    if (retryAfter !== null) {
-      c.header('Retry-After', String(retryAfter))
-      return c.json({ error: `发得太快了，${retryAfter} 秒后再试` }, 429)
+    // limit 传 2 而不是 1：`consumeRateLimit` 是「先记账再判断」，
+    // 窗口里的第一条（hits = 1）必须放行，所以要拦第 2 条就得把阈值设成 2。
+    const attempt = await consumeRateLimit(c.env.DB, `message:${sub}`, 2, MESSAGE_WINDOW_SECONDS)
+    if (attempt.blocked) {
+      c.header('Retry-After', String(attempt.retryAfterSeconds))
+      return c.json({ error: `发得太快了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
     }
 
     const user = await User.findOne(sub)

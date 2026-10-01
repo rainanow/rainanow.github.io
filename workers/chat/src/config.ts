@@ -43,8 +43,19 @@ export const MAX_UPLOAD_BYTES = 16 * 1024 * 1024
  */
 export const MEDIA_PATH_PREFIX = '/api/media/'
 
-/** 上传间隔：同一个人两次上传至少隔这么久，防手滑和刷存储。 */
-export const UPLOAD_MIN_INTERVAL_MS = 3000
+/**
+ * 发言 / 上传的频率限制窗口（秒），落在 D1 里。
+ *
+ * 以前这两个是 isolate 内存里的毫秒间隔，但内存计数**换个接入点就绕过去了** ——
+ * 它挡得住手滑连点，挡不住真想刷的人。现在统一走 `consumeRateLimit`：
+ * 固定窗口、落库、跨 isolate 可靠。代价是每次多一次 D1 写。
+ *
+ * 从「最小间隔」改成了「固定窗口」，语义上有个小差别：固定窗口在边界处会放行
+ * 两条挨得很近的请求（窗口末尾发一条、窗口一重置立刻再发）。对聊天场景无所谓，
+ * 换来的是不会被绕。
+ */
+export const MESSAGE_WINDOW_SECONDS = 2
+export const UPLOAD_WINDOW_SECONDS = 3
 
 /**
  * 上传配额。分两层，因为两道防线拦的东西不一样：
