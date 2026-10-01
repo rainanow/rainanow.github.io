@@ -459,7 +459,7 @@ section('上传与媒体')
 
   // 换一个会被当成纯文本的 HTML：必须拒掉，
   // 否则下载下来双击就能在浏览器里执行
-  await sleep(3200) // 绕开上传间隔限流
+  await sleep(3400) // 绕开上传间隔限流
   const htmlUpload = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'text/html',
@@ -468,7 +468,7 @@ section('上传与媒体')
   })
   check('HTML / SVG 这类标记文本被拒', htmlUpload.status === 415, `实际 ${htmlUpload.status}`)
 
-  await sleep(3200)
+  await sleep(3400)
   const svgUpload = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/svg+xml',
@@ -478,7 +478,7 @@ section('上传与媒体')
   check('SVG 被拒（它能在浏览器里执行脚本）', svgUpload.status === 415, `实际 ${svgUpload.status}`)
 
   // 撤回要连带删掉媒体对象
-  await sleep(1600) // 绕开发言间隔限流
+  await sleep(2200) // 绕开发言间隔限流
   const withMedia = await request('/api/messages', {
     method: 'POST',
     jar,
@@ -508,7 +508,7 @@ section('上传配额')
   const day = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
 
   clearUploadQuota()
-  await sleep(3200) // 绕开上传间隔限流
+  await sleep(3400) // 绕开上传间隔限流
   const before = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/png',
@@ -519,7 +519,7 @@ section('上传配额')
 
   // 把全站今天的额度填满，模拟被人拿一群小号刷爆
   forceUploadQuota(day)
-  await sleep(3200)
+  await sleep(3400)
   const blocked = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/png',
@@ -535,7 +535,7 @@ section('上传配额')
   )
 
   clearUploadQuota()
-  await sleep(3200)
+  await sleep(3400)
   const after = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/png',
@@ -569,9 +569,9 @@ section('管理员：导出与清空')
 
   // 清空拿一个临时房间试，别去动 general —— 那会毁掉别的用例
   const probeRoom = 'smokeprobe'
-  await sleep(1600)
+  await sleep(2200)
   await request('/api/messages', { method: 'POST', jar, body: { body: '会被清掉的消息一', room: probeRoom } })
-  await sleep(1600)
+  await sleep(2200)
   await request('/api/messages', {
     method: 'POST',
     jar,

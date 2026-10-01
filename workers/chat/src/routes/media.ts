@@ -1,11 +1,12 @@
 import { HTTPException } from 'hono/http-exception'
 import type { Context } from 'hono'
 
-import { MAX_UPLOAD_BYTES, UPLOAD_MIN_INTERVAL_MS } from '../config'
+import { MAX_UPLOAD_BYTES, UPLOAD_WINDOW_SECONDS } from '../config'
 import type { AppEnv, ChatContext } from '../context'
 import { buildMediaKey, detectMedia, isMediaKey, sanitizeFilename } from '../media'
 import { cookieAuthBridge } from '../middleware'
 import { checkUploadQuota, markUpload, quotaDay } from '../quota'
+import { consumeRateLimit } from '../rate-limit'
 
 function requireSubject(c: Context<AppEnv>): string {
   const sub = c.get('user')['sub']
@@ -15,28 +16,11 @@ function requireSubject(c: Context<AppEnv>): string {
   return sub
 }
 
-/**
- * 上传限流，放在 isolate 内存里，理由和发言限流一样：
- * 这条路径本来就有「读用户 + 写 R2」两次往返，再加一次 D1 写不划算。
- * 目的是防手滑连点和简单刷存储，不是安全边界 —— 真正的边界是登录态 + 大小/类型校验。
+/*
+ * 上传频率限制也搬到了 D1（`consumeRateLimit`），理由和发言限流一样：
+ * isolate 内存计数换个接入点就绕过去了。这条路径本来就有「读用户 + 写 R2」，
+ * 再多一次 D1 写不算负担，而防刷的意义比省这一次写大得多。
  */
-const lastUploadAt = new Map<string, number>()
-
-function throttleUpload(userId: string): number | null {
-  const now = Date.now()
-  const last = lastUploadAt.get(userId)
-  if (last !== undefined && now - last < UPLOAD_MIN_INTERVAL_MS) {
-    return Math.max(1, Math.ceil((UPLOAD_MIN_INTERVAL_MS - (now - last)) / 1000))
-  }
-  lastUploadAt.set(userId, now)
-
-  if (lastUploadAt.size > 512) {
-    for (const [key, timestamp] of lastUploadAt) {
-      if (now - timestamp > UPLOAD_MIN_INTERVAL_MS) lastUploadAt.delete(key)
-    }
-  }
-  return null
-}
 
 const MAX_MB = Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)
 
@@ -56,10 +40,11 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
     const user = await User.findOne(sub)
     if (user === null) throw new HTTPException(401, { message: '账号不存在' })
 
-    const retryAfter = throttleUpload(sub)
-    if (retryAfter !== null) {
-      c.header('Retry-After', String(retryAfter))
-      return c.json({ error: `上传太频繁了，${retryAfter} 秒后再试` }, 429)
+    // limit 传 2 的理由同发言限流：记账在先，窗口里的第一条要放行
+    const attempt = await consumeRateLimit(c.env.DB, `upload:${sub}`, 2, UPLOAD_WINDOW_SECONDS)
+    if (attempt.blocked) {
+      c.header('Retry-After', String(attempt.retryAfterSeconds))
+      return c.json({ error: `上传太频繁了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
     }
 
     // 先看声明的长度：不然一个超大的 body 会被整个读进内存，

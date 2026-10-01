@@ -210,7 +210,7 @@ try {
   // --- XSS ---
   section('XSS 防护')
   const payload = '<img src=x onerror="window.__pwned=1">'
-  await sleep(1600) // 绕开发言间隔限制
+  await sleep(2200) // 绕开发言限流（窗口 2 秒）
   $('[data-chat-input]').value = payload
   submitForm('[data-chat-composer]')
 
@@ -234,7 +234,7 @@ try {
   section('行内 markdown')
   const mdStamp = String(Date.now())
   const md = '**粗体** 与 `代码` 与 [链接](https://example.com) ' + mdStamp
-  await sleep(1600) // 绕开发言间隔限制
+  await sleep(2200) // 绕开发言限流（窗口 2 秒）
   $('[data-chat-input]').value = md
   submitForm('[data-chat-composer]')
 
@@ -256,7 +256,7 @@ try {
   // 不安全的协议不能变成链接，也不能被执行
   const badStamp = String(Date.now())
   const bad = '[点我](javascript:window.__pwned2=1) ' + badStamp
-  await sleep(1600)
+  await sleep(2200)
   $('[data-chat-input]').value = bad
   submitForm('[data-chat-composer]')
 
@@ -340,7 +340,7 @@ try {
   const mediaBase = $('#chat-app')?.dataset.mediaBase ?? ''
   const ownImage = mediaBase + '/2026-09/11111111-2222-3333-4444-555555555555.jpg'
 
-  await sleep(1600)
+  await sleep(2200)
   $('[data-chat-input]').value = '![图](' + ownImage + ')'
   submitForm('[data-chat-composer]')
 
@@ -369,7 +369,7 @@ try {
   check('点遮罩能关掉', !visible('[data-chat-lightbox]'))
 
   // 外站图片绝不能被渲染成 <img>：那等于给每个人一条追踪访问者 IP 的探针
-  await sleep(1600)
+  await sleep(2200)
   $('[data-chat-input]').value = '![x](https://evil.example.com/track.png)'
   submitForm('[data-chat-composer]')
   // 外站图片会被降级成普通外链（URL 在 href 里，不在 textContent 里，所以按 href 等）
@@ -389,7 +389,7 @@ try {
   )
 
   // 音视频按扩展名分派成播放器
-  await sleep(1600)
+  await sleep(2200)
   const videoUrl = mediaBase + '/2026-09/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.mp4'
   $('[data-chat-input]').value = '[视频](' + videoUrl + ')'
   submitForm('[data-chat-composer]')
@@ -408,7 +408,7 @@ try {
   check('播放器带 controls', player?.hasAttribute('controls') === true)
 
   // 文档 / 压缩包：下载条目
-  await sleep(1600)
+  await sleep(2200)
   const pdfUrl = mediaBase + '/2026-09/11111111-1111-1111-1111-111111111111.pdf'
   $('[data-chat-input]').value = '[说明.pdf](' + pdfUrl + ')'
   submitForm('[data-chat-composer]')
