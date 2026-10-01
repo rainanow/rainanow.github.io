@@ -1,0 +1,99 @@
+{{/* 乐谱图片。
+     为什么不用 markdown 的 ![](...) 语法：那样写不出 width/height
+     （hugo.toml 里 block attributes 对图片不生效），而没有尺寸的 lazy 图片
+     占位高度是 0，浏览器会认为 167 张全在视口附近，一次性全加载。
+
+     为什么不用原生 loading="lazy"：点目录跳转时页面会快速滚过中间几十张，
+     原生 lazy 只要「进入过视口」就发请求，途经的全都会被拉下来，直接撞上
+     img.yulo.top 在 Cloudflare 上的限流（40 次/秒，封 10 秒）。
+     所以这里只写 data-src，真正的加载交给下面那段脚本：
+     滚动停下来 150ms 后，才按文档顺序加载当前视口里的图，同时最多 3 个并发。
+
+     用法：{{< score src="https://img.yulo.top/sky/xxx.jpg" title="曲名" w="1920" h="12223" >}}
+     w/h 必须是图片真实像素，浏览器靠它算 aspect-ratio 预留占位。
+*/ -}}
+
+{{- if not (.Page.Store.Get "scoreScript") -}}
+{{- .Page.Store.Set "scoreScript" true -}}
+<script>
+(function () {
+    var DWELL = 150;      // 滚动停下来多久才发请求(ms)
+    var MAX_ACTIVE = 3;   // 同时最多几个请求；限流是 40 次/秒，这里远远够不着
+    var LOOKAHEAD = '150px 0px';
+
+    function init() {
+        var imgs = Array.prototype.slice.call(document.querySelectorAll('img.score[data-src]'));
+        if (!imgs.length) return;
+
+        var queue = [], active = 0, idle = null, candidates = [];
+
+        function pump() {
+            while (active < MAX_ACTIVE && queue.length) {
+                var img = queue.shift();
+                var src = img.getAttribute('data-src');
+                img.removeAttribute('data-src');
+                active++;
+                img.addEventListener('load', settle, { once: true });
+                img.addEventListener('error', settle, { once: true });
+                img.src = src;
+            }
+        }
+        function settle() {
+            active--;
+            pump();
+        }
+        function flush() {
+            idle = null;
+            candidates
+                .sort(function (a, b) {
+                    return (a.compareDocumentPosition(b) & 2) ? -1 : 1;
+                })
+                .forEach(function (img) {
+                    if (img.hasAttribute('data-src') && queue.indexOf(img) === -1) queue.push(img);
+                });
+            pump();
+        }
+        function schedule() {
+            if (idle) clearTimeout(idle);
+            idle = setTimeout(flush, DWELL);
+        }
+
+        if (!('IntersectionObserver' in window)) {
+            imgs.forEach(function (img) { queue.push(img); });
+            pump();
+            return;
+        }
+
+        var io = new IntersectionObserver(function (entries) {
+            entries.forEach(function (e) {
+                var i = candidates.indexOf(e.target);
+                if (e.isIntersecting && i === -1) candidates.push(e.target);
+                else if (!e.isIntersecting && i !== -1) candidates.splice(i, 1);
+            });
+            schedule();
+        }, { rootMargin: LOOKAHEAD });
+
+        imgs.forEach(function (img) { io.observe(img); });
+        schedule(); // 首屏也要出图，不能干等滚动
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
+</script>
+{{- end -}}
+
+<img class="score"
+     data-src="{{ .Get "src" | safeURL }}"
+     alt="{{ .Get "title" }}"
+     title="{{ .Get "title" }}"
+     width="{{ .Get "w" }}"
+     height="{{ .Get "h" }}"
+     decoding="async">
+<noscript>
+  <img class="score" src="{{ .Get "src" | safeURL }}" alt="{{ .Get "title" }}"
+       title="{{ .Get "title" }}" width="{{ .Get "w" }}" height="{{ .Get "h" }}">
+</noscript>
