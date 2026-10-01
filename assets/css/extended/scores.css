@@ -1,0 +1,18 @@
+/* 乐谱页：content/posts/乐谱/index.md 用 layouts/shortcodes/score.html 输出图片。
+
+   height:auto 这一条不能省。img 的 width/height 属性在浏览器里会变成
+   `width:1920px; height:12223px` 这样的 presentational hint，而主题只给了
+   `img { max-width: 100% }`（reset.css）——宽度被容器压窄、高度却还是那一万像素，
+   图片会被压扁。写了 height:auto 之后，高度改由 width/height 属性推出的
+   aspect-ratio 计算，既等比，又给还没加载的图预留了正确高度的占位。
+
+   .score[data-src] 是「图片还没轮到加载」的状态：src 由脚本在滚动停下后才填上，
+   填满会 removeAttribute('data-src')，透明度跟着回到 1，所以是淡入而不是闪出来。 */
+.score {
+    height: auto;
+    transition: opacity .25s;
+}
+
+.score[data-src] {
+    opacity: 0;
+}
