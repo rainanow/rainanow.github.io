@@ -19,8 +19,16 @@ const ORIGIN = 'https://yulo.top'
 /**
  * 跑之前清掉本地限流计数。
  *
- * 注册限额是「同一 IP 每小时 5 次」，而这个脚本一轮就要用掉 3 次
- * （成功 1 次 + 非法输入 1 次 + 重名 1 次），连跑两遍必然撞 429 ——
+ * 注册限额是「同一 IP 每小时 5 次」，而这个脚本一轮要用掉 **3 次**：
+ *   1. 主测试账号（成功）
+ *   2. 重名账号（用户名大写）—— 409，但**已经记过账了**
+ *   3. 「审计：谁删的」那一节的 victim 账号
+ *
+ * 注意**非法输入那一次不算**：注册接口是**先校验格式、后记账**，
+ * 所以 `username: 'x'` 那次直接 400 返回，压根没走到限流。
+ * 别照着「有 4 次 register 调用」去数额度 —— 那是 4 次调用、3 次记账。
+ *
+ * 3/5 意味着再加两个注册就会撞限额，连跑两遍必然 429 ——
  * 表现成一片红，很容易被误判成代码坏了。
  *
  * 只在本机地址上动手，指向远端时直接跳过，绝不会去清生产环境的数据。
@@ -425,6 +433,52 @@ section('实时收发')
   check('每条都带 online 布尔值', memberList.members.every((item) => typeof item.online === 'boolean'))
   check('名单里没有密码字段', memberList.members.every((item) => item.password === undefined))
   check('名单回显了房间名', memberList.room === 'general', `实际 ${memberList.room}`)
+  check('默认 scope 是 all', memberList.scope === 'all', `实际 ${memberList.scope}`)
+
+  /*
+   * scope=online：这条路径的意义就是**不读 D1 的 users 表**，
+   * 所以这里验的不是「能不能拿到名单」，而是三件事：
+   *   1. 只回在线的人（离线的一个都不该出现）；
+   *   2. 带上了用户名（否则前端拿到一堆 id 也没法显示）；
+   *   3. 未登录仍然 401 —— 别为了省一次查询把鉴权也省了。
+   */
+  const onlineRes = await request('/api/members?scope=online', { jar })
+  check('scope=online 返回 200', onlineRes.status === 200, `实际 ${onlineRes.status}`)
+  const onlineList = await onlineRes.json()
+  check('scope=online 只回在线的人', Array.isArray(onlineList.members) && onlineList.members.every((m) => m.online === true), `实际 ${JSON.stringify(onlineList.members).slice(0, 120)}`)
+  check(
+    'scope=online 带上了用户名（否则前端显示不出来）',
+    onlineList.members.every((m) => typeof m.username === 'string' && m.username.length > 0),
+    `实际 ${JSON.stringify(onlineList.members).slice(0, 120)}`,
+  )
+  check(
+    'scope=online 里能找到自己（WebSocket 还连着）',
+    onlineList.members.some((m) => m.username === username),
+    `实际 ${onlineList.members.map((m) => m.username).join(',')}`,
+  )
+  check('scope=online 的人数不超过全量人数', onlineList.total <= memberList.total, `${onlineList.total} vs ${memberList.total}`)
+
+  const anonOnline = await request('/api/members?scope=online')
+  check('scope=online 未登录仍然 401（省查询不能省鉴权）', anonOnline.status === 401, `实际 ${anonOnline.status}`)
+
+  /*
+   * 降级路径的形状检查。
+   *
+   * 线上代码里有个不显然的判断：DO 如果回了 userIds 却没回 members
+   * （老版本 DO / 两边代码不同步），`scope=online` 会**自动退回全量**，
+   * 而不是回一个空列表 —— 因为空列表会让前端把所有人都标成离线，
+   * 那是「显示错」而不是「显示慢」。
+   *
+   * 这里没法真的造一个老版本 DO，但能验「有人在线时 scope=online 一定给得出用户名」，
+   * 也就是那条降级分支的前提不成立时它一定会生效。
+   */
+  const onlineNames = onlineList.members.map((m) => m.username)
+  check(
+    '有人在线时 scope=online 一定带得出用户名（降级分支不会误触发）',
+    onlineList.members.length === 0 ||
+      (onlineList.members.length > 0 && onlineNames.every((n) => typeof n === 'string' && n.length > 0)),
+    `在线 ${onlineList.members.length} 人：${onlineNames.join(',')}`,
+  )
 
   client.socket.close()
 }
@@ -556,6 +610,24 @@ section('管理员：导出与清空')
 
   setLocalRole(username, 'admin')
 
+  /*
+   * 先往 general 里补一条**不会被删**的消息。
+   *
+   * 为什么必须自己造：以前这两个用例（导出有内容、清空没误伤 general）
+   * 是靠「之前几轮测试在 general 里攒下的消息」通过的。在**全新库**上跑，
+   * general 是空的 —— 因为前面「撤回」「撤回带媒体」两个用例
+   * 正好把本轮发到 general 的消息都撤掉了，于是这两条直接红。
+   *
+   * 测试不能依赖上一轮留下的状态，否则换个环境就误报成代码坏了。
+   */
+  await sleep(2200)
+  const seed = await request('/api/messages', {
+    method: 'POST',
+    jar,
+    body: { body: '给导出用例垫一条消息', room: 'general' },
+  })
+  check('垫的消息发成功了', seed.status === 201, `实际 ${seed.status}`)
+
   const exported = await request('/api/rooms/general/export', { jar })
   check('管理员能导出房间', exported.status === 200, `实际 ${exported.status}`)
   const dump = await exported.json()
@@ -626,6 +698,229 @@ section('登录限流')
     lastStatus = response.status
   }
   check('连续失败 11 次后返回 429', lastStatus === 429, `实际 ${lastStatus}`)
+}
+
+section('撤回限流')
+{
+  /*
+   * 撤回原先完全没有限流，是唯一一条「无限制、每条都写库」的路由。
+   * 这里验四件事：
+   *   1. 额度用完之前，请求能正常走到「消息不存在」这一层（不会被限流误伤）；
+   *   2. 打满之后确实返回 429，而不是无限放行；
+   *   3. 429 带 Retry-After，前端/调用方能知道等多久；
+   *   4. 撤回的计数器和发言是**分开**的 —— 被撤回限流挡住之后，还能正常发言。
+   *      这一条最重要：如果两个计数器共用一个 key，用户连着撤回几条旧消息
+   *      就会莫名其妙发不出话。
+   *
+   * 断言写成「序列里必然出现 429」而不是「第 21 次一定 429」，
+   * 这样不依赖本轮之前已经用过几次撤回（上面还有 2 次），也就不会因为
+   * 测试顺序调整而变成脆弱的假失败。
+   */
+  const statuses = []
+  let retryAfter = null
+  // 31 > 20 的额度，保证一定能打满
+  for (let attempt = 0; attempt < 31; attempt += 1) {
+    const response = await request('/api/messages/00000000-0000-4000-8000-000000000000', {
+      method: 'DELETE',
+      jar,
+    })
+    statuses.push(response.status)
+    if (response.status === 429 && retryAfter === null) {
+      retryAfter = response.headers.get('retry-after')
+    }
+  }
+
+  const firstBlocked = statuses.indexOf(429)
+  check('撤回打满额度后返回 429', firstBlocked !== -1, `状态序列：${statuses.join(',')}`)
+  check(
+    '被限流之前，请求正常走到了业务逻辑（404）',
+    firstBlocked > 0 && statuses.slice(0, firstBlocked).every((status) => status === 404),
+    `前 ${firstBlocked} 个状态：${statuses.slice(0, firstBlocked).join(',')}`,
+  )
+  check('429 之后不会再放行', statuses.slice(firstBlocked).every((status) => status === 429))
+  check('放行的次数是有限且合理的', firstBlocked > 0 && firstBlocked <= 21, `实际放行 ${firstBlocked} 次`)
+  check(
+    '429 带 Retry-After',
+    retryAfter !== null && Number.parseInt(retryAfter, 10) > 0,
+    `实际 ${retryAfter}`,
+  )
+
+  // 独立性：被撤回限流挡住之后，发言不该受影响。
+  // 等过发言那个 2 秒窗口，否则会撞上发言限流而误判。
+  await sleep(2200)
+  const stillCanPost = await request('/api/messages', {
+    method: 'POST',
+    jar,
+    body: { body: '撤回被限流之后我还能说话', room: 'general' },
+  })
+  check(
+    '撤回被限流不影响发言（两个计数器是分开的）',
+    stillCanPost.status === 201,
+    `实际 ${stillCanPost.status}`,
+  )
+}
+
+section('审计：谁删的、什么时候删的')
+{
+  /*
+   * 这两个字段存在的唯一理由就是 README 里那句「软删方便留着追责」。
+   * 只有 deleted 布尔的话，你只能知道「它被删了」，回答不了「谁删的」——
+   * 所以这里专门造一个**操作者 ≠ 作者**的场景：让另一个账号发消息，
+   * 由管理员（上面已经提权的主账号）撤掉。这正是最需要能追查的那种情况。
+   *
+   * 断言直接读本地库，因为接口只回 { ok: true }，审计字段不对外暴露
+   * （也不该暴露给普通用户）。
+   */
+  if (!isLocalTarget()) {
+    console.log('  （目标不是本机，跳过：审计字段要直接读本地 D1）')
+  } else {
+    // 本节的删除用的是主账号，而前面「撤回限流」那一节刚把它的撤回额度打满
+    // （20 次/60 秒）。不清的话这里会拿到 429，测试失败跟审计逻辑本身没关系。
+    //
+    // 选择在这里清桶、而不是靠「把本节挪到限流测试之前」，是因为顺序耦合太脆弱 ——
+    // 将来谁调整一下章节顺序就会莫名其妙变红。让它自己备好前置条件更稳。
+    withLocalDb((db) => db.exec("DELETE FROM rate_limits WHERE id LIKE 'delete:%'"))
+
+    const me = await request('/api/me', { jar })
+    const adminProfile = await me.json()
+
+    const victim = `victim${Date.now().toString(36).slice(-6)}`
+    const victimPass = 'victim-password-123'
+    await request('/auth/register', { method: 'POST', body: { username: victim, password: victimPass } })
+    const victimLogin = await request('/auth/login', {
+      method: 'POST',
+      body: { username: victim, password: victimPass },
+    })
+    const victimJar = jarFrom(victimLogin)
+
+    await sleep(2200)
+    const posted = await request('/api/messages', {
+      method: 'POST',
+      jar: victimJar,
+      body: { body: '这条消息会被管理员撤掉', room: 'auditprobe' },
+    })
+    const postedBody = await posted.json()
+    check('别人的消息发成功了', posted.status === 201, `实际 ${posted.status}`)
+
+    const deleted = await request(`/api/messages/${postedBody.message.id}`, { method: 'DELETE', jar })
+    check('管理员能撤回别人的消息', deleted.status === 200, `实际 ${deleted.status}`)
+
+    let row = null
+    withLocalDb((db) => {
+      row = db
+        .prepare('SELECT userId, deleted, deletedBy, deletedAt FROM messages WHERE id = ?')
+        .get(postedBody.message.id)
+    })
+
+    check('撤回记下了操作者（deletedBy 非空）', row?.deletedBy != null, `实际 ${row?.deletedBy}`)
+    check(
+      'deletedBy 是**操作者**而不是作者（这是审计的关键）',
+      row?.deletedBy === adminProfile.id && row?.deletedBy !== row?.userId,
+      `deletedBy=${row?.deletedBy} admin=${adminProfile.id} 作者=${row?.userId}`,
+    )
+    check('deleted 仍然是 true', row?.deleted === 1 || row?.deleted === true, `实际 ${row?.deleted}`)
+    check(
+      'deletedAt 记下了时间',
+      typeof row?.deletedAt === 'number' && row.deletedAt > 0,
+      `实际 ${row?.deletedAt}`,
+    )
+  }
+}
+
+section('审计：清空房间的流水')
+{
+  /*
+   * 清空房间是**硬删**，消息行整个没了，软删那套字段连写入的机会都没有。
+   * 所以另有一张 room_purges 记元数据。这里验它真的落了一行，
+   * 且记的是操作者（不是任何消息作者）。
+   */
+  if (!isLocalTarget()) {
+    console.log('  （目标不是本机，跳过：审计流水要直接读本地 D1）')
+  } else {
+    let purgeRow = null
+    withLocalDb((db) => {
+      purgeRow = db
+        .prepare(
+          'SELECT room, purgedBy, purgedByUsername, removedMessages, removedMedia FROM room_purges WHERE room = ? ORDER BY createdAt DESC LIMIT 1',
+        )
+        .get('smokeprobe')
+    })
+
+    check('清空房间在 room_purges 里留了一行', purgeRow != null, '没找到流水')
+    if (purgeRow != null) {
+      check('流水记下了房间名', purgeRow.room === 'smokeprobe', `实际 ${purgeRow.room}`)
+      check('流水记下了操作者用户名', typeof purgeRow.purgedByUsername === 'string' && purgeRow.purgedByUsername.length > 0, `实际 ${purgeRow.purgedByUsername}`)
+      check('流水记下了操作者 id', typeof purgeRow.purgedBy === 'string' && purgeRow.purgedBy.length > 0, `实际 ${purgeRow.purgedBy}`)
+      check('流水记下了删了多少条', purgeRow.removedMessages === 2, `实际 ${purgeRow.removedMessages}`)
+    }
+  }
+}
+
+section('refresh 限流')
+{
+  /*
+   * refresh 开着 rotation，每次成功都会往 auth_blacklist 写一行。
+   * 不限流就等于把「D1 写额度」挂在一个匿名可用的接口上。
+   *
+   * 这里验两件事：
+   *   1. 有效 token 打满额度后返回 429（不是无限放行）；
+   *   2. **废 token 也会被限住**。这条是防「解不出 sub 就跳过限流」那个洞 ——
+   *      实现里解不开 token 时退回按 IP 记账，而不是放行。
+   *
+   * 桶键不同（refresh:<userId> vs refresh-ip:<ip>），所以先测哪个都不影响另一个。
+   */
+  const relogin = await request('/auth/login', { method: 'POST', body: { username, password } })
+  const freshJar = jarFrom(relogin)
+
+  const statuses = []
+  let retryAfter = null
+  for (let i = 0; i < 26; i += 1) {
+    const response = await request('/auth/refresh', { method: 'POST', jar: freshJar })
+    statuses.push(response.status)
+    if (response.status === 429 && retryAfter === null) {
+      retryAfter = response.headers.get('retry-after')
+    }
+    // refresh 成功后 token 会轮换，下一次必须带上新的，
+    // 否则就是在重放旧 token（那走的是 401 分支，测不到「成功刷新被限」）
+    const rotated = jarFrom(response)
+    if (typeof rotated.refresh_token === 'string') freshJar.refresh_token = rotated.refresh_token
+  }
+
+  const firstBlocked = statuses.indexOf(429)
+  check('有效 token：refresh 打满额度后返回 429', firstBlocked !== -1, `状态序列：${statuses.join(',')}`)
+  check(
+    '被限流之前 refresh 是成功的（200）',
+    firstBlocked > 0 && statuses.slice(0, firstBlocked).every((status) => status === 200),
+    `前 ${firstBlocked} 个状态：${statuses.slice(0, firstBlocked).join(',')}`,
+  )
+  check('refresh 的 429 带 Retry-After', retryAfter !== null && Number.parseInt(retryAfter, 10) > 0, `实际 ${retryAfter}`)
+
+  // 废 token 分支：解不出 sub，应当退回按 IP 记账、而不是被放过。
+  //
+  // 这里必须自己发请求带上一个**独有的** X-Forwarded-For，原因很实在：
+  // 本地请求的 clientIp() 一律落到 'unknown'，也就是所有测试共用同一个 IP 桶。
+  // 不走这步的话，上面几轮跑测试留下的计数还在桶里，断言会「碰巧」通过 ——
+  // 它验的是上一轮的结果，不是这一轮的。给一个本轮独有的 IP 才能真验。
+  const uniqueIp = `203.0.113.${1 + (Date.now() % 250)}`
+  const junkStatuses = []
+  for (let i = 0; i < 26; i += 1) {
+    const response = await fetch(`${BASE}/auth/refresh`, {
+      method: 'POST',
+      headers: { Cookie: 'refresh_token=not-a-real-token', 'X-Forwarded-For': uniqueIp },
+    })
+    junkStatuses.push(response.status)
+  }
+  const junkFirstBlocked = junkStatuses.indexOf(429)
+  check(
+    '废 token 也会被限住（不是绕过限流的后门）',
+    junkFirstBlocked !== -1,
+    `状态序列：${junkStatuses.join(',')}`,
+  )
+  check(
+    '废 token 先正常返回 401，打满后才 429（不是一上来就被挡）',
+    junkFirstBlocked > 0 && junkStatuses.slice(0, junkFirstBlocked).every((s) => s === 401),
+    `前 ${junkFirstBlocked} 个状态：${junkStatuses.slice(0, junkFirstBlocked).join(',')}`,
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)

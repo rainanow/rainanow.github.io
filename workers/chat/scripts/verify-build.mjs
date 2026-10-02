@@ -8,9 +8,12 @@
  * extend_footer.html 里，本地构建恰好 /chat/ 先渲染所以看起来正常，
  * 上线后 CI 换成别的页面先渲染，/chat/ 就彻底没有 JS 了。
  *
- * 所以这里把两个不变式固定下来，别再靠肉眼抽查：
+ * 所以这里把这些不变式固定下来，别再靠肉眼抽查：
  *   1. /chat/ 必须加载 chat.js
  *   2. 其它**任何**页面都不许出现 chat.js 或聊天室骨架
+ *   3. 页面上输入框的 maxlength 必须等于后端 config.ts 里的 MAX_MESSAGE_LENGTH
+ *      （第 3 条是后来加的：那个数字原先在后端两处、前端一处各写一遍，
+ *       而常量本身没人 import。现在两边各有一个来源，靠这条检查钉住）
  *
  * 用法：hugo 构建之后 `node scripts/verify-build.mjs`
  */
@@ -105,6 +108,62 @@ const strayScript = withScript.filter((path) => !isChatPage(path))
 const strayShell = withShell.filter((path) => !isChatPage(path))
 check('没有别的页面加载 chat.js（防 partialCached 串页）', strayScript.length === 0, strayScript.join(', '))
 check('没有别的页面出现聊天室骨架', strayShell.length === 0, strayShell.join(', '))
+
+/**
+ * 消息长度上限：前端和后端各有一个来源，这里是它们之间的焊缝。
+ *
+ *  - 后端：`workers/chat/src/config.ts` 的 `MAX_MESSAGE_LENGTH`（校验 + 表约束都读它）
+ *  - 前端：`hugo.toml` 的 `params.chat.maxMessageLength`（渲染成输入框的 maxlength）
+ *
+ * 以前这个数字在三处各写一遍、常量本身没人 import，改一处就不同步。
+ * 现在两侧各有单一来源，但「它们相等」这件事仍然需要有人检查——
+ * 不然就会出现「前端让输 800 字、后端 400」。
+ *
+ * 做法：从源码里正则抠出常量值，再从构建产物里抠出 maxlength，两边比。
+ * 用正则而不是 import，是因为这个脚本刻意保持零第三方依赖、且要能在
+ * 没有 npm install 的 CI 环境里跑（CI 里就是这样直接 node 跑的）。
+ */
+console.log('\n消息长度上限：前后端是否一致')
+{
+  const configPath = fileURLToPath(new URL('../src/config.ts', import.meta.url))
+  let backendLimit = null
+  try {
+    const source = readFileSync(configPath, 'utf8')
+    const matched = /export const MAX_MESSAGE_LENGTH\s*=\s*(\d+)/.exec(source)
+    if (matched !== null) backendLimit = Number.parseInt(matched[1], 10)
+  } catch (error) {
+    console.log(`  （读不到 ${configPath}：${error.message}）`)
+  }
+
+  check(
+    '能从 config.ts 里读出 MAX_MESSAGE_LENGTH',
+    backendLimit !== null && Number.isFinite(backendLimit),
+    `实际 ${backendLimit}`,
+  )
+
+  if (backendLimit !== null) {
+    const chatIndexPath = join(ROOT, 'chat/index.html')
+    let frontendLimit = null
+    try {
+      const html = readFileSync(chatIndexPath, 'utf8')
+      const matched = /<textarea[^>]*maxlength=["']?(\d+)/i.exec(html)
+      if (matched !== null) frontendLimit = Number.parseInt(matched[1], 10)
+    } catch {
+      // 上面已经检查过 /chat/ 存在，这里读不到就让它以 null 落下去报错
+    }
+
+    check(
+      `/chat/ 的输入框带上了 maxlength`,
+      frontendLimit !== null,
+      `没在 ${chatIndexPath} 里找到 maxlength`,
+    )
+    check(
+      `前后端消息长度上限一致（后端 ${backendLimit}）`,
+      frontendLimit === backendLimit,
+      `前端 ${frontendLimit} ≠ 后端 ${backendLimit} —— 改 hugo.toml 的 params.chat.maxMessageLength`,
+    )
+  }
+}
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)
 if (failures.length > 0) {

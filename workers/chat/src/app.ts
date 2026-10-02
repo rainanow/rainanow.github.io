@@ -14,6 +14,7 @@ import type { AppEnv, ChatContext } from './context'
 import type { Env } from './env'
 import { scryptHasher } from './hasher'
 import { messageFields, messageTableName } from './models/message'
+import { roomPurgeFields, roomPurgeTableName } from './models/room-purge'
 import { userFields, userTableName } from './models/user'
 import { isAllowedOrigin } from './origins'
 import { registerAuthRoutes } from './routes/auth'
@@ -31,6 +32,7 @@ export function buildChatApp(env: Env): ChatContext {
   const app = nanoka<AppEnv>(d1Adapter(env.DB))
   const User = app.model(userTableName, userFields)
   const Message = app.model(messageTableName, messageFields)
+  const RoomPurge = app.model(roomPurgeTableName, roomPurgeFields)
 
   const auth = createAuth({
     model: User,
@@ -94,7 +96,7 @@ export function buildChatApp(env: Env): ChatContext {
     return c.json({ error: '服务器内部错误' }, 500)
   })
 
-  const context: ChatContext = { app, User, Message, auth }
+  const context: ChatContext = { app, User, Message, RoomPurge, auth }
   registerAuthRoutes(context)
   registerChatRoutes(context)
   registerMediaRoutes(context)

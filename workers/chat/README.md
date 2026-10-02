@@ -69,8 +69,11 @@ workers/chat/
 │   ├── models/              # 表定义（nanoka 字段 DSL）
 │   └── routes/              # auth.ts / chat.ts
 └── scripts/
-    ├── smoke.mjs            # 后端端到端冒烟测试（43 项）
-    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（23 项）
+    ├── smoke.mjs            # 后端端到端冒烟测试（108 项）
+    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（59 项）
+    ├── purge-test.mjs       # 清空房间的去重与批量切分（17 项，纯逻辑）
+    ├── verify-build.mjs     # 构建产物归属检查（8 项，CI 里也跑）
+    ├── probe-production.mjs # 探线上健康
     └── inspect-d1.mjs       # 直接读本地 D1 的 SQLite，排查用
 ```
 
@@ -91,12 +94,24 @@ npm run dev                  # http://127.0.0.1:8787
 
 ```bash
 npm run typecheck            # TypeScript 全量检查
-npm run smoke                # 后端 43 项
-npm run frontend-test        # 前端 23 项（需要先 hugo 构建出 public/chat/index.html）
-npm run verify-build         # 构建产物归属 5 项（不需要 dev server，hugo 构建完就能跑）
+npm run smoke                # 后端 108 项
+npm run frontend-test        # 前端 59 项（需要先 hugo 构建出 public/chat/index.html）
+npm run verify-build         # 构建产物归属 8 项（不需要 dev server，hugo 构建完就能跑）
+npm run purge-test           # 清空房间的去重与批量切分 17 项（纯逻辑，不需要任何服务）
 npm run inspect-d1           # 打印本地 D1 里的表结构、账号、限流、吊销名单
 npm run probe-production     # 探线上 api.yulo.top + /chat/ 页面是否健康
 ```
+
+> `probe-production` 会往**生产**的 `rate_limits` 写一行：它要探「登录路由」，
+> 而登录失败是被记账的（那正是限流的一部分）。写入的 key 是
+> `login:<你的IP>:definitely-not-a-real-user-xyz` —— 带一个不存在的用户名，
+> 所以既不会影响任何真实账号，也不会把正常登录锁住。跑多少次都安全。
+> 其余探测（健康检查、CORS 预检、非法入参注册、页面抓取）都不写库。
+
+> **`verify-build` 和 `typecheck` 已经接进 CI**（仓库根的 `.github/workflows/hugo.yaml`）。
+> 守第 11 条那个 `partialCached` 事故的检查从此不再只靠手工跑 ——
+> 改坏 footer 会在 CI 就红，而不是等线上「注册按钮点不动」。
+> 详见下方「测试覆盖」一节。
 
 > `npm run smoke` 会真的注册账号。注册限额是「同一 IP 每小时 5 次」，而这个脚本一轮要用掉 3 次，
 > 所以它**开始前会自动清掉本地 `rate_limits`**（只在目标是 `127.0.0.1` / `localhost` 时才动手，
@@ -262,9 +277,49 @@ jobs:
 | D1 写入 | 100,000 行 / 天 | 发消息 1 行；登录失败 1 行；refresh 1 行 |
 | DO 请求 | 100,000 / 天 | 握手 1 次 + 每条消息广播 1 次；心跳由运行时直接应答，不唤醒对象 |
 | DO compute | 13,000 GB-s / 天 | 只在真正处理消息时计；空闲连接被 Hibernation 换出后不计 |
-| D1 存储 | 5 GB | 一条消息不到 1 KB |
+| D1 存储 | **单库 500 MB**（账号级 5 GB） | 一条消息不到 1 KB，单库够放几十万条 |
 
 按这个量级，几十人同时在线、每天几千条消息都还有很大余量。
+
+### 和 CPU 10 ms 同性质、本地测不出上线才炸的另外三个上限
+
+这三个都是**单次请求内**的硬限制。本地 `wrangler dev` 一个都不强制，
+所以测试全绿不代表线上安全。给任何路径加逻辑前，先数一遍它用了几次。
+
+| 上限 | 免费套餐 | 付费套餐 | 说明 |
+| --- | --- | --- | --- |
+| D1 查询数 / 一次 Worker 调用 | **50** | 1,000 | 见下 |
+| 子请求 → Cloudflare 内部服务 / 每次调用 | **1,000** | 10,000 | R2 的 head/get/put/delete、D1 都算 |
+| 子请求 → 外部网络 / 每次调用 | **50** | 10,000 | 这个才是大多数人口中的「subrequest 上限」 |
+
+**D1 的 50 次最容易被忽略。** 现有路径逐条数过（2026-10-02 核）：
+
+| 路由 | D1 查询数 |
+| --- | --- |
+| `POST /auth/login` 成功 | 2 |
+| `POST /auth/refresh` | 3（限流 1 + 黑名单读 1 + 写 1；handler 不查 users 表） |
+| `POST /api/messages` | 4 |
+| `POST /api/uploads` | 约 7（配额检查两条并发 + `markUpload` 两条 batch） |
+| `DELETE /api/messages/:id` 带 3 个媒体 | 约 13（含限流那 1 次 + 退配额的 batch） |
+| `GET /api/members`（`scope=all`） | 2（但一次读 500 行，**按行数计费**） |
+| `GET /api/members?scope=online` | 1（只查自己那一行；users 表**一行都不读**） |
+| `DELETE /api/rooms/:room`（清空） | 约 4（读 body 1 + 删消息 1 + 审计流水 1 + 限流/清理） |
+
+最宽的是撤回那条，约 13 次，离 50 还差得远。
+但**加一次限流就是加一次查询**，改动前先回来数一遍。
+
+> `scope=online` 那一行的价值不在「少一次查询」，而在「少读 **500 行**」——
+> D1 是按读取行数计费的，成员名单原本每次有人进出都要刷全表。
+> 详见 `/api/members` 那个路由上的注释。
+
+都还有余量，但**给某条路径加一次限流就是加一次查询**。如果哪天某个路由要拆成
+更多查询，先回来重新数一遍。
+
+**R2 逐个删会撞 1,000。** `DELETE /api/rooms/:room`（清空房间）原先对每个媒体
+对象调一次 `MEDIA.delete(key)`。房间文件超 1000 个时会在第 1001 个上失败，
+而 `try/catch` 会把异常吞掉、`app.db.delete` 照常执行 →
+**消息没了、文件永久残留**，正是这个项目最想避免的孤儿对象。
+`R2Bucket.delete()` 支持传数组（一次最多 1000 key），所以这条路径必须走批量。
 
 ---
 
@@ -346,11 +401,18 @@ SQLite 的比较和唯一索引都跟随列的排序规则。列声明成 NOCASE
 `hasher.hash('__dummy__')`（防用户名枚举的时序侧信道），那是一次完整的 scrypt。
 若每个请求都重建，就等于每请求白扔一次 scrypt，10 ms 预算根本扛不住。
 
-### 9. 发言频率限制在 isolate 内存里
+### 9. 发言限流曾放在 isolate 内存里，现已搬到 D1（保留作为「为什么不能放内存」的记录）
 
-这条路径本来就有「读用户 + 写消息」两次 D1 往返，再为限流加一次写不划算。
-所以它是**软限制**（isolate 按 POP 分布，理论上能绕过），目的是防手滑连点，
-安全边界是登录态 + 消息长度上限。登录和注册的限流则落在 D1 里，因为那是真的攻击面。
+最初的理由是「这条路径本来就有读用户 + 写消息两次 D1 往返，再为限流加一次写不划算」，
+所以它是**软限制**（isolate 按 POP 分布、随时回收，换个接入点就能绕过），
+只用来防手滑连点。
+
+**这个取舍后来被推翻了**（commit `bb99fb1`）：内存计数挡得住手滑，挡不住真想刷的人——
+攻击者每次请求落在不同 isolate 上，等于每次都是全新的空计数。
+现在发言和上传都走 `consumeRateLimit` 落 D1，固定窗口、跨 isolate 可靠。
+
+留着这条是想说明：**「isolate 内存计数够用」是一个会在压力下失效的假设。**
+判断某个状态能不能放内存，要问「攻击者换接入点之后还算数吗」，而不是「正常情况下准不准」。
 
 ### 10. 没有做邮箱验证
 
@@ -412,11 +474,125 @@ Chrome 把这种 `Set-Cookie` 丢掉，只在 Network 面板的 Response Headers
 但只要有一边写成 `127.0.0.1`，就变成跨站，`SameSite=Lax` 的 Cookie 一样不会被带上，
 表现和上面一模一样。所以本地预览的两个地址都用 `localhost`。
 
+### 14. 清空房间：R2 批量删，而且**不要**顺手加「分页」
+
+`DELETE /api/rooms/:room` 原来对每个媒体对象调一次 `MEDIA.delete(key)`。
+`key` 逐个删看起来天然省内存，但它是**一次内部子请求**，而 Workers 免费套餐对
+Cloudflare 内部服务的子请求上限是 **1000 次 / 调用**（对外部网络只有 50 次）。
+房间文件超过 1000 个就会在第 1001 个上失败。
+
+之所以说这个 bug 致命，是因为失败被 `catch` 吞掉，而后面的 `app.db.delete` 照常执行：
+**消息全没了、文件永久残留**，而那些 URL 是公开可访问的——「清空」只清掉一半，
+且不可恢复。
+
+现在用 `MEDIA.delete(key[])` 按 1000 一批删，并且**用 Set 先去重**
+（同一个文件被多条消息引用时只删一次、只计一次）。
+
+**不要给它加分页。** 分页查消息会多花 D1 查询，而 D1 查询的上限是 **50 次 / 调用**，
+比 R2 子请求的 1000 稀缺得多，是更紧的约束。消息正文一行最多 500 字，
+一间房全部读进来的内存占用在这个量级下完全可接受，所以保持「一条 SQL 查完」。
+加了个字段或换个房间名就想翻页的直觉在这里是错的。
+
+`npm run purge-test`（17 项，纯逻辑）把这段批次逻辑的边界钉住了，
+其中 1001 那个 case 就是这条坑的回归测试。
+
+### 15. 撤回限流：必须独立计数器，且 `consumeRateLimit` 有个 off-by-one
+
+撤回原先**完全没有限流**，是整个后端唯一一条「无限制、每条都写库」的路由。
+它比发言更值得限，因为一次请求撬动的资源多得多：D1 读 2 行 + 写 1 行 + 一次 DO 广播，
+带媒体时还有 R2 head × N、R2 delete × N、退配额的 D1 batch（2 条语句）。
+
+两个必须记住的点：
+
+**① 不能用 `message:` 那个计数器。** 撤回和发言是不同性质的操作，
+共用一个桶会互相干扰：一个连着撤回几条旧消息的人，会发现接下来几分钟**发不出话**——
+而他只是收拾自己的房间。所以 key 是 `delete:<userId>`。
+
+**② 限流放在 `Message.findOne` 之前**（刻意的 fail-closed）。
+放到后面的话，攻击者拿随机 id 打过来就是无限次「读一行 + 404」，这层保护等于没有。
+代价是「本来就删不掉」的请求也占额度，但前端一条消息只渲染一个撤回按钮，
+点两下第二下拿到 404 就到头了，20 次/分钟的额度足够。
+
+**③ off-by-one：传 N 只放行 N-1 次。** `consumeRateLimit` 是「先记账、再判断」，
+窗口里的第 1 条（`hits = 1`）必须放行，所以传 21 才恰好放行 20 次。
+**这个坑踩过两次了**（发消息那次、撤回这次），所以这次在 `config.ts` 里
+用 `DELETE_ALLOWED_PER_WINDOW = 20` 命名意图、在调用处写 `+ 1`，
+并实测验证过：全新用户连打 31 次，前 20 次 404、第 21 次起 429。
+
+阈值是 20 次/60 秒，理由写在 `config.ts` 那个常量上。
+管理员的大批量清理**不要**走这个接口 —— 那是「清空房间」的活，
+走 `DELETE /api/rooms/:room`（R2 批量删，不受这条限制）。
+
+回归测试：`npm run smoke` 的「撤回限流」一节 6 项，其中一条专门验
+**「撤回被限流不影响发言」**（两个计数器分开），这正是 ① 要防的事。
+
+### 16. 迁移文件名：drizzle-kit 按 journal 的 **idx** 编号，会撞上手工改过名的文件
+
+加审计字段那次（`0003_audit_fields.sql`）踩到的：
+
+drizzle-kit 生成的文件名是 `${idx 补零}_${随机名}.sql`，而 `idx` 来自
+`drizzle/migrations/meta/_journal.json` 里最后一条 entry。仓库里已经有一个
+`0002_create_upload_usage.sql`（它当初也是手工改的名，为了给手写的
+`0001_chat_indexes.sql` 让位），所以 journal 里的 idx 号和文件名的数字**不是一回事**：
+
+```
+journal: idx 0 → 0000_gray_leo
+         idx 1 → 0002_create_upload_usage   ← 手工改过名
+         idx 2 → ?   drizzle-kit 会生成 0002_xxx.sql  ← 撞车
+```
+
+它照样生成了 `0002_volatile_tyrannus.sql`，和已有文件同前缀。
+**wrangler d1 migrations apply 是按文件名排序应用的**，两个 0002 谁先谁后不确定，
+线上库的结构就可能对不上。
+
+处理办法：把新文件改名成 `0003_xxx.sql`，并且**同步改 journal 里那条 entry 的 tag**
+（快照文件 `meta/0002_snapshot.json` 是按 idx 命名的，不用动）。
+改完再跑一次 `drizzle-kit generate`，应当输出 `No schema changes, nothing to migrate` ——
+这一句是在确认快照跟上了，没留下漂移。
+
+以后再加迁移，先 `ls drizzle/migrations/` 看一眼现在用到几号了。
+
+### 17. `/auth/refresh` 必须限流，而且废 token 不能成为后门
+
+rotation 开着意味着**每一次成功 refresh 都会往 `auth_blacklist` 写一行**（旧 jti 入名单）。
+所以这个接口本质上是「匿名可用的 D1 写接口」—— 请求里只有一个 refresh Cookie，
+不需要 access token、不过 `auth.middleware()`。不限流就等于把 10 万行/天的写额度
+挂在一个谁都能打的端点上。
+
+两个实现要点：
+
+**① 桶键优先用 token 里的 `sub`。** 但 refresh 路径拿不到 `sub`（没有 middleware），
+所以限流中间件得**自己先 `verify()` 一次**把 token 解开。这次验签是亚毫秒级，
+相对 10 ms CPU 预算可以忽略，换来的是「按账号限流」的准确度——
+不然同一出口 IP 下的几百人会互相连坐。
+
+**② 解不出 `sub` 时退回按 IP 记账，不能放行。** 令牌无效/过期时 `verify()` 会抛，
+这时如果直接 `next()` 跳过限流，「拿一堆废 token 反复打」就成了免费的 D1 写路径。
+实测验证过这个分支：废 token 前 20 次正常返回 401、第 21 次起 429，
+额度和有效 token 完全一致。
+
+> 写这条的测试时要注意：本地请求的 `clientIp()` 一律落到 `unknown`，
+> 也就是**所有测试共用一个 IP 桶**。不换桶的话，上一轮跑测试留下的计数还在里面，
+> 断言会「碰巧」通过——它验的是上一轮的结果。所以测试里给了一个本轮独有的
+> `X-Forwarded-For`。
+
+回归测试：`npm run smoke` 的「refresh 限流」一节 5 项。
+
 ---
 
 ## 测试覆盖
 
-`npm run smoke`（43 项，后端）：
+一共 **192 项**，分四个脚本。（项数会随测试增加变化，`2026-10-02` 实测值如下。）
+
+```bash
+npm run typecheck      # tsc --noEmit，CI 里也跑
+npm run verify-build   # 8 项， 只看 Hugo 产物，不需要任何服务
+npm run purge-test     # 17 项， 纯逻辑，不需要任何服务
+npm run smoke          # 108 项，需要 wrangler dev
+npm run frontend-test  # 59 项，需要 wrangler dev + 构建出的 public/chat/
+```
+
+`npm run smoke`（108 项，后端）：
 
 - 健康检查、CORS 预检（含非白名单来源拿不到允许头）
 - 注册 / 大小写不同的重名被拒 / 非法输入
@@ -425,21 +601,50 @@ Chrome 把这种 `Set-Cookie` 丢掉，只在 Network 面板的 Response Headers
 - 非白名单 Origin 的 WebSocket 握手被拒（跨站劫持防护）
 - 实时收发：`ready` / `message` / 在线人数
 - 发言间隔限流、超长消息、历史游标分页与顺序
-- 撤回本人消息 + 广播 + 历史消失
+- 撤回本人消息 + 广播 + 历史消失；撤回连带删掉媒体对象并退上传额度
+- **撤回限流**：打满后 429、带 `Retry-After`、在此之前正常走到业务逻辑，
+  且**不影响发言**（两个计数器分开，见第 15 条）
+- 上传配额：单人层、全站熔断、额度恢复后能继续上传
+- 管理员导出与清空：非管理员被拒、导出是原始数据、清空只影响目标房间
+- **成员名单**：`scope=online` 只回在线的人、带用户名、未登录仍 401
 - refresh 轮换、旧令牌重放被拒、登出后 refresh 被拒
 - 连续登录失败 11 次触发 429
+- **refresh 限流**：有效 token 打满后 429；**废 token 也会被限住**（不是后门）
+- **审计**：撤回记下了「操作者」（管理员撤别人时 deletedBy ≠ 作者）；
+  清空房间在 `room_purges` 留了一行流水
 
-`npm run frontend-test`（23 项，真实 `chat.js` + jsdom + 真实 Worker）：
+`npm run frontend-test`（59 项，真实 `chat.js` + jsdom + 真实 Worker）：
 
 - `chat.js` 引用的 18 个 `data-chat-*` 钩子在真实页面里都存在
 - 未登录 → 注册 → 自动登录 → 加载历史 → WebSocket 连上
 - 「自己发的消息」既走 HTTP 响应又走 WebSocket 广播，只渲染一条（去重）
 - 消息里的 HTML 被当成纯文本，不会创建元素、不会触发行内事件
-- 撤回后前端跟着移除、退出后回到登录面板、无未捕获 JS 错误
+- 外站图片不会被渲染成 `<img>`（媒体白名单生效）
+- 撤回后前端跟着移除；**被限流时显示服务端的中文原因、且消息不会被移除**
+- 退出后回到登录面板、无未捕获 JS 错误
 
-`npm run verify-build`（5 项，只检查 Hugo 构建产物，不需要 dev server）：
+`npm run verify-build`（8 项，只检查 Hugo 构建产物，不需要 dev server）：
 
 - `/chat/` 存在、加载了 `chat.js`、有聊天室骨架
 - **其它任何页面都没有** `chat.js`、也没有聊天室骨架
   —— 专门守第 11 条那个 `partialCached` 事故，跑一次就能发现脚本串页或丢失
+- **消息长度上限前后端一致**：从 `src/config.ts` 抠出 `MAX_MESSAGE_LENGTH`，
+  再从构建出的 `/chat/` 里抠出输入框的 `maxlength`，两者必须相等。
+  这一项是后来加的 —— 那个数字原先在后端两处、前端一处各写一遍，
+  而常量本身没人 import（是个死常量）。现在两边各有单一来源，
+  「它们相等」这件事由这条检查钉住。
+
+**这个脚本已经接进 CI**（`.github/workflows/hugo.yaml` 的 `Verify chat script placement` 步骤），
+所以那次事故不会再靠肉眼发现。它只 import `node:fs` / `node:path` / `node:url`，
+零第三方依赖，所以 CI 里不需要先 `npm ci`。
+
+`npm run purge-test`（17 项，纯逻辑，不需要 dev server）：
+
+- 清空房间时**跨消息去重**：同一个文件被多条消息引用，只删一次、只计一次
+- 批量切分正确：999 → 1 批、**1000 → 1 批（不越界）**、
+  **1001 → 2 批（修的就是这个 case）**、2500 → 3 批，每批不超 1000、不重不漏
+
+为什么不真传 1000 个文件去验：那太慢，而且会真的写 R2。
+这个脚本把路由里那段批次逻辑抄出来喂假 key，抄而不是 import 是因为
+那段逻辑内联在 handler 里——**以后改了路由里的批大小，这里会先对不上而暴露出来**。
 

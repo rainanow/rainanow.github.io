@@ -5,8 +5,11 @@ import { z } from 'zod'
 
 import {
   DEFAULT_ROOM,
+  DELETE_ALLOWED_PER_WINDOW,
+  DELETE_WINDOW_SECONDS,
   EXPORT_LIMIT,
   HISTORY_PAGE_SIZE,
+  MAX_MESSAGE_LENGTH,
   MEMBER_LIST_LIMIT,
   MESSAGE_WINDOW_SECONDS,
 } from '../config'
@@ -20,7 +23,15 @@ import { isAllowedOrigin } from '../origins'
 import type { ChatMessage, ChatServerEvent } from '../types'
 
 const postMessageSchema = z.object({
-  body: z.string().trim().min(1, '消息不能为空').max(500, '单条消息最多 500 字'),
+  // 用常量而不是写死 500：以前这个数字在后端两处 + 前端一处各写一遍，
+  // 而 config.ts 里的 MAX_MESSAGE_LENGTH 根本没人 import（是个死常量）。
+  // 现在后端两处都读它，前端那处由 hugo.toml 的 params.chat.maxMessageLength 提供，
+  // 两边是否一致由 `npm run verify-build` 的第 6 项守着。
+  body: z
+    .string()
+    .trim()
+    .min(1, '消息不能为空')
+    .max(MAX_MESSAGE_LENGTH, `单条消息最多 ${MAX_MESSAGE_LENGTH} 字`),
   room: z.string().optional(),
 })
 
@@ -54,11 +65,21 @@ function normalizeRoom(value: string | undefined): string {
  * 前端也会把按钮藏起来，但那只是「别让人白点」——真正的判定必须在这里，
  * 否则任何人手上一发请求就能清空整个房间。
  */
-async function requireAdmin(c: Context<AppEnv>, User: ChatContext['User']): Promise<void> {
+/**
+ * 返回查到的 admin 账号，而不只是 void —— 清空房间那一处需要用它写审计流水
+ * （谁清的）。原来返回 void 时那里要么再查一次库，要么记不下操作者。
+ *
+ * 已有的调用方（导出）忽略返回值即可，不受影响。
+ */
+async function requireAdmin(
+  c: Context<AppEnv>,
+  User: ChatContext['User'],
+): Promise<NonNullable<Awaited<ReturnType<ChatContext['User']['findOne']>>>> {
   const sub = requireSubject(c)
   const user = await User.findOne(sub)
   if (user === null) throw new HTTPException(401, { message: '账号不存在' })
   if (user.role !== 'admin') throw new HTTPException(403, { message: '只有管理员能做这个操作' })
+  return user
 }
 
 /**
@@ -79,7 +100,7 @@ async function broadcast(env: Env, room: string, event: ChatServerEvent): Promis
   })
 }
 
-export function registerChatRoutes({ app, User, Message, auth }: ChatContext): void {
+export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: ChatContext): void {
   /** 存活探针。不带鉴权，用来确认 Worker、路由和 D1 绑定都活着。 */
   app.get('/api/health', (c) => c.json({ ok: true, service: 'yulo-chat' }))
 
@@ -95,32 +116,88 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
   })
 
   /**
-   * 成员名单：所有已注册账号，外加各自此刻在不在线。
+   * 成员名单。
    *
-   * 在线状态只有 Durable Object 知道（连接握在它手里），所以这里问一次 DO 的 /online；
-   * 离线账号从 D1 取。两边的交集就是在线名单。
+   * 支持 `?scope=`：
+   *   - 省略或 `all`（默认）：所有已注册账号 + 各自在不在线。会读 users 表，
+   *     上限 MEMBER_LIST_LIMIT 行。
+   *   - `online`：**只**返回此刻在线的人，名单数据来自 DO，不读 users 表。
+   *
+   * ## 为什么要有 online 这一档
+   *
+   * D1 是按**读取行数**计费的（免费 500 万行/天）。成员名单原本每次有人进出
+   * （`presence` 事件）就要重新拉一次全表 —— 一次吃掉最多 500 行。
+   * 用 `scope=online` 刷新就把这部分砍掉了：500 行 → 1 行。
+   *
+   * ⚠️ 说「不读 users 表」，但**不是零次 D1 查询**：上面那句
+   * `User.findOne(requireSubject(c))` 仍然会跑，一次按主键查自己，
+   * 用来确认账号还存在（删号的人不该还能拉名单）。这是刻意保留的 fail-closed，
+   * 1 行和 500 行差了两个数量级，不值得为省这一行把校验去掉。
+   * 别在注释里把「不读 users 表」写成「不读 D1」——会误导后来的人。
+   *
+   * 代价是 `role` 在 online 这一档拿不到（DO 里没存），置为 null ——
+   * 名单展示用不到它。
+   *
+   * 前端的用法：首次展开面板拉 `all` 建好缓存，之后的 presence 刷新只拉 `online`。
    *
    * 返回**扁平数组**而不是分好组的两份列表：排序是展示层的事，
    * 前端想按在线优先排、还是加个搜索框筛，都不用再改后端。
    */
   app.get('/api/members', cookieAuthBridge, auth.middleware(), async (c) => {
     const room = normalizeRoom(c.req.query('room'))
+    const onlineOnly = c.req.query('scope') === 'online'
     const me = await User.findOne(requireSubject(c))
     if (me === null) throw new HTTPException(401, { message: '账号不存在' })
 
     const stub = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(room))
     let onlineIds: string[] = []
+    let onlineMembers: { userId: string; username: string }[] = []
     try {
       const response = await stub.fetch('https://chat-room.internal/online')
       if (response.ok) {
-        const payload = (await response.json()) as { userIds?: unknown }
+        const payload = (await response.json()) as {
+          userIds?: unknown
+          members?: unknown
+        }
         if (Array.isArray(payload.userIds)) {
           onlineIds = payload.userIds.filter((id): id is string => typeof id === 'string')
+        }
+        if (Array.isArray(payload.members)) {
+          onlineMembers = payload.members.filter(
+            (item): item is { userId: string; username: string } =>
+              typeof item === 'object' &&
+              item !== null &&
+              typeof (item as { userId?: unknown }).userId === 'string' &&
+              typeof (item as { username?: unknown }).username === 'string',
+          )
         }
       }
     } catch {
       // DO 临时拿不到就当作「没人在线」，不能因为这一处把整个名单接口拖挂。
     }
+
+    // 只问在线：直接把 DO 给的结果回出去，不查 users 表。
+    //
+    // ⚠️ 那个 `if` 不是多余的保险，是**必需的降级**：如果 DO 回了 userIds 却没有
+    // members（老版本的 DO、或者两边代码版本不同步），而我们直接回空列表，
+    // 前端会把**所有人**都标成离线 —— 那是「显示错」而不是「显示慢」。
+    // 所以检测到「有人在线但拿不到用户名」时，退回全量那条老路：
+    // 多花一次 D1 查询，但结果是对的。
+    const doGaveUsernames = onlineMembers.length > 0 || onlineIds.length === 0
+    if (onlineOnly && doGaveUsernames) {
+      return c.json({
+        room,
+        scope: 'online',
+        total: onlineMembers.length,
+        members: onlineMembers.map((member) => ({
+          id: member.userId,
+          username: member.username,
+          role: null,
+          online: true,
+        })),
+      })
+    }
+
     const online = new Set(onlineIds)
 
     // users 是小表，一次取完最省事；MEMBER_LIST_LIMIT 只是防呆上限。
@@ -136,6 +213,7 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
 
     return c.json({
       room,
+      scope: 'all',
       total: rows.length,
       members: rows.map((row) => ({
         id: row.id,
@@ -246,6 +324,26 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
     const sub = requireSubject(c)
     const id = c.req.param('id')
 
+    // 限流放在**查库之前**，是刻意的 fail-closed：
+    //
+    //  - 位置的差别在这里很实在。放到 `Message.findOne` 后面，攻击者拿随机 id 打过来
+    //    就是无限次「读一行 + 404」，这一层保护等于没有——而这条路由原先连这个都没有。
+    //  - 代价是「本来就删不掉」的请求（消息已被别人删掉、id 不存在）也会占额度。
+    //    这在真实使用里可以忽略：前端一个消息只渲染一个撤回按钮，点两下、第二下拿到 404
+    //    就到头了，而额度是 20 次/分钟。
+    //  - 用 `delete:<userId>` 而不是复用发言那个 key，否则「连撤几条旧消息」会把人
+    //    接下来的发言一起锁掉。原因写在 config.ts 那个常量上。
+    const attempt = await consumeRateLimit(
+      c.env.DB,
+      `delete:${sub}`,
+      DELETE_ALLOWED_PER_WINDOW + 1,
+      DELETE_WINDOW_SECONDS,
+    )
+    if (attempt.blocked) {
+      c.header('Retry-After', String(attempt.retryAfterSeconds))
+      return c.json({ error: `撤回得太频繁了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
+    }
+
     const target = await Message.findOne(id)
     if (target === null || target.deleted) {
       return c.json({ error: '消息不存在' }, 404)
@@ -258,7 +356,20 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
       return c.json({ error: '只能撤回自己的消息' }, 403)
     }
 
-    await Message.update(id, { deleted: true })
+    // 审计：记下**操作者**是谁、什么时候做的。
+    //
+    // deletedBy 存的是 me.id（操作者），不是 target.userId（作者）——
+    // 自己撤自己的消息时这俩一样，但管理员撤别人的消息时不一样，
+    // 而恰恰是后者才需要事后能查出来。
+    //
+    // 没有这两个字段的话，messages 表里只剩一个 `deleted = true`，
+    // 你只能知道「它被删了」，回答不了「谁删的」，
+    // README 里那句「软删方便留着追责」就是句空话。
+    await Message.update(id, {
+      deleted: true,
+      deletedBy: me.id,
+      deletedAt: new Date(),
+    })
 
     // 撤回要连带把消息里引用的媒体对象也删掉（用户明确要求）。
     //
@@ -297,8 +408,9 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
    * 返回**原始数据**，不在这里拼 markdown —— 格式是展示层的事，
    * 后端猜错了就得改接口，不如让前端拿到之后想存成 md 还是 json 都行。
    *
-   * 一次最多 `EXPORT_LIMIT` 条，超了截断并带 `truncated` 标记，
-   * 免得某个房间攒了几万条时把响应体撑爆。
+   * 一次最多 `EXPORT_LIMIT` 条，超了截断并带 `truncated` 标记。
+   * 这个上限是被 **CPU 10 ms / 请求**卡住的（实测 5000 条顶格消息要 9–13 ms，会 1102），
+   * 不是被响应体积卡住的。理由和实测数据见 `config.ts` 里那个常量。
    */
   app.get('/api/rooms/:room/export', cookieAuthBridge, auth.middleware(), async (c) => {
     const room = normalizeRoom(c.req.param('room'))
@@ -330,34 +442,82 @@ export function registerChatRoutes({ app, User, Message, auth }: ChatContext): v
     })
   })
 
+  /** `R2Bucket.delete()` 一次最多能删多少个 key（官方硬上限，也是免费套餐内部子请求的合理粒度）。 */
+  const R2_DELETE_BATCH = 1000
+
   /**
    * 清空整个房间（仅管理员）。**硬删**，不是软删 —— 这是「清空」不是「撤回」。
    *
    * 消息里引用的媒体对象也一并删掉，否则它们会变成没人引用的孤儿：
    * 白占 R2 空间，而且那些 URL 是公开的，等于内容其实没清干净。
+   *
+   * ## 为什么必须批量删，而不是一个 key 一次 delete
+   *
+   * Workers 免费套餐对 **Cloudflare 内部服务**的子请求上限是 **1000 次 / 调用**
+   * （对外部网络只有 50 次，别混淆）。而 `MEDIA.delete(key)` 每调一次就是一个内部子请求。
+   * 房间里的文件一旦超过 1000 个，就会在第 1001 个上直接失败。
+   *
+   * 失败之所以致命，是因为异常被下面的 `catch` 吞掉、`app.db.delete` 照常执行：
+   * **消息全没了、文件永久残留**，而那些文件的 URL 是公开可访问的 ——
+   * 等于「清空」只清掉了一半，而且是不可恢复的那一半。
+   *
+   * `delete()` 接受 key 数组（一次最多 1000 个），所以按 1000 一批删干净。
+   *
+   * ## 为什么这里不加分页
+   *
+   * 分页查消息会**多花 D1 查询**，而 D1 查询的上限（50 次 / 调用）比 R2 子请求
+   * （1000 次）稀缺得多，是更紧的约束。消息正文一行最多 500 字，一间房全部读进来
+   * 的内存占用在这个应用的量级下完全可接受，所以保持「一条 SQL 查完」。
    */
   app.delete('/api/rooms/:room', cookieAuthBridge, auth.middleware(), async (c) => {
     const room = normalizeRoom(c.req.param('room'))
-    await requireAdmin(c, User)
+    const admin = await requireAdmin(c, User)
 
     const rows = (await app.db
       .select({ body: Message.table.body })
       .from(Message.table)
       .where(eq(Message.table.room, room))) as { body: string }[]
 
-    let removedMedia = 0
+    // 用 Set 去重：同一个文件可能被多条消息引用（比如重复贴同一个链接），
+    // 去重后既能少删一次（省一次子请求额度），removedMedia 的数字也才准。
+    const keys = new Set<string>()
     for (const row of rows) {
-      for (const key of extractMediaKeys(row.body)) {
-        try {
-          await c.env.MEDIA.delete(key)
-          removedMedia += 1
-        } catch {
-          // 单个对象删失败不该让整个清空回滚，继续删剩下的
-        }
+      for (const key of extractMediaKeys(row.body)) keys.add(key)
+    }
+
+    let removedMedia = 0
+    const all = [...keys]
+    for (let offset = 0; offset < all.length; offset += R2_DELETE_BATCH) {
+      const batch = all.slice(offset, offset + R2_DELETE_BATCH)
+      try {
+        await c.env.MEDIA.delete(batch)
+        removedMedia += batch.length
+      } catch {
+        // 一批删失败不该让整个清空回滚，继续删剩下的。
+        // 注意这里的后果：这一批文件会变成孤儿（消息没了、文件还在），
+        // 但总好过整个请求失败、连消息都留在那里。批量之后失败面已经从
+        // 「1001 个文件里坏一个」缩到「1000 个一批」，概率低得多。
+        console.error('清空房间时删除媒体失败', { room, batch: batch.length, offset })
       }
     }
 
     await app.db.delete(Message.table).where(eq(Message.table.room, room))
+
+    // 审计流水。这一步必须**在硬删之后**才准（数字已经算出来了），
+    // 而且即便写入失败也不能让清空本身失败 —— 消息已经删了，
+    // 回滚不回去，为了记一笔流水把整个操作报成 500 只会让人以为没删成。
+    try {
+      await RoomPurge.create({
+        room,
+        purgedBy: admin.id,
+        purgedByUsername: admin.username,
+        removedMessages: rows.length,
+        removedMedia,
+      })
+    } catch (error) {
+      console.error('清空房间的审计流水写入失败', { room, admin: admin.username, error })
+    }
+
     await broadcast(c.env, room, { type: 'purged', room })
 
     return c.json({ ok: true, removedMessages: rows.length, removedMedia })

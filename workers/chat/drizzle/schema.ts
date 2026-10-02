@@ -18,6 +18,8 @@ export const messages = sqliteTable('messages', {
   username: text('username').notNull(),
   body: text('body').notNull(),
   deleted: integer('deleted', { mode: 'boolean' }).notNull().default(false),
+  deletedBy: text('deletedBy'),
+  deletedAt: integer('deletedAt', { mode: 'timestamp_ms' }),
   createdAt: integer('createdAt', { mode: 'timestamp_ms' }).notNull().default(sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`),
 })
 
@@ -37,4 +39,14 @@ export const upload_usage = sqliteTable('upload_usage', {
   id: text('id').primaryKey().notNull(),
   bytes: integer('bytes').notNull().default(0),
   count: integer('count').notNull().default(0),
+})
+
+export const room_purges = sqliteTable('room_purges', {
+  id: text('id').primaryKey().notNull(),
+  room: text('room').notNull(),
+  purgedBy: text('purgedBy').notNull(),
+  purgedByUsername: text('purgedByUsername').notNull(),
+  removedMessages: integer('removedMessages').notNull().default(0),
+  removedMedia: integer('removedMedia').notNull().default(0),
+  createdAt: integer('createdAt', { mode: 'timestamp_ms' }).notNull().default(sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`),
 })
