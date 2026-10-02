@@ -3,6 +3,7 @@ name: Deploy Hugo site to Pages
 on:
   push:
     branches: ["main"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -10,8 +11,11 @@ permissions:
   pages: write
   id-token: write
 
+# 并发组带上 ref，这样 PR 的构建不会和 main 的部署互相排队。
+# （原来固定写 "pages"，加了 PR 触发之后两者会挤在同一个队列里，
+#   一个还没合并的 PR 就能把真实部署堵住。）
 concurrency:
-  group: "pages"
+  group: "pages-${{ github.ref }}"
   cancel-in-progress: false
 
 defaults:
@@ -39,7 +43,16 @@ jobs:
         id: pages
         uses: actions/configure-pages@v5
       
+      # wiki 那几步只在 push 时跑。
+      #
+      # 原因：wiki 在**私有仓库**里，靠 secrets.WIKI_REPO_TOKEN 拉取，
+      # 而 fork 出来的 PR 拿不到任何 secret —— 硬跑只会让每个 PR 都红。
+      #
+      # 跳掉之后 PR 构建出来的站点少一部分内容，但我们要验的三件事一件不少：
+      # Hugo 能不能构建、聊天室脚本归属对不对、后端类型过不过。
+      # 真正需要 wiki 的场景是「部署」，那只有 push 会发生。
       - name: Checkout wiki source
+        if: github.event_name == 'push'
         uses: actions/checkout@v4
         with:
           repository: rainanow/wiki
@@ -47,6 +60,7 @@ jobs:
           path: wiki-source
 
       - name: Copy wiki into content
+        if: github.event_name == 'push'
         run: |
           mkdir -p content/posts/wiki
           cp -r wiki-source/*.md content/posts/wiki/
@@ -76,8 +90,32 @@ jobs:
           hugo \
             --minify \
             --baseURL "${{ steps.pages.outputs.base_url }}/"
-      
+
+      # 把「聊天室脚本的归属」变成自动检查。
+      #
+      # 为什么必须在这里：PaperMod 用 partialCached 调 footer，缓存键里没有页面路径，
+      # 于是 /chat/ 和所有文章页共用同一个缓存条目。脚本要是放错地方，
+      # 本地构建（恰好 /chat/ 先渲染）完全看不出来，CI 换个渲染顺序就重演线上事故
+      # ——表现是「页面骨架在、状态永远停在正在加载、注册按钮点不动」。
+      # 这个脚本存在就是为了拦这件事，所以它必须在 CI 里跑，不能只靠手工。
+      #
+      # 它只 import node:fs / node:path / node:url，**零第三方依赖**，
+      # 所以不用先 npm ci，直接 node 跑就行（也因此不能放在需要装依赖的步骤之前）。
+      - name: Verify chat script placement
+        working-directory: workers/chat
+        run: node scripts/verify-build.mjs
+
+      # 后端类型检查。同样不需要 dev server，npm ci 完了就能跑。
+      # 之所以接进 CI：tsc 只在本地跑的话，一次「改完直接 push」就能把类型错误带上线，
+      # 而 wrangler dev 不会替你把关。
+      - name: Typecheck chat worker
+        working-directory: workers/chat
+        run: |
+          npm ci
+          npm run typecheck
+
       - name: Encrypt wiki
+        if: github.event_name == 'push'
         run: |
           npm install -g staticrypt
           if [ ! -d public/posts/wiki ]; then
@@ -102,12 +140,19 @@ jobs:
           fi
           ls -la public/posts/wiki
 
+      # PR 只验证、不产出部署产物。
+      # 顺带一个安全收益：PR 构建里没有 wiki（明文），不上传就不会有
+      # 「把未加密的 wiki 塞进 artifact」的可能。
       - name: Upload artifact
+        if: github.event_name == 'push'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./public
 
   deploy:
+    # 只有 push 才真的上线。
+    # needs: build 仍然保留，所以 build 挂了就不会部署。
+    if: github.event_name == 'push'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

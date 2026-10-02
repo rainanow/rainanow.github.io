@@ -1,15 +1,13 @@
-{{ if .Site.Params.busuanzi.enable -}}
-<div class="busuanzi-footer">
-  <span id="busuanzi_container_site_pv">
-    本站总访问量 <span id="busuanzi_value_site_pv"></span> 次
-  </span>
-  <span id="busuanzi_container_site_uv">
-    本站访客数 <span id="busuanzi_value_site_uv"></span> 人次
-  </span>
-</div>
-{{- end }}
+{{- /*
+  这个 partial 由 baseof.html 用 **partialCached** 调用，缓存键里没有页面路径，
+  所以这里**不能**输出任何依赖当前页面的内容 —— /chat/ 和普通文章页共用同一个缓存条目，
+  谁先渲染谁决定那组页面的结果。聊天室的 <script> 因此放在
+  layouts/shortcodes/chat.html 里（骨架和脚本由同一个条件产出），不要挪回来。
 
-{{- /* 注意：这个 partial 由 baseof.html 用 **partialCached** 调用，缓存键里没有页面路径，
-       所以这里**不能**输出任何依赖当前页面的内容——/chat/ 和普通文章页共用同一个缓存条目，
-       谁先渲染谁决定那组页面的结果。聊天室的 <script> 因此放在
-       layouts/shortcodes/chat.html 里（骨架和脚本同一个条件产出），不要挪回来。 */ -}}
+  曾经这里还有一段 busuanzi 的统计计数（`{{ if .Site.Params.busuanzi.enable }}`），
+  但 hugo.toml 只配了 vercount，那段永远不会渲染 —— 已删除。
+
+  留着这个文件的唯一原因是那条 partialCached 的警告：它出过一次线上事故
+  （表现是「页面骨架在、状态永远停在正在加载、注册按钮点不动」），
+  这个注释就是提醒下一个来改 footer 的人。
+*/ -}}

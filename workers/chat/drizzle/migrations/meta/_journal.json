@@ -15,6 +15,13 @@
       "when": 1790780948328,
       "tag": "0002_create_upload_usage",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790952825966,
+      "tag": "0003_audit_fields",
+      "breakpoints": true
     }
   ]
 }

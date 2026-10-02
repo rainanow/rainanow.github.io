@@ -95,6 +95,14 @@
   var pendingCatchUp = false
   var membersLoading = false
   var membersRefreshTimer = null
+  /**
+   * 上一次拉到的**全量**成员名单。
+   *
+   * 存在的原因：presence 刷新走的是 `scope=online`（不读 D1），
+   * 那边只回「此刻谁在线」，给不出离线名单。要画出「在线 / 离线」两组，
+   * 就得拿这份缓存当底子 —— 在线的人标 online，其余的都算离线。
+   */
+  var memberCache = []
 
   // --- 小工具 ---------------------------------------------------------------
 
@@ -463,8 +471,14 @@
     })
   }
 
+  /**
+   * 进房间时加载第一页历史。
+   *
+   * 之前这里有个 `stickToBottom` 变量恒为 true，然后 `if (stickToBottom) scrollToBottom()`。
+   * 那是「以后可能要按条件决定滚不滚到底」留下的钩子，但它从来没被改成过 false，
+   * 读代码的人只能停下来确认一遍「是不是哪里会改它」——已经删掉，直接滚。
+   */
   function loadInitialHistory() {
-    var stickToBottom = true
     return loadHistory(null).then(function (page) {
       clearMessages()
       page.messages.forEach(function (message) {
@@ -472,7 +486,7 @@
       })
       hasMore = page.hasMore === true
       updateMoreButton()
-      if (stickToBottom) scrollToBottom()
+      scrollToBottom()
     })
   }
 
@@ -535,10 +549,27 @@
       })
   }
 
+  /**
+   * 撤回一条消息。
+   *
+   * 失败时要读响应体里的 `error` —— 后端加了撤回限流之后，429 会带上
+   * 「撤回得太频繁了，N 秒后再试」这种**可以直接给用户看**的中文说明，
+   * 只显示「撤回失败（429）」等于把最有用的信息丢掉了。
+   * 响应体不是 JSON（比如网关返回的 HTML 错误页）时退回状态码，不抛错。
+   */
   function deleteMessage(id) {
     api('/api/messages/' + encodeURIComponent(id), { method: 'DELETE' })
       .then(function (response) {
-        if (!response.ok) throw new Error('撤回失败（' + response.status + '）')
+        return response
+          .json()
+          .catch(function () {
+            return null
+          })
+          .then(function (payload) {
+            if (!response.ok) {
+              throw new Error((payload && payload.error) || '撤回失败（' + response.status + '）')
+            }
+          })
       })
       .catch(function (error) {
         notice(error.message, 'error')
@@ -774,18 +805,54 @@
     setMembersStatus('')
   }
 
-  function loadMembers() {
+  /**
+   * 拉成员名单。
+   *
+   * onlineOnly = true 时走 `scope=online`：名单数据由 Durable Object 提供，
+   * 后端不再去读 users 表全表（仍有一次按主键查自己确认账号在，忽略不计）。
+   * 这是为了省 D1 的读取行数 —— 全量名单一次最多 500 行，
+   * 而有人进出（presence）就要刷一次，累积起来是这笔额度里最冤的一块。
+   *
+   * 代价是这种请求只回「谁在线」，所以离线名单要靠 memberCache 补：
+   * 缓存里的人，在线集合里有就算在线，没有就算离线。
+   */
+  function loadMembers(onlineOnly) {
     if (membersLoading) return
     membersLoading = true
     setMembersStatus('正在加载…')
 
-    api('/api/members?room=' + encodeURIComponent(ROOM))
+    var query = '/api/members?room=' + encodeURIComponent(ROOM)
+    if (onlineOnly) query += '&scope=online'
+
+    api(query)
       .then(function (response) {
         if (!response.ok) throw new Error('加载成员失败（' + response.status + '）')
         return response.json()
       })
       .then(function (payload) {
-        renderMembers(Array.isArray(payload.members) ? payload.members : [])
+        var members = Array.isArray(payload.members) ? payload.members : []
+
+        if (!onlineOnly) {
+          // 全量：直接替换缓存
+          memberCache = members
+          renderMembers(memberCache)
+          return
+        }
+
+        // 只在线：拿在线集合去更新缓存里每个人的 online 标记
+        var onlineIds = {}
+        members.forEach(function (member) {
+          onlineIds[member.id] = true
+          // 在线但不在缓存里（比如我们上次全量之后才注册的账号），补进去
+          var known = memberCache.some(function (cached) {
+            return cached.id === member.id
+          })
+          if (!known) memberCache.push(member)
+        })
+        memberCache.forEach(function (member) {
+          member.online = onlineIds[member.id] === true
+        })
+        renderMembers(memberCache)
       })
       .catch(function (error) {
         setMembersStatus(error.message, 'error')
@@ -798,8 +865,11 @@
   /**
    * 有人进出时刷新名单。
    *
-   * 进出是低频事件，但同一瞬间可能连着来好几条（一个人断线重连就是 leave+join），
-   * 所以攒 800ms 再拉一次，免得每条 presence 都去读一遍 D1 的 users 表。
+   * 两道节流叠在一起，都是为了少读 D1：
+   *   1. 攒 800ms —— 同一瞬间可能连着来好几条（一个人断线重连就是 leave+join）；
+   *   2. 走 `scope=online` —— 这类刷新压根不查 users 表，只问 DO。
+   *      全量名单只在首次展开面板时拉一次（见 setMembersExpanded）。
+   *
    * 面板收着的时候直接跳过——看不到的东西不用查。
    */
   function scheduleMembersRefresh() {
@@ -807,7 +877,7 @@
     if (membersRefreshTimer !== null) return
     membersRefreshTimer = setTimeout(function () {
       membersRefreshTimer = null
-      loadMembers()
+      loadMembers(true)
     }, 800)
   }
 
@@ -836,7 +906,9 @@
     if (expanded) {
       // 两个面板占的是同一块位置，一次只留一个开着
       setRoomsExpanded(false)
-      loadMembers()
+      // 展开时拉**全量**（不带 onlineOnly）：这是建 memberCache 的地方，
+      // 之后的 presence 刷新才能只拉 scope=online 靠这份缓存补离线名单。
+      loadMembers(false)
     }
   }
 
@@ -846,6 +918,8 @@
     if (el.onlineCount !== null) el.onlineCount.textContent = '0'
     if (el.offlineCount !== null) el.offlineCount.textContent = '0'
     setMembersStatus('')
+    // 缓存也要清：它是「上一个账号看到的名单」，留着下一个账号会看到别人的名字。
+    memberCache = []
   }
 
   // --- 管理员操作：导出 / 清空 ----------------------------------------------
@@ -914,7 +988,14 @@
           'chat-' + payload.room + '-' + new Date().toISOString().slice(0, 10) + '.md',
           lines.join('\n'),
         )
-        notice('已导出 ' + payload.count + ' 条消息')
+        // 截断要在界面上说清楚。以前上限是 5000 条，撞到截断的概率很低，
+        // 只写进导出文件里也够；现在是 1000 条（为了躲开 CPU 10ms 上限），
+        // 稍大一点的房间就会撞上，用户得知道「这不是全部」。
+        notice(
+          payload.truncated
+            ? '房间太大，这次只导出了最早的 ' + payload.count + ' 条（还有更早的没导出）'
+            : '已导出 ' + payload.count + ' 条消息',
+        )
       })
       .catch(function (error) {
         notice(error.message, 'error')

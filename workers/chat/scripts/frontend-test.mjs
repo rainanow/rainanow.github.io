@@ -432,6 +432,48 @@ try {
   )
   check('撤回后消息从列表移除', true)
 
+  // --- 撤回限流时的提示文案 ---
+  // 后端加了撤回限流之后，429 会带一句能直接给用户看的中文说明。
+  // 前端如果只显示「撤回失败（429）」，等于把最有用的信息丢掉了。
+  // 这里真把额度打满，再点一次撤回按钮，看提示里有没有那句话。
+  section('撤回限流时的提示')
+  {
+    await sleep(2200)
+    const limitedBody = `等会儿要撤掉的消息 ${Date.now()}`
+    $('[data-chat-input]').value = limitedBody
+    submitForm('[data-chat-composer]')
+    await waitFor('新消息出现在列表里', () =>
+      [...document.querySelectorAll('.chat__body')].some((node) => node.textContent === limitedBody),
+      12000,
+    )
+
+    // 直接把额度打满：打到一个不存在的 id 也会消耗额度（限流在查库之前，
+    // 这是刻意的 fail-closed，理由见 routes/chat.ts）
+    for (let i = 0; i < 25; i += 1) {
+      await window.fetch(WORKER + '/api/messages/00000000-0000-4000-8000-000000000000', {
+        method: 'DELETE',
+        credentials: 'include',
+      })
+    }
+
+    const limitedNode = [...document.querySelectorAll('.chat__message')].find(
+      (node) => node.querySelector('.chat__body')?.textContent === limitedBody,
+    )
+    limitedNode.querySelector('.chat__delete').dispatchEvent(new window.Event('click', { bubbles: true }))
+
+    await waitFor('限流提示出现', () => {
+      const notice = $('[data-chat-notice]')
+      return notice !== null && !notice.hidden && (notice.textContent ?? '').includes('撤回得太频繁')
+    })
+    const noticeText = $('[data-chat-notice]')?.textContent ?? ''
+    check('被限流时显示服务端给的中文原因', noticeText.includes('撤回得太频繁'), `实际「${noticeText}」`)
+    check('提示里带上了要等多少秒', /\d+\s*秒/.test(noticeText), `实际「${noticeText}」`)
+    check(
+      '被限流时消息本身没有被移除',
+      [...document.querySelectorAll('.chat__body')].some((node) => node.textContent === limitedBody),
+    )
+  }
+
   // --- 退出 ---
   section('退出登录')
   $('[data-chat-logout]').dispatchEvent(new window.Event('click', { bubbles: true }))

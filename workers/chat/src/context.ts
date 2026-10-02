@@ -3,10 +3,12 @@ import type { Nanoka, NanokaModel } from '@nanokajs/core'
 
 import type { Env } from './env'
 import type { messageFields } from './models/message'
+import type { roomPurgeFields } from './models/room-purge'
 import type { userFields } from './models/user'
 
 export type MessageModel = NanokaModel<typeof messageFields>
 export type UserModel = NanokaModel<typeof userFields>
+export type RoomPurgeModel = NanokaModel<typeof roomPurgeFields>
 
 /**
  * access token 里只有 `sub` 和 `type`（`@nanokajs/auth` 就是这么签的），
@@ -24,5 +26,7 @@ export interface ChatContext {
   app: ChatApp
   User: UserModel
   Message: MessageModel
+  /** 「清空房间」的审计流水。硬删留不下痕迹，只能靠这张表。 */
+  RoomPurge: RoomPurgeModel
   auth: AuthInstance
 }

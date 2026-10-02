@@ -48,7 +48,10 @@ export class ChatRoom implements DurableObject {
    * DO 自己没有对外路由，外面碰不到。
    */
   private async handleOnline(): Promise<Response> {
-    return Response.json({ userIds: this.onlineUserIds() })
+    // `members` 是后来加的（带用户名，让 Worker 不用再查 users 表）。
+    // `userIds` 保留是为了兼容老调用方，但它现在只是 members 的投影，不额外遍历。
+    const members = this.onlineMembers()
+    return Response.json({ userIds: members.map((m) => m.userId), members })
   }
 
   /** Worker 校验并落库之后，把事件丢过来广播。DO 没有对外的 route，只有 Worker 能调到这里。 */
@@ -150,13 +153,28 @@ export class ChatRoom implements DurableObject {
    * 房间就几十个人，这点开销可以忽略，而且这些调用本来就发生在 DO 已经被唤醒的时候。
    */
   /** 当前连着的用户 id，按人算不按连接算（同一个人开三个标签页只出现一次）。 */
-  private onlineUserIds(): string[] {
-    const userIds = new Set<string>()
+  /**
+   * 当前在线的人，**带用户名**。
+   *
+   * 以前这里只返回 userId，Worker 拿到之后还得去 D1 的 users 表查一遍
+   * 才能知道这些人叫什么 —— 而成员名单每次有人进出就要刷一次，
+   * 等于每次都白读几百行。用户名在 attachment 里本来就有（握手时存下的），
+   * 直接一并返回，那条 D1 查询就能省掉。
+   */
+  private onlineMembers(): { userId: string; username: string }[] {
+    // 用 Map 而不是 Set：同一个人开多个标签页会有多条连接，
+    // 要按 userId 去重（和 onlineCount 的口径一致），同时留住第一次见到的用户名。
+    const seen = new Map<string, string>()
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as SocketAttachment | null
-      if (attachment !== null && attachment.userId.length > 0) userIds.add(attachment.userId)
+      if (attachment === null || attachment.userId.length === 0) continue
+      if (!seen.has(attachment.userId)) seen.set(attachment.userId, attachment.username)
     }
-    return [...userIds]
+    return [...seen].map(([userId, username]) => ({ userId, username }))
+  }
+
+  private onlineUserIds(): string[] {
+    return this.onlineMembers().map((member) => member.userId)
   }
 
   private onlineCount(): number {

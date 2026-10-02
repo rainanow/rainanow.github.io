@@ -103,6 +103,12 @@ hasCJKLanguage = true
     # 前端靠这个前缀判断「一个 URL 是不是本站上传的」，不是自家的就不会被
     # 渲染成图片或播放器（否则别人发个外链就能追踪访问者的 IP）。
     mediaBase = "https://media.yulo.top"
+    # 单条消息的长度上限。**必须和 workers/chat/src/config.ts 里的
+    # MAX_MESSAGE_LENGTH 保持一致** —— 这里是前端的唯一来源（输入框的 maxlength），
+    # 那边是后端的唯一来源（校验 + 表约束）。
+    # 两边是否还一致由 `npm run verify-build` 的第 6 项自动检查，
+    # 所以改这个值之后跑一次那个脚本，不用靠肉眼比对。
+    maxMessageLength = 500
 
 [menu]
   [[menu.main]]
