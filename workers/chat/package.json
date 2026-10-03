@@ -13,9 +13,10 @@
     "tail": "wrangler tail",
     "smoke": "node scripts/smoke.mjs",
     "frontend-test": "node scripts/frontend-test.mjs",
-"verify-build": "node scripts/verify-build.mjs",
-"purge-test": "node scripts/purge-test.mjs",
-"probe-production": "node scripts/probe-production.mjs",
+    "verify-build": "node scripts/verify-build.mjs",
+    "purge-test": "node scripts/purge-test.mjs",
+    "rate-limit-test": "node scripts/run-rate-limit-test.mjs",
+    "probe-production": "node scripts/probe-production.mjs",
     "inspect-d1": "node scripts/inspect-d1.mjs"
   },
   "dependencies": {
