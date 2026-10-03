@@ -8,6 +8,26 @@ export const users = sqliteTable('users', {
   username: text('username').notNull().unique(),
   password: text('password').notNull(),
   role: text('role').notNull().default("user"),
+  lastSeenAt: integer('lastSeenAt', { mode: 'timestamp_ms' }),
+  mutedUntil: integer('mutedUntil', { mode: 'timestamp_ms' }),
+  createdAt: integer('createdAt', { mode: 'timestamp_ms' }).notNull().default(sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`),
+})
+
+export const user_sessions = sqliteTable('user_sessions', {
+  jti: text('jti').primaryKey().notNull(),
+  userId: text('userId').notNull(),
+  expiresAt: integer('expiresAt').notNull(),
+  createdAt: integer('createdAt', { mode: 'timestamp_ms' }).notNull().default(sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`),
+})
+
+export const user_purges = sqliteTable('user_purges', {
+  id: text('id').primaryKey().notNull(),
+  purgedUserId: text('purgedUserId').notNull(),
+  purgedUsername: text('purgedUsername').notNull(),
+  purgedBy: text('purgedBy').notNull(),
+  purgedByUsername: text('purgedByUsername').notNull(),
+  renamedTo: text('renamedTo').notNull(),
+  purgedMessages: integer('purgedMessages').notNull().default(0),
   createdAt: integer('createdAt', { mode: 'timestamp_ms' }).notNull().default(sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`),
 })
 

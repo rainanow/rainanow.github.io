@@ -15,11 +15,13 @@ import type { Env } from './env'
 import { scryptHasher } from './hasher'
 import { messageFields, messageTableName } from './models/message'
 import { roomPurgeFields, roomPurgeTableName } from './models/room-purge'
+import { userPurgeFields, userPurgeTableName } from './models/user-purge'
 import { userFields, userTableName } from './models/user'
 import { isAllowedOrigin } from './origins'
 import { registerAuthRoutes } from './routes/auth'
 import { registerChatRoutes } from './routes/chat'
 import { registerMediaRoutes } from './routes/media'
+import { registerModerationRoutes } from './moderation'
 
 export function buildChatApp(env: Env): ChatContext {
   if (typeof env.AUTH_SECRET !== 'string' || env.AUTH_SECRET.length < 32) {
@@ -33,6 +35,7 @@ export function buildChatApp(env: Env): ChatContext {
   const User = app.model(userTableName, userFields)
   const Message = app.model(messageTableName, messageFields)
   const RoomPurge = app.model(roomPurgeTableName, roomPurgeFields)
+  const UserPurge = app.model(userPurgeTableName, userPurgeFields)
 
   const auth = createAuth({
     model: User,
@@ -96,10 +99,11 @@ export function buildChatApp(env: Env): ChatContext {
     return c.json({ error: '服务器内部错误' }, 500)
   })
 
-  const context: ChatContext = { app, User, Message, RoomPurge, auth }
+  const context: ChatContext = { app, User, Message, RoomPurge, UserPurge, auth }
   registerAuthRoutes(context)
   registerChatRoutes(context)
   registerMediaRoutes(context)
+  registerModerationRoutes(context)
   return context
 }
 

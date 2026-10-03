@@ -14,6 +14,58 @@
  * 这样正常登录路径只花一次读，不产生写。
  */
 
+/**
+ * 本地开发时把阈值放大到「等于没有」。
+ *
+ * ## 为什么需要
+ *
+ * 限流按 IP 记账，但**本地 `clientIp()` 一律返回 `unknown`**
+ * （拿不到 CF-Connecting-IP），所以本机所有请求共用 `127.0.0.1` 一个桶。
+ * 写几个测试脚本、或手动注册几个账号就能把 5 次/小时的额度用光，
+ * 之后登录/注册直接 429 —— 现象像「代码坏了」，其实只是撞了限流。
+ *
+ * 调试期间反复去清 `rate_limits` 表很打断思路（本项目 2026-10-03 那天清了好几回），
+ * 所以给个开关。
+ *
+ * ## 线上会不会被削弱
+ *
+ * 不会：这个开关只写在 `.dev.vars` 里，而 **`wrangler deploy` 不读 `.dev.vars`**
+ * （那是 `wrangler dev` 专用的文件）。所以生产环境它恒为 undefined。
+ * 判定用 `=== 'true'`，空串/别拼错的值都走「不放宽」这一侧。
+ *
+ * ## 放大多少
+ *
+ * 放到 100 万。不是「取消记账」—— 记账照做、行为可观测，
+ * 只是阈值高到正常调试永远碰不到。这样万一以后写了依赖限流行为的测试，
+ * 在本地也能跑出真实结果，而不是被静默跳过。
+ */
+const LOCAL_RELAXED_LIMIT = 1_000_000
+
+/** 只在本机 `wrangler dev` 且 .dev.vars 显式设了 RELAX_LOCAL_LIMITS=true 时为真。 */
+export function isLimitRelaxed(env: {
+  RELAX_LOCAL_LIMITS?: string
+  STRICT_RATE_LIMIT?: string
+}): boolean {
+  // 测试可以显式要求「限流必须生效」，用来跑那些断言 429 的用例。
+  // 少了这一条，开发机上一旦开了放宽，限流测试就会集体变红
+  // （实测 12 条），而人很容易把它当成「代码坏了」去查错方向。
+  if (env.STRICT_RATE_LIMIT === 'true') return false
+  return env.RELAX_LOCAL_LIMITS === 'true'
+}
+
+/**
+ * 真正拿去比较的阈值。本地放宽时换成巨大的数，线上原样返回。
+ *
+ * 单独抽出来是为了让**所有调用点都不用改** —— 限流有七八处，
+ * 逐处加 `if (local)` 早晚有人漏掉一处，而漏掉的那处会毫无征兆。
+ */
+export function effectiveLimit(
+  env: { RELAX_LOCAL_LIMITS?: string; STRICT_RATE_LIMIT?: string },
+  limit: number,
+): number {
+  return isLimitRelaxed(env) ? LOCAL_RELAXED_LIMIT : limit
+}
+
 export interface RateLimitState {
   blocked: boolean
   /** 距离窗口重置还有多少秒，用于 Retry-After。 */

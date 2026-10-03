@@ -5,6 +5,8 @@ import { messageFields, messageTableName } from './src/models/message'
 import { rateLimitFields, rateLimitTableName } from './src/models/rate-limit'
 import { roomPurgeFields, roomPurgeTableName } from './src/models/room-purge'
 import { uploadUsageFields, uploadUsageTableName } from './src/models/upload-usage'
+import { userPurgeFields, userPurgeTableName } from './src/models/user-purge'
+import { userSessionFields, userSessionTableName } from './src/models/user-session'
 import { userFields, userTableName } from './src/models/user'
 
 /**
@@ -14,6 +16,8 @@ import { userFields, userTableName } from './src/models/user'
 export default defineConfig({
   models: [
     { name: userTableName, fields: userFields },
+    { name: userSessionTableName, fields: userSessionFields },
+    { name: userPurgeTableName, fields: userPurgeFields },
     { name: messageTableName, fields: messageFields },
     { name: authBlacklistTableName, fields: authBlacklistFields },
     { name: rateLimitTableName, fields: rateLimitFields },
