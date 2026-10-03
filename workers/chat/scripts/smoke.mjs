@@ -130,11 +130,14 @@ function cookieHeader(jar) {
     .join('; ')
 }
 
-function request(path, { jar, method = 'GET', body, origin } = {}) {
+function request(path, { jar, method = 'GET', body, origin, headers: extra } = {}) {
   const headers = {}
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (jar !== undefined) headers['Cookie'] = cookieHeader(jar)
   if (origin !== undefined) headers['Origin'] = origin
+  // 额外头：上传接口要 X-Filename，禁言测试要一个 Content-Type 不一样的请求。
+  // 放在最后覆盖，别让它能把 Cookie/Origin 顶掉。
+  if (extra !== undefined) Object.assign(headers, extra)
   return fetch(`${BASE}${path}`, {
     method,
     headers,
@@ -385,9 +388,10 @@ section('实时收发')
   check('同一条消息经 WebSocket 推了回来', pushed.message.body === '第一条消息 👋')
   check('推送里带用户名', pushed.message.username.toLowerCase() === username.toLowerCase())
 
-  // 连点保护
-  const tooFast = await request('/api/messages', { method: 'POST', jar, body: { body: '抢跑' } })
-  check('1.5 秒内的第二条被限流 429', tooFast.status === 429, `实际 ${tooFast.status}`)
+  // ⚠️ 发言限流的断言**不在这里** —— 它要求限流真的生效，
+  // 而本地 .dev.vars 开了 RELAX_LOCAL_LIMITS（见 rate-limit-test.mjs 的说明）。
+  // 早先它内嵌在本节里，于是本地一开放宽 smoke 就红，人会误以为代码坏了。
+  // 现在它住在 scripts/rate-limit-test.mjs，由 npm run rate-limit-test 跑。
 
   const tooLong = await request('/api/messages', {
     method: 'POST',
@@ -686,80 +690,6 @@ section('refresh 轮换与吊销')
   check('登出后 refresh 被拒', afterLogout.status === 401, `实际 ${afterLogout.status}`)
 }
 
-section('登录限流')
-{
-  // 用一个不存在的用户名，避免把上面那个账号锁掉
-  let lastStatus = 0
-  for (let attempt = 0; attempt < 11; attempt += 1) {
-    const response = await request('/auth/login', {
-      method: 'POST',
-      body: { username: 'ghost-who-does-not-exist', password: 'whatever-long-enough' },
-    })
-    lastStatus = response.status
-  }
-  check('连续失败 11 次后返回 429', lastStatus === 429, `实际 ${lastStatus}`)
-}
-
-section('撤回限流')
-{
-  /*
-   * 撤回原先完全没有限流，是唯一一条「无限制、每条都写库」的路由。
-   * 这里验四件事：
-   *   1. 额度用完之前，请求能正常走到「消息不存在」这一层（不会被限流误伤）；
-   *   2. 打满之后确实返回 429，而不是无限放行；
-   *   3. 429 带 Retry-After，前端/调用方能知道等多久；
-   *   4. 撤回的计数器和发言是**分开**的 —— 被撤回限流挡住之后，还能正常发言。
-   *      这一条最重要：如果两个计数器共用一个 key，用户连着撤回几条旧消息
-   *      就会莫名其妙发不出话。
-   *
-   * 断言写成「序列里必然出现 429」而不是「第 21 次一定 429」，
-   * 这样不依赖本轮之前已经用过几次撤回（上面还有 2 次），也就不会因为
-   * 测试顺序调整而变成脆弱的假失败。
-   */
-  const statuses = []
-  let retryAfter = null
-  // 31 > 20 的额度，保证一定能打满
-  for (let attempt = 0; attempt < 31; attempt += 1) {
-    const response = await request('/api/messages/00000000-0000-4000-8000-000000000000', {
-      method: 'DELETE',
-      jar,
-    })
-    statuses.push(response.status)
-    if (response.status === 429 && retryAfter === null) {
-      retryAfter = response.headers.get('retry-after')
-    }
-  }
-
-  const firstBlocked = statuses.indexOf(429)
-  check('撤回打满额度后返回 429', firstBlocked !== -1, `状态序列：${statuses.join(',')}`)
-  check(
-    '被限流之前，请求正常走到了业务逻辑（404）',
-    firstBlocked > 0 && statuses.slice(0, firstBlocked).every((status) => status === 404),
-    `前 ${firstBlocked} 个状态：${statuses.slice(0, firstBlocked).join(',')}`,
-  )
-  check('429 之后不会再放行', statuses.slice(firstBlocked).every((status) => status === 429))
-  check('放行的次数是有限且合理的', firstBlocked > 0 && firstBlocked <= 21, `实际放行 ${firstBlocked} 次`)
-  check(
-    '429 带 Retry-After',
-    retryAfter !== null && Number.parseInt(retryAfter, 10) > 0,
-    `实际 ${retryAfter}`,
-  )
-
-  // 独立性：被撤回限流挡住之后，发言不该受影响。
-  // 等过发言那个 2 秒窗口，否则会撞上发言限流而误判。
-  await sleep(2200)
-  const stillCanPost = await request('/api/messages', {
-    method: 'POST',
-    jar,
-    body: { body: '撤回被限流之后我还能说话', room: 'general' },
-  })
-  check(
-    '撤回被限流不影响发言（两个计数器是分开的）',
-    stillCanPost.status === 201,
-    `实际 ${stillCanPost.status}`,
-  )
-}
-
 section('审计：谁删的、什么时候删的')
 {
   /*
@@ -856,71 +786,156 @@ section('审计：清空房间的流水')
   }
 }
 
-section('refresh 限流')
+section('会话吊销：改密码后旧 token 失效')
 {
   /*
-   * refresh 开着 rotation，每次成功都会往 auth_blacklist 写一行。
-   * 不限流就等于把「D1 写额度」挂在一个匿名可用的接口上。
+   * 这条守着的是一个**真实漏洞的回归**：改密码如果不吊销会话，
+   * 之前泄露的 refresh token 照样能换出新 access token —— 密码改了但没生效。
    *
-   * 这里验两件事：
-   *   1. 有效 token 打满额度后返回 429（不是无限放行）；
-   *   2. **废 token 也会被限住**。这条是防「解不出 sub 就跳过限流」那个洞 ——
-   *      实现里解不开 token 时退回按 IP 记账，而不是放行。
-   *
-   * 桶键不同（refresh:<userId> vs refresh-ip:<ip>），所以先测哪个都不影响另一个。
+   * 注意要**重新登录**拿一个干净的 jar：前面几节已经把主账号的
+   * refresh 轮换过多次，而且「refresh 限流」那节会把它打满。
    */
   const relogin = await request('/auth/login', { method: 'POST', body: { username, password } })
-  const freshJar = jarFrom(relogin)
+  check('重新登录成功', relogin.status === 200, `实际 ${relogin.status}`)
+  const pwJar = jarFrom(relogin)
 
-  const statuses = []
-  let retryAfter = null
-  for (let i = 0; i < 26; i += 1) {
-    const response = await request('/auth/refresh', { method: 'POST', jar: freshJar })
-    statuses.push(response.status)
-    if (response.status === 429 && retryAfter === null) {
-      retryAfter = response.headers.get('retry-after')
-    }
-    // refresh 成功后 token 会轮换，下一次必须带上新的，
-    // 否则就是在重放旧 token（那走的是 401 分支，测不到「成功刷新被限」）
-    const rotated = jarFrom(response)
-    if (typeof rotated.refresh_token === 'string') freshJar.refresh_token = rotated.refresh_token
-  }
+  const before = pwJar.refresh_token
+  check('拿到了 refresh token', typeof before === 'string' && before.length > 0)
 
-  const firstBlocked = statuses.indexOf(429)
-  check('有效 token：refresh 打满额度后返回 429', firstBlocked !== -1, `状态序列：${statuses.join(',')}`)
-  check(
-    '被限流之前 refresh 是成功的（200）',
-    firstBlocked > 0 && statuses.slice(0, firstBlocked).every((status) => status === 200),
-    `前 ${firstBlocked} 个状态：${statuses.slice(0, firstBlocked).join(',')}`,
-  )
-  check('refresh 的 429 带 Retry-After', retryAfter !== null && Number.parseInt(retryAfter, 10) > 0, `实际 ${retryAfter}`)
+  // 改密码：先验旧密码错会被拒
+  const wrongOld = await request('/api/me/password', {
+    method: 'POST',
+    jar: pwJar,
+    body: { currentPassword: 'definitely-wrong', newPassword: 'brand-new-password-1' },
+  })
+  check('旧密码不对时拒绝（403）', wrongOld.status === 403, `实际 ${wrongOld.status}`)
 
-  // 废 token 分支：解不出 sub，应当退回按 IP 记账、而不是被放过。
-  //
-  // 这里必须自己发请求带上一个**独有的** X-Forwarded-For，原因很实在：
-  // 本地请求的 clientIp() 一律落到 'unknown'，也就是所有测试共用同一个 IP 桶。
-  // 不走这步的话，上面几轮跑测试留下的计数还在桶里，断言会「碰巧」通过 ——
-  // 它验的是上一轮的结果，不是这一轮的。给一个本轮独有的 IP 才能真验。
-  const uniqueIp = `203.0.113.${1 + (Date.now() % 250)}`
-  const junkStatuses = []
-  for (let i = 0; i < 26; i += 1) {
-    const response = await fetch(`${BASE}/auth/refresh`, {
-      method: 'POST',
-      headers: { Cookie: 'refresh_token=not-a-real-token', 'X-Forwarded-For': uniqueIp },
+  // 两次新密码不一致时后端也应挡（后端只收 newPassword，一致性由前端保证，
+  // 这里验的是「旧密码错」不会被误判成 200）
+  const changed = await request('/api/me/password', {
+    method: 'POST',
+    jar: pwJar,
+    body: { currentPassword: password, newPassword: 'brand-new-password-1' },
+  })
+  check('改密码成功', changed.status === 200, `实际 ${changed.status}`)
+  const changedBody = await changed.json()
+  check('吊销了至少一个会话', changedBody.revokedSessions >= 1, `实际 ${changedBody.revokedSessions}`)
+
+  // 关键断言：改密码【之前】那个 refresh token 必须换不出东西
+  const replay = await fetch(`${BASE}/auth/refresh`, {
+    method: 'POST',
+    headers: { Cookie: `refresh_token=${before}` },
+  })
+  check('改密码前的 refresh token 失效了（401）', replay.status === 401, `实际 ${replay.status}`)
+
+  // 改回去，否则后面 logout 那节会用旧密码
+  const back = await request('/auth/login', {
+    method: 'POST',
+    body: { username, password: 'brand-new-password-1' },
+  })
+  check('新密码能登录', back.status === 200, `实际 ${back.status}`)
+  const backJar = jarFrom(back)
+  const restore = await request('/api/me/password', {
+    method: 'POST',
+    jar: backJar,
+    body: { currentPassword: 'brand-new-password-1', newPassword: password },
+  })
+  check('能改回原密码（测试不留副作用）', restore.status === 200, `实际 ${restore.status}`)
+}
+
+section('管理员：禁言与注销')
+{
+  if (!isLocalTarget()) {
+    console.log('  （目标不是本机，跳过：需要改本地库提权）')
+  } else {
+    // 用一个**独立的管理员账号**，不复用主账号。
+    // 理由：主账号的「moderation:<sub>」限流桶在别处可能被占，
+    // 而且拿主账号去测「不能对自己操作」这类断言会互相干扰。
+    withLocalDb((db) => db.exec("DELETE FROM rate_limits WHERE id LIKE 'register:%'"))
+
+    const adminName = `boss${Date.now().toString(36).slice(-5)}`
+    const adminPass = 'admin-password-123'
+    await request('/auth/register', { method: 'POST', body: { username: adminName, password: adminPass } })
+    const adminLogin = await request('/auth/login', { method: 'POST', body: { username: adminName, password: adminPass } })
+    const adminJar = jarFrom(adminLogin)
+    setLocalRole(adminName, 'admin')
+    // 提权后要重新登录：access token 里没有 role claim，
+    // 而管理路由每次都查库，所以旧 token 也能用，不必重登。
+
+    const targetName = `tgt${Date.now().toString(36).slice(-5)}`
+    const targetPass = 'target-password-123'
+    await request('/auth/register', { method: 'POST', body: { username: targetName, password: targetPass } })
+    const targetLogin = await request('/auth/login', { method: 'POST', body: { username: targetName, password: targetPass } })
+    const targetJar = jarFrom(targetLogin)
+    const targetProfile = await (await request('/api/me', { jar: targetJar })).json()
+
+    // ① 禁言
+    const mute = await request(`/api/users/${targetProfile.id}/mute`, {
+      method: 'POST', jar: adminJar, body: { minutes: 60 },
     })
-    junkStatuses.push(response.status)
+    check('管理员能禁言', mute.status === 200, `实际 ${mute.status}`)
+    const muteBody = await mute.json()
+    check('禁言返回了截止时间戳', typeof muteBody.mutedUntil === 'number', `实际 ${muteBody.mutedUntil}`)
+
+    // ② 被禁言后三处都要拦住
+    await sleep(2200)
+    const speak = await request('/api/messages', { method: 'POST', jar: targetJar, body: { body: '禁言后发言', room: 'modprobe' } })
+    check('被禁言后发不了消息（403）', speak.status === 403, `实际 ${speak.status}`)
+
+    const upload = await request('/api/uploads', { method: 'POST', jar: targetJar, headers: { 'X-Filename': 'a.txt' } })
+    check('被禁言后传不了文件（403）', upload.status === 403, `实际 ${upload.status}`)
+
+    // 用 openSocket 而不是 fetch：Node 的 fetch 不认 ws:// 协议。
+    const ws = openSocket({ jar: targetJar, room: 'modprobe' })
+    let wsStatus = 'connected'
+    try {
+      await ws.opened
+    } catch (error) {
+      wsStatus = error.message
+    }
+    ws.socket.terminate()
+    check('被禁言后连不上 WebSocket（403）', wsStatus === 'HTTP 403', `实际 ${wsStatus}`)
+
+    // ③ 解除
+    const unmute = await request(`/api/users/${targetProfile.id}/mute`, {
+      method: 'POST', jar: adminJar, body: { minutes: null },
+    })
+    check('能解除禁言', unmute.status === 200, `实际 ${unmute.status}`)
+    await sleep(2200)
+    const speak2 = await request('/api/messages', { method: 'POST', jar: targetJar, body: { body: '解除后发言', room: 'modprobe' } })
+    check('解除后能发消息（201）', speak2.status === 201, `实际 ${speak2.status}`)
+
+    // ④ 不能对自己操作
+    const adminProfile = await (await request('/api/me', { jar: adminJar })).json()
+    const selfMute = await request(`/api/users/${adminProfile.id}/mute`, { method: 'POST', jar: adminJar, body: { minutes: 10 } })
+    check('不能禁言自己（400）', selfMute.status === 400, `实际 ${selfMute.status}`)
+    const selfDelete = await request(`/api/users/${adminProfile.id}`, { method: 'DELETE', jar: adminJar })
+    check('不能注销自己（400）', selfDelete.status === 400, `实际 ${selfDelete.status}`)
+
+    // ⑤ 非管理员不能操作别人
+    const targetMuteOther = await request(`/api/users/${adminProfile.id}/mute`, {
+      method: 'POST', jar: targetJar, body: { minutes: 10 },
+    })
+    check('非管理员不能禁言别人（403）', targetMuteOther.status === 403, `实际 ${targetMuteOther.status}`)
+
+    // ⑥ 注销
+    const before2 = await (await request('/api/messages?room=modprobe', { jar: adminJar })).json()
+    const targetMessages = before2.messages.filter((m) => m.username === targetName).length
+    check('目标发过消息（后面验证保留）', targetMessages > 0, `实际 ${targetMessages}`)
+
+    const del = await request(`/api/users/${targetProfile.id}`, { method: 'DELETE', jar: adminJar })
+    check('管理员能注销用户', del.status === 200, `实际 ${del.status}`)
+    const delBody = await del.json()
+    check('注销报告了改写了几条消息', delBody.renamedMessages === targetMessages, `${delBody.renamedMessages} vs ${targetMessages}`)
+
+    const relogin2 = await request('/auth/login', { method: 'POST', body: { username: targetName, password: targetPass } })
+    check('被注销的人登不上了（401）', relogin2.status === 401, `实际 ${relogin2.status}`)
+
+    const after = await (await request('/api/messages?room=modprobe', { jar: adminJar })).json()
+    const stillThere = after.messages.filter((m) => m.body.includes('解除后发言'))
+    check('消息本身被保留（注销不该删别人的发言）', stillThere.length > 0, `实际 ${stillThere.length}`)
+    check('作者名改成了「已注销」', stillThere.every((m) => m.username === '已注销'), `实际 ${stillThere.map((m) => m.username).join(',')}`)
   }
-  const junkFirstBlocked = junkStatuses.indexOf(429)
-  check(
-    '废 token 也会被限住（不是绕过限流的后门）',
-    junkFirstBlocked !== -1,
-    `状态序列：${junkStatuses.join(',')}`,
-  )
-  check(
-    '废 token 先正常返回 401，打满后才 429（不是一上来就被挡）',
-    junkFirstBlocked > 0 && junkStatuses.slice(0, junkFirstBlocked).every((s) => s === 401),
-    `前 ${junkFirstBlocked} 个状态：${junkStatuses.slice(0, junkFirstBlocked).join(',')}`,
-  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)

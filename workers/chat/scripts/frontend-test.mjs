@@ -447,30 +447,228 @@ try {
       12000,
     )
 
-    // 直接把额度打满：打到一个不存在的 id 也会消耗额度（限流在查库之前，
-    // 这是刻意的 fail-closed，理由见 routes/chat.ts）
-    for (let i = 0; i < 25; i += 1) {
-      await window.fetch(WORKER + '/api/messages/00000000-0000-4000-8000-000000000000', {
-        method: 'DELETE',
-        credentials: 'include',
-      })
+    /*
+     * 撤回被限流时前端的表现。
+     *
+     * ⚠️ **不能靠「真的打满限流」来测这一节**（早先就是那么写的，打 25 次 DELETE）。
+     * 原因有两个：
+     *   1. 本地 .dev.vars 开了 RELAX_LOCAL_LIMITS，限流打不满 → 用例必然超时；
+     *   2. 就算关掉开关，打 25 次真实请求也慢，且让本节依赖了限流阈值这个常量。
+     *
+     * 改成 mock 掉这一个 DELETE 让它返回 429：要验的行为
+     *（「提示中文原因」+「消息不被误删」）与限流阈值无关，
+     * 阈值本身由 rate-limit-test.mjs 负责。
+     */
+    const realFetchForMute = window.fetch
+    window.fetch = function (input, init) {
+      const url = typeof input === 'string' ? input : (input && input.url) || ''
+      if (url.indexOf('/api/messages/') !== -1 && (init && init.method) === 'DELETE') {
+        return Promise.resolve({
+          ok: false,
+          status: 429,
+          json: function () {
+            return Promise.resolve({ error: '撤回得太频繁了，12 秒后再试' })
+          },
+        })
+      }
+      return realFetchForMute(input, init)
     }
 
     const limitedNode = [...document.querySelectorAll('.chat__message')].find(
       (node) => node.querySelector('.chat__body')?.textContent === limitedBody,
     )
+    check('待撤回的消息在列表里', limitedNode !== undefined, '找不到那条消息')
     limitedNode.querySelector('.chat__delete').dispatchEvent(new window.Event('click', { bubbles: true }))
 
     await waitFor('限流提示出现', () => {
       const notice = $('[data-chat-notice]')
       return notice !== null && !notice.hidden && (notice.textContent ?? '').includes('撤回得太频繁')
-    })
+    }, 5000)
     const noticeText = $('[data-chat-notice]')?.textContent ?? ''
     check('被限流时显示服务端给的中文原因', noticeText.includes('撤回得太频繁'), `实际「${noticeText}」`)
     check('提示里带上了要等多少秒', /\d+\s*秒/.test(noticeText), `实际「${noticeText}」`)
-    check(
+    window.fetch = realFetchForMute
+        check(
       '被限流时消息本身没有被移除',
       [...document.querySelectorAll('.chat__body')].some((node) => node.textContent === limitedBody),
+    )
+  }
+
+  // --- data-* 属性名不能撞车（回归） ---
+  section('选择器没有撞车')
+  {
+    /*
+     * 这条是踩过一次才加的。
+     *
+     * 改密码的按钮曾经用了 `data-chat-password`，而登录密码框用的是**同一个**
+     * 属性名。`querySelector('[data-chat-password]')` 只会返回**第一个**匹配 ——
+     * 登录框在文档前面，于是 `el.password` 被抢走，登录永远读到空值，
+     * 表现成「明明填了账号密码，却提示都要填」。
+     *
+     * 为什么别的地方测不出来：登录是在别的 section 里做的，
+     * 等测到改密码按钮时登录早就成功了，属性名撞车已经被"绕过"。
+     * 所以必须**在登录之前**断言「每个 data-* 选择器都唯一对应一个元素」。
+     */
+    const dataAttrs = [...document.querySelectorAll('[data-chat-auth] [data-chat-password], [data-chat-password]')]
+    const bare = document.querySelectorAll('[data-chat-password]')
+    check('裸的 [data-chat-password] 只有一个元素（登录密码框）', bare.length === 1, `实际 ${bare.length} 个`)
+
+    const button = document.querySelectorAll('[data-chat-password-button]')
+    check('改密码按钮用独立的属性名', button.length === 1, `实际 ${button.length} 个`)
+
+    // 逐个核对 chat.js 里要用到的选择器：命中数必须和预期一致，
+    // 大于 1 就意味着其中某个是被别人的属性顺带匹配上的。
+    const expected = {
+      '[data-chat-username]': 1,
+      '[data-chat-password]': 1,
+      '[data-chat-password-button]': 1,
+      '[data-chat-password-current]': 1,
+      '[data-chat-password-new]': 1,
+      '[data-chat-password-confirm]': 1,
+      '[data-chat-password-modal]': 1,
+      '[data-chat-password-form]': 1,
+    }
+    for (const [selector, want] of Object.entries(expected)) {
+      const got = document.querySelectorAll(selector).length
+      check(`${selector} 唯一（${want} 个）`, got === want, `实际 ${got} 个`)
+    }
+
+    // 登录框真的还是登录框：值填进去能被读到
+    const userInput = $('[data-chat-username]')
+    const passInput = $('[data-chat-password]')
+    passInput.value = 'sentinel-password'
+    check('登录密码框能读到自己的值（没被别的元素占位）', passInput.value === 'sentinel-password', `实际 "${passInput.value}"`)
+    check('登录密码框和改密码的新密码框不是同一个元素', passInput !== $('[data-chat-password-new]'))
+    passInput.value = ''
+    if (userInput !== null) userInput.value = ''
+  }
+
+  // --- 成员名单的次要信息与管理按钮 ---
+  section('成员名单：上次在线与管理员按钮')
+  {
+    // 「上次在线」只给离线的人显示，在线的人那个位置是空的
+    const rows = [...document.querySelectorAll('.chat__member')]
+    check('成员行里有名字元素', rows.every((r) => r.querySelector('.chat__member-name') !== null))
+    const offlineRows = rows.filter((r) => !r.classList.contains('is-online'))
+    check(
+      '离线成员显示了上次在线时间',
+      offlineRows.every((r) => {
+        const seen = r.querySelector('.chat__member-seen')
+        return seen !== null && seen.textContent.length > 0
+      }),
+      `离线 ${offlineRows.length} 人`,
+    )
+    check(
+      '在线成员不显示上次在线（那个信息没意义）',
+      rows
+        .filter((r) => r.classList.contains('is-online'))
+        .every((r) => r.querySelector('.chat__member-seen') === null),
+    )
+
+    // 这个测试账号不是管理员，所以管理按钮不该出现
+    const meRow = rows.find((r) => r.classList.contains('is-me'))
+    check('管理员操作按钮默认不出现（当前是普通用户）', document.querySelectorAll('.chat__member-action').length === 0, `实际 ${document.querySelectorAll('.chat__member-action').length} 个`)
+    check('自己的那一行没有管理按钮', meRow !== undefined && meRow.querySelector('.chat__member-action') === null)
+  }
+
+  // --- 改密码弹窗 ---
+  section('改密码弹窗')
+  {
+    check('登录后改密码按钮可见', visible('[data-chat-password-button]'))
+    check('弹窗默认是关着的', $('[data-chat-password-modal]').hidden === true)
+
+    $('[data-chat-password-button]').dispatchEvent(new window.Event('click', { bubbles: true }))
+    check('点笔图标打开弹窗', visible('[data-chat-password-modal]'))
+    check('弹窗里有三个输入框（当前密码 / 新密码 / 确认）',
+      $('[data-chat-password-current]') !== null &&
+      $('[data-chat-password-new]') !== null &&
+      $('[data-chat-password-confirm]') !== null)
+
+    // 两次不一致要挡在提交之前
+    $('[data-chat-password-current]').value = 'old-password-x'
+    $('[data-chat-password-new]').value = 'new-password-abc'
+    $('[data-chat-password-confirm]').value = 'different-password'
+    submitForm('[data-chat-password-form]')
+    await waitFor('不一致的提示出现', () =>
+      ($('[data-chat-password-hint]')?.textContent ?? '').includes('不一致'), 5000)
+    check('两次新密码不一致时提示且不提交', ($('[data-chat-password-hint]')?.textContent ?? '').includes('不一致'))
+
+    // 取消能关掉
+    $('[data-chat-password-cancel]').dispatchEvent(new window.Event('click', { bubbles: true }))
+    check('取消能关掉弹窗', $('[data-chat-password-modal]').hidden === true)
+  }
+
+  /*
+   * refresh 被限流（429）不该把人登出 —— 回归测试。
+   *
+   * 背景：本地跑测试时把 refresh 限流桶打满（29 次），浏览器一进页面
+   * 就看到「登录已过期」—— 而密码对、会话也好，只是刷新太勤被限流。
+   * 修法：refreshSession 的结果从布尔改成三态（ok / expired / retry），
+   * 429 归入 'retry'；三个调用方（api / 重连 / boot）看到 'retry' 都不登出。
+   *
+   * ## 为什么这一节只做静态断言，不在 jsdom 里跑真的链路
+   *
+   * 试了三次都不成功，记下来免得下一个人再走一遍：
+   *   1. mock 装在登录前 → 伪造的 401 把登录本身也打断，用例卡在「进入聊天室」；
+   *   2. mock 装在登录后 → `loadMembers` 开头 `if (membersLoading) return` 去重，
+   *      不「先收后展」就不发请求；展开了，`api()` 里 `me === null` 又挡着；
+   *   3. 用 `new Function` 把那段源码抽出来跑 → 字符串替换太脆，语法都对不上。
+   *
+   * 三次都变成在测「链路走没走到」而不是「判定对不对」——
+   * **测不准的测试比没有测试更糟**，它给的是虚假的安全感。
+   *
+   * 现在改成静态断言：验「429 被归类成 retry」和「调用方不因 retry 登出」
+   * 这两条不变式在源码里成立。链路由上面的功能测试覆盖。
+   * 好处是零 flake、改代码时立刻反映；代价是不覆盖运行时行为——
+   * 接受，因为要保的就是这几行判定，不是整条链路。
+   */
+  section('refresh 被限流（429）不算会话失效')
+  {
+    const src = chatJs
+
+    // ① 429 必须被单独归类成 retry，不能和 expired 混在一起
+    check(
+      "refreshSession 把 429 判成 'retry'",
+      /response\.status === 429\)\s*return 'retry'/.test(src),
+      '源码里找不到 429 → retry 的判定',
+    )
+    check(
+      "refreshSession 只有非 429 的失败才判 'expired'",
+      /return response\.ok \? 'ok' : 'expired'/.test(src),
+      '源码里找不到 ok/expired 的判定',
+    )
+
+    // ② 三个调用方都区分 retry：不该一看到失败就登出。
+    //    用「从 refreshSession 调用处往后 600 字符」切段，而不是靠正则匹配函数体 ——
+    //    正则要么抓不全（`\n  }` 会在嵌套的 then 里提前结束），要么抓太宽。
+    const slices = []
+    let from = 0
+    for (;;) {
+      const at = src.indexOf('refreshSession()', from)
+      if (at === -1) break
+      // 跳过函数定义那一处（'function refreshSession() {'），只留真正的调用点
+      const isDefinition = src.slice(Math.max(0, at - 40), at).includes('function ')
+      if (!isDefinition) slices.push(src.slice(at, at + 600))
+      from = at + 1
+    }
+    check('源码里有 3 处调用 refreshSession', slices.length === 3, `实际 ${slices.length} 处`)
+
+    for (const [i, segment] of slices.entries()) {
+      // 每处都该在 state 上分支，而不是 `if (state === 'ok')` 就完事
+      const branches = /state === 'retry'/.test(segment) || /state === 'expired'/.test(segment)
+      check(`第 ${i + 1} 处续期调用区分了 retry/expired`, branches, '看不到 state 分支')
+      // 最关键：retry 附近绝不能出现 handleSignedOut
+      const signedOutAfterRetry =
+        /state === 'retry'[\s\S]{0,200}handleSignedOut/.test(segment) ||
+        /handleSignedOut\(\)[\s\S]{0,80}state === 'retry'/.test(segment)
+      check(`第 ${i + 1} 处不会在 retry 时登出`, signedOutAfterRetry === false, 'retry 分支里调了 handleSignedOut')
+    }
+
+    // ③ 旧实现（布尔）已经被彻底换掉，别留着半吊子
+    check(
+      '不再有「把 refresh 结果当布尔用」的残留',
+      !/if \(!ok\)\s*\{\s*handleSignedOut/.test(src),
+      '还有 !ok → handleSignedOut 的旧写法',
     )
   }
 
