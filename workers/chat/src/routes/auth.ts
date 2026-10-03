@@ -1,6 +1,6 @@
 import { verify } from '@nanokajs/auth'
 import { deleteCookie, getCookie } from 'hono/cookie'
-import type { MiddlewareHandler } from 'hono'
+import type { Context, MiddlewareHandler } from 'hono'
 import { z } from 'zod'
 
 import { revokeRefreshToken } from '../blacklist'
@@ -13,7 +13,8 @@ import {
 import type { AppEnv, ChatContext } from '../context'
 import { scryptHasher } from '../hasher'
 import { clientIp } from '../middleware'
-import { consumeRateLimit, peekRateLimit } from '../rate-limit'
+import { consumeRateLimit, effectiveLimit, peekRateLimit } from '../rate-limit'
+import { isSessionActive, registerSession } from '../sessions'
 
 /** 登录失败限额：同一 IP + 同一用户名，15 分钟内最多 10 次。 */
 const LOGIN_FAILURE_LIMIT = 10
@@ -70,7 +71,12 @@ const loginThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   const username = typeof body?.username === 'string' ? body.username.trim().toLowerCase() : ''
 
   const key = `login:${ip}:${username}`
-  const state = await peekRateLimit(c.env.DB, key, LOGIN_FAILURE_LIMIT, LOGIN_WINDOW_SECONDS)
+  const state = await peekRateLimit(
+    c.env.DB,
+    key,
+    effectiveLimit(c.env, LOGIN_FAILURE_LIMIT),
+    LOGIN_WINDOW_SECONDS,
+  )
   if (state.blocked) {
     c.header('Retry-After', String(state.retryAfterSeconds))
     return c.json({ error: '登录失败次数过多，请过一会儿再试' }, 429)
@@ -83,7 +89,12 @@ const loginThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   // 异常根本不会冒泡回这一层——写成 try/catch 会静默失效（实测踩过一次，
   // 现象是 rate_limits 表里永远没有 login: 记录）。
   if (c.res?.status === 401) {
-    await consumeRateLimit(c.env.DB, key, LOGIN_FAILURE_LIMIT, LOGIN_WINDOW_SECONDS)
+    await consumeRateLimit(
+      c.env.DB,
+      key,
+      effectiveLimit(c.env, LOGIN_FAILURE_LIMIT),
+      LOGIN_WINDOW_SECONDS,
+    )
   }
 }
 
@@ -115,9 +126,33 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   const token = getCookie(c, REFRESH_TOKEN_COOKIE)
   if (token !== undefined && token.length > 0) {
     try {
-      const payload = await verify<{ sub?: unknown; type?: unknown }>(token, c.env.AUTH_SECRET)
+      const payload = await verify<{ sub?: unknown; type?: unknown; jti?: unknown }>(
+        token,
+        c.env.AUTH_SECRET,
+      )
       if (payload.type === 'refresh' && typeof payload.sub === 'string' && payload.sub.length > 0) {
         bucket = `refresh:${payload.sub}`
+
+        /*
+         * 有效会话校验。**这是「改密码」能真正生效的那一步。**
+         *
+         * 改密码会清空这个 userId 在 user_sessions 里的全部行，于是这里
+         * 判成无效 → refresh 被拒。之前泄露出去的 refresh token 也就换不出
+         * 任何 access token 了。
+         *
+         * 放在限流**之后**是有意的：先记账再判定，这样「拿一个已被吊销的 token
+         * 疯狂打 refresh」同样会被限流住，不会变成一条无开销的免费路径。
+         *
+         * token 验签失败的情况不用在这里处理 —— 交给下面的 refreshHandler，
+         * 它本来就会拒。少一处判断就少一处不一致。
+         */
+        if (typeof payload.jti === 'string' && payload.jti.length > 0) {
+          const active = await isSessionActive(c.env.DB, payload.jti)
+          if (!active) {
+            deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
+            return c.json({ error: '登录状态已失效，请重新登录' }, 401)
+          }
+        }
       }
     } catch {
       // 令牌无效/过期：解不出 sub，退回按 IP 记账（见上面第三点）
@@ -127,7 +162,7 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   const attempt = await consumeRateLimit(
     c.env.DB,
     bucket,
-    REFRESH_ALLOWED_PER_WINDOW + 1,
+    effectiveLimit(c.env, REFRESH_ALLOWED_PER_WINDOW + 1),
     REFRESH_WINDOW_SECONDS,
   )
   if (attempt.blocked) {
@@ -138,10 +173,58 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next()
 }
 
-export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
-  app.post('/auth/login', loginThrottle, auth.loginHandler())
+/**
+ * 登录 / 刷新成功后，把新签发的 refresh token 登记进「有效会话」表。
+ *
+ * ## 为什么需要这么绕
+ *
+ * `@nanokajs/auth` 在 handler 内部签好 JWT、塞进 Set-Cookie，没有「签发后回调」的钩子。
+ * 所以只能在 handler **之前**挂一个中间件：`await next()` 让它跑完，
+ * 然后从 `c.res` 的 Set-Cookie 里把 refresh token 抠出来、解出 jti、登记。
+ *
+ * 挂在前面而不是后面，是因为 Hono 里 handler 一旦返回 Response就不再往下走，
+ * 写在后面的中间件根本不会被调用。`await next()` 之后 `c.res` 才是完整的。
+ *
+ * 换来的好处是**不用 fork 那个库**。
+ */
+const trackSession: MiddlewareHandler<AppEnv> = async (c, next) => {
+  await next()
 
-  app.post('/auth/refresh', refreshThrottle, auth.refreshHandler())
+  if (c.res.status !== 200) return
+
+  const setCookies = (
+    c.res.headers as unknown as { getSetCookie?: () => string[] }
+  ).getSetCookie?.() ?? []
+
+  for (const line of setCookies) {
+    if (!line.startsWith(`${REFRESH_TOKEN_COOKIE}=`)) continue
+    const value = line.slice(REFRESH_TOKEN_COOKIE.length + 1).split(';')[0]
+    if (value === undefined || value.length === 0) continue
+    try {
+      const payload = await verify<{ sub?: unknown; jti?: unknown; exp?: unknown }>(
+        value,
+        c.env.AUTH_SECRET,
+      )
+      if (
+        typeof payload.sub === 'string' &&
+        typeof payload.jti === 'string' &&
+        typeof payload.exp === 'number'
+      ) {
+        await registerSession(c.env.DB, payload.jti, payload.sub, payload.exp)
+      }
+    } catch (error) {
+      // 登记失败不影响登录本身：最坏情况是这个 token 没被记进有效列表，
+      // 于是下次 refresh 会被判成失效、要求重新登录。可接受。
+      console.error('登记会话失败', error)
+    }
+    return
+  }
+}
+
+export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
+  app.post('/auth/login', loginThrottle, trackSession, auth.loginHandler())
+
+  app.post('/auth/refresh', refreshThrottle, trackSession, auth.refreshHandler())
 
   app.post('/auth/register', async (c) => {
     const ip = clientIp(c)
@@ -165,7 +248,7 @@ export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
     const attempt = await consumeRateLimit(
       c.env.DB,
       `register:${ip}`,
-      REGISTER_LIMIT,
+      effectiveLimit(c.env, REGISTER_LIMIT),
       REGISTER_WINDOW_SECONDS,
     )
     if (attempt.blocked) {

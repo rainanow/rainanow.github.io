@@ -12,10 +12,16 @@ import {
   MAX_MESSAGE_LENGTH,
   MEMBER_LIST_LIMIT,
   MESSAGE_WINDOW_SECONDS,
+  REFRESH_TOKEN_COOKIE,
 } from '../config'
+import { deleteCookie } from 'hono/cookie'
+
+import { scryptHasher } from '../hasher'
 import { extractMediaKeys } from '../media'
 import { refundUpload } from '../quota'
-import { consumeRateLimit } from '../rate-limit'
+import { isMuted, mutedRemaining } from '../moderation'
+import { consumeRateLimit, effectiveLimit } from '../rate-limit'
+import { revokeAllSessions } from '../sessions'
 import type { AppEnv, ChatContext } from '../context'
 import type { Env } from '../env'
 import { cookieAuthBridge } from '../middleware'
@@ -206,10 +212,22 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
         id: User.table.id,
         username: User.table.username,
         role: User.table.role,
+        lastSeenAt: User.table.lastSeenAt,
+        mutedUntil: User.table.mutedUntil,
       })
       .from(User.table)
       .orderBy(asc(User.table.username))
-      .limit(MEMBER_LIST_LIMIT)) as { id: string; username: string; role: string }[]
+      .limit(MEMBER_LIST_LIMIT)) as {
+      id: string
+      username: string
+      role: string
+      lastSeenAt: Date | null
+      mutedUntil: Date | null
+    }[]
+
+    // 被禁言中才算「现在受罚」，到期自动恢复正常。判断放在服务端，
+    // 前端拿到的是一个已经算好的布尔值，不用自己算时间戳。
+    const now = Date.now()
 
     return c.json({
       room,
@@ -220,6 +238,12 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
         username: row.username,
         role: row.role,
         online: online.has(row.id),
+        // 转成毫秒数字再给前端：drizzle 的 timestamp_ms 读出来是 Date，
+        // 序列化成 JSON 会变成 ISO 字符串，前端还得再 parse 一次。
+        // null 表示「从来没连过」或「连过但还没有记录」，前端显示「未知」。
+        lastSeenAt: row.lastSeenAt === null ? null : row.lastSeenAt.getTime(),
+        mutedUntil: row.mutedUntil === null ? null : row.mutedUntil.getTime(),
+        muted: row.mutedUntil !== null && row.mutedUntil.getTime() > now,
       })),
     })
   })
@@ -288,7 +312,12 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
 
     // limit 传 2 而不是 1：`consumeRateLimit` 是「先记账再判断」，
     // 窗口里的第一条（hits = 1）必须放行，所以要拦第 2 条就得把阈值设成 2。
-    const attempt = await consumeRateLimit(c.env.DB, `message:${sub}`, 2, MESSAGE_WINDOW_SECONDS)
+    const attempt = await consumeRateLimit(
+      c.env.DB,
+      `message:${sub}`,
+      effectiveLimit(c.env, 2),
+      MESSAGE_WINDOW_SECONDS,
+    )
     if (attempt.blocked) {
       c.header('Retry-After', String(attempt.retryAfterSeconds))
       return c.json({ error: `发得太快了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
@@ -296,6 +325,15 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
 
     const user = await User.findOne(sub)
     if (user === null) throw new HTTPException(401, { message: '账号不存在' })
+
+    // 禁言检查放在**限流之后、真正落库之前**：
+    //   - 放限流之后，被禁言的人发消息照样占限流额度（想刷也刷不动，
+    //     因为他根本发不出去），但「限流」和「禁言」是两种不同的拒绝，
+    //     先报限流更贴近用户当下的真实处境；
+    //   - 放落库之前是必须的，别写成「先存了再判断要不要删」。
+    if (isMuted(user)) {
+      return c.json({ error: `你已被禁言，还剩 ${mutedRemaining(user.mutedUntil!)}` }, 403)
+    }
 
     const room = normalizeRoom(parsed.data.room)
     // Message.create 内部用了 `INSERT ... RETURNING`，所以这里能直接拿到
@@ -336,7 +374,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
     const attempt = await consumeRateLimit(
       c.env.DB,
       `delete:${sub}`,
-      DELETE_ALLOWED_PER_WINDOW + 1,
+      effectiveLimit(c.env, DELETE_ALLOWED_PER_WINDOW + 1),
       DELETE_WINDOW_SECONDS,
     )
     if (attempt.blocked) {
@@ -446,6 +484,105 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
   const R2_DELETE_BATCH = 1000
 
   /**
+   * 改密码限额：同一账号 10 分钟内最多 5 次。
+   *
+   * 比其它几条限流严得多，因为**每一次都要跑一次 scrypt 验签 + 一次 scrypt 哈希**
+   * （验旧密码 + 存新密码）。scrypt 的设计目标本来就是「慢到爆破不划算」，
+   * 单次开销是登录的数倍，放开跑就能拿它当 CPU 放大器。
+   *
+   * 5 次/10 分钟对正常人绰绰有余（改密码通常一辈子就改几次），
+   * 而它把「拿着别人的 access token 来烧 CPU」压到了可忽略的量级。
+   */
+  const PASSWORD_CHANGE_LIMIT = 5
+  const PASSWORD_CHANGE_WINDOW_SECONDS = 10 * 60
+
+  const passwordSchema = z.object({
+    currentPassword: z.string().min(1, '请输入当前密码').max(128, '密码最多 128 位'),
+    newPassword: z.string().min(8, '新密码至少 8 位').max(128, '新密码最多 128 位'),
+  })
+
+  /**
+   * 改密码。
+   *
+   * ## 为什么必须验旧密码
+   *
+   * 这是最容易被省掉、也最不该省的一步。没有它的话，任何能碰到你已登录浏览器的人
+   * （借用电脑、离开时没锁屏、XSS 拿到执行上下文）都能直接改掉你的密码，
+   * 把你永久锁在门外 —— 而 access token 还在他那边的 localStorage 里。
+   *
+   * ## 改完为什么要吊销所有 refresh token
+   *
+   * 改密码的**意义**是「别人拿不到我的账号了」。如果只改哈希、不吊销，
+   * 之前泄露出去的 refresh token 还能继续换出新 access token —���
+   * 等于密码改了但没实际生效。吊销之后，那些 token 换不出任何东西。
+   *
+   * ⚠️ 顺序不能反：先写新哈希、再吊销。反过来的话，中间失败会留下
+   * 「密码没改但 token 全废」的状态，用户直接登不进去。
+   */
+  app.post(
+    '/api/me/password',
+    cookieAuthBridge,
+    auth.middleware(),
+    async (c) => {
+      const sub = requireSubject(c)
+      const user = await User.findOne(sub)
+      if (user === null) throw new HTTPException(401, { message: '账号不存在' })
+
+      // 限流放在验密码**之前**：一次请求只跑一次 scrypt，挡住就完全不烧 CPU。
+      // 放后面的话，已经付出了验签的代价再告诉用户「太频繁」，等于没限。
+      const attempt = await consumeRateLimit(
+        c.env.DB,
+        `password:${sub}`,
+        effectiveLimit(c.env, PASSWORD_CHANGE_LIMIT + 1),
+        PASSWORD_CHANGE_WINDOW_SECONDS,
+      )
+      if (attempt.blocked) {
+        c.header('Retry-After', String(attempt.retryAfterSeconds))
+        return c.json(
+          { error: `改密码太频繁了，${Math.ceil(attempt.retryAfterSeconds / 60)} 分钟后再试` },
+          429,
+        )
+      }
+
+      const body = (await c.req.json().catch(() => null)) as {
+        currentPassword?: unknown
+        newPassword?: unknown
+      } | null
+
+      const parsed = passwordSchema.safeParse({
+        currentPassword: typeof body?.currentPassword === 'string' ? body.currentPassword : '',
+        newPassword: typeof body?.newPassword === 'string' ? body.newPassword : '',
+      })
+      if (!parsed.success) {
+        return c.json({ error: parsed.error.issues[0]?.message ?? '输入不合法' }, 400)
+      }
+
+      const { currentPassword, newPassword } = parsed.data
+
+      // 旧密码错**不能报「密码不对」**：等于确认了这个账号存在。
+      // 统一说「当前密码不正确」，覆盖「账号不存在」和「密码不对」两种情况。
+      const matches = await scryptHasher.verify(currentPassword, user.password)
+      if (!matches) {
+        return c.json({ error: '当前密码不正确' }, 403)
+      }
+
+      if (currentPassword === newPassword) {
+        return c.json({ error: '新密码不能和当前密码一样' }, 400)
+      }
+
+      const hash = await scryptHasher.hash(newPassword)
+      await User.update(user.id, { password: hash })
+
+      // 吊销这个账号所有还活着的 refresh token，让改密码**真的**生效。
+      // 不吊销的话，密码改了，之前泄露的 token 照样能换出新 access token。
+      const revoked = await revokeAllSessions(c.env.DB, user.id)
+      deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
+
+      return c.json({ ok: true, revokedSessions: revoked })
+    },
+  )
+
+  /**
    * 清空整个房间（仅管理员）。**硬删**，不是软删 —— 这是「清空」不是「撤回」。
    *
    * 消息里引用的媒体对象也一并删掉，否则它们会变成没人引用的孤儿：
@@ -531,7 +668,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
    * 「运行时的升级请求」了，DO 里的 `acceptWebSocket()` 会直接拒绝。
    * 所以这里只做能做的事（Origin 校验），身份校验交给 room.ts。
    */
-  app.get('/api/ws', async (c) => {
+  app.get('/api/ws', cookieAuthBridge, auth.middleware(), async (c) => {
     // 跨站 WebSocket 劫持（CSWSH）防护：WebSocket 握手不受 CORS 约束，
     // 浏览器一定会带上目标域的 Cookie。不查 Origin 的话，任意站点都能
     // 用访客的身份建连、然后把聊天内容读走。
@@ -540,6 +677,25 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
     }
 
     const room = normalizeRoom(c.req.query('room'))
+
+    // 禁言的人不许连 WebSocket。
+    //
+    // **这一处最容易漏**：发言和上传拦住了，但他还能连着收消息、
+    // 还能占着 DO 的连接数，在成员名单里还显示成「在线」——
+    // 那等于禁言只禁了一半。三处（发言 / 上传 / 握手）必须一起拦。
+    //
+    // 这里给 /api/ws 挂上 auth.middleware() 是为了让 `c.get('user')` 有值：
+    // 原来这条路由不做鉴权（校验在 DO 里），于是 Worker 这层拿不到 sub、
+    // 也就查不了 mutedUntil。中间件只是读 Cookie 往 c 上挂个 user，
+    // 真正转发给 DO 的仍然是 `c.req.raw` 原始请求（见坑列表第 4 条）。
+    const sub = c.get('user')['sub']
+    if (typeof sub === 'string' && sub.length > 0) {
+      const user = await User.findOne(sub)
+      if (isMuted(user)) {
+        return c.json({ error: `你已被禁言，还剩 ${mutedRemaining(user!.mutedUntil!)}` }, 403)
+      }
+    }
+
     const stub = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(room))
     return stub.fetch(c.req.raw)
   })

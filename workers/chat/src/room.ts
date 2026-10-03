@@ -22,11 +22,28 @@ import type { BroadcastRequest, ChatServerEvent, SocketAttachment } from './type
 const BROADCAST_PATH = '/broadcast'
 const ONLINE_PATH = '/online'
 
+/**
+ * 同一用户的 lastSeenAt 最短间隔多久写一次（毫秒）。
+ *
+ * 5 分钟是权衡出来的：短于它，写入量对 D1 不友好（断连很频繁）；
+ * 长于它，「几分钟前」这个显示档位会失真。5 分钟能让绝大多数
+ * 「刚下线的人」落在「1 分钟前 ~ 5 分钟前」这个区间里，够用。
+ */
+const LAST_SEEN_THROTTLE_MS = 5 * 60 * 1000
+
 function unauthorized(reason: string): Response {
   return new Response(reason, { status: 401 })
 }
 
 export class ChatRoom implements DurableObject {
+  /**
+   * userId → 上次写 lastSeenAt 的时间戳（内存态）。
+   *
+   * 刻意**不做**持久化：DO 被驱逐后这张表清空，最坏后果只是下一次断连
+   * 多写一行 D1，不会写错也不会漏写。用 storage 持久化反而多一次写。
+   */
+  private readonly lastSeenWrites = new Map<string, number>()
+
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env,
@@ -136,13 +153,57 @@ export class ChatRoom implements DurableObject {
     } catch {
       // 已经关了，无所谓。
     }
-    if (attachment !== null) this.publishPresence('leave', attachment.username)
+    if (attachment !== null) {
+      this.publishPresence('leave', attachment.username)
+      this.markOffline(attachment.userId)
+    }
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error('chatroom websocket error', error)
     const attachment = ws.deserializeAttachment() as SocketAttachment | null
-    if (attachment !== null) this.publishPresence('leave', attachment.username)
+    if (attachment !== null) {
+      this.publishPresence('leave', attachment.username)
+      // 异常断开同样要记：用户掉线时往往就是这个路径，
+      // 只在 webSocketClose 里写的话，拔网线/杀进程的人会永远停在「在线」。
+      this.markOffline(attachment.userId)
+    }
+  }
+
+  /**
+   * 记下「这个人刚离线」，写进 users.lastSeenAt。
+   *
+   * ## 为什么要节流
+   *
+   * 断连事件比想象频繁得多：网络抖动、切换 WiFi、页面被浏览器挂起、
+   * 心跳超时……每个都会走一次 webSocketClose 或 webSocketError。
+   * 不节流的话，一个网络不稳的人一晚上能刷出几百行 D1 写。
+   *
+   * ## 为什么用内存 Map 而不是 DO 的 alarm 合并
+   *
+   * alarm 那套要先把待写集合存进 DO storage（因为 alarm 到点时 DO 可能已被驱逐，
+   * 内存里的东西就没了），而每存一次本身又是一次写 —— 反而更贵。
+   * 内存 Map 的代价是「DO 被驱逐后节流失效」，最坏结果就是**多写一次**，
+   * 不会写错、也不会漏写。这里的正确性要求只是「lastSeen 大致准」，不需要精确。
+   *
+   * 写失败只记日志不改流程：lastSeen 是个展示用的辅助信息，
+   * 写不进去不该影响断开处理。
+   */
+  private markOffline(userId: string): void {
+    if (userId.length === 0) return
+    const now = Date.now()
+    const previous = this.lastSeenWrites.get(userId)
+    if (previous !== undefined && now - previous < LAST_SEEN_THROTTLE_MS) return
+    this.lastSeenWrites.set(userId, now)
+
+    this.ctx.waitUntil(
+      this.env.DB.prepare('UPDATE users SET lastSeenAt = ?1 WHERE id = ?2')
+        .bind(now, userId)
+        .run()
+        .catch((error: unknown) => {
+          console.error('写 lastSeenAt 失败', { userId, error })
+        }),
+    )
   }
 
   /**

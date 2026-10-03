@@ -31,5 +31,28 @@ export const userFields = {
   username: t.string().min(2).max(20).unique(),
   password: t.string().writeOnly(),
   role: t.string().default('user'),
+  /**
+   * 最后一次**离线**的时刻（UTC 毫秒），用来在成员列表里显示「上次在线」。
+   *
+   * 由 DO 在最后一条 WebSocket 断开时写入（见 `room.ts` 的 `markOffline`），
+   * 同一用户 5 分钟内只写一次，避免网络抖动时反复刷库。
+   *
+   * 允许为 null：账号刚注册、还没连过一次就没有这个值。
+   * 前端对 null 显示「未知」而不是编一个时间出来 ——
+   * 拿注册时间冒充「上次在线」是在显示假信息。
+   */
+  lastSeenAt: t.timestamp().optional(),
+  /**
+   * 禁言到什么时候（UTC 毫秒）。null = 没被禁言。
+   *
+   * 和 `role` 一样，这是**管理员施加的临时状态**，所以：
+   *   - 存的是「截止时间」而不是布尔值 —— 禁言 1 小时和 7 天用同一列表达，
+   *     到期自动解除，不需要定时任务去「取消」；
+   *   - 不用 `deleted` 那种布尔，因为布尔得另配一个「什么时候解封」的字段，
+   *     两份状态可能互相矛盾。
+   *
+   * 为什么不用「永久封禁」：那属于删号（`DELETE` 那个接口），语义不同。
+   */
+  mutedUntil: t.timestamp().optional(),
   createdAt: t.timestamp().defaultNow().readOnly(),
 }

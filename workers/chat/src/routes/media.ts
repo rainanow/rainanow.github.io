@@ -6,7 +6,8 @@ import type { AppEnv, ChatContext } from '../context'
 import { buildMediaKey, detectMedia, isMediaKey, sanitizeFilename } from '../media'
 import { cookieAuthBridge } from '../middleware'
 import { checkUploadQuota, markUpload, quotaDay } from '../quota'
-import { consumeRateLimit } from '../rate-limit'
+import { isMuted, mutedRemaining } from '../moderation'
+import { consumeRateLimit, effectiveLimit } from '../rate-limit'
 
 function requireSubject(c: Context<AppEnv>): string {
   const sub = c.get('user')['sub']
@@ -41,10 +42,21 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
     if (user === null) throw new HTTPException(401, { message: '账号不存在' })
 
     // limit 传 2 的理由同发言限流：记账在先，窗口里的第一条要放行
-    const attempt = await consumeRateLimit(c.env.DB, `upload:${sub}`, 2, UPLOAD_WINDOW_SECONDS)
+    const attempt = await consumeRateLimit(
+      c.env.DB,
+      `upload:${sub}`,
+      effectiveLimit(c.env, 2),
+      UPLOAD_WINDOW_SECONDS,
+    )
     if (attempt.blocked) {
       c.header('Retry-After', String(attempt.retryAfterSeconds))
       return c.json({ error: `上传太频繁了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
+    }
+
+    // 禁言的人不许上传。**这一处不能漏**：禁言的意图是「让他别在这儿活动」，
+    // 只挡发言而放着上传，等于他还能继续占 R2 存储和上传配额。
+    if (isMuted(user)) {
+      return c.json({ error: `你已被禁言，还剩 ${mutedRemaining(user.mutedUntil!)}` }, 403)
     }
 
     // 先看声明的长度：不然一个超大的 body 会被整个读进内存，
