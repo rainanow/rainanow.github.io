@@ -105,8 +105,49 @@
 
     <span class="chat__self">
       <span data-chat-me hidden></span>
+      {{- /* 改密码：笔形图标，紧贴用户名右边。图标而不是文字，是为了不和「退出」抢视觉重量 ——
+             它是低频操作，而「退出」用文字是因为那是主要出口。 */ -}}
+      <button type="button" class="chat__icon-button" data-chat-password-button hidden
+              title="修改密码" aria-label="修改密码">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M11.6 1.3a1.6 1.6 0 0 1 2.3 2.3l-.9.9-2.3-2.3zM9.9 3l2.3 2.3-6 6H3.9v-2.3z" />
+        </svg>
+      </button>
       <button type="button" class="chat__button chat__button--ghost" data-chat-logout hidden>退出</button>
     </span>
+  </div>
+
+  {{- /*
+    改密码弹窗。**刻意做成和登录/注册一样的模态框**，而不是把三个输入框
+    直接塞在状态栏里：那个位置宽度只够一个输入框，而这里需要三个。
+    复用同一套视觉，而不是另发明一种弹窗。
+  */ -}}
+  <div class="chat__modal" data-chat-password-modal hidden>
+    <div class="chat__modal-box" role="dialog" aria-modal="true" aria-labelledby="chat-password-title">
+      <h2 class="chat__modal-title" id="chat-password-title">修改密码</h2>
+      <form class="chat__form" data-chat-password-form>
+        <label class="chat__field">
+          当前密码
+          <input type="password" name="currentPassword" data-chat-password-current
+                 autocomplete="current-password" maxlength="128" required>
+        </label>
+        <label class="chat__field">
+          新密码
+          <input type="password" name="newPassword" data-chat-password-new
+                 autocomplete="new-password" minlength="8" maxlength="128" required>
+        </label>
+        <label class="chat__field">
+          确认新密码
+          <input type="password" name="confirmPassword" data-chat-password-confirm
+                 autocomplete="new-password" minlength="8" maxlength="128" required>
+        </label>
+        <p class="chat__hint" data-chat-password-hint></p>
+        <div class="chat__modal-actions">
+          <button type="button" class="chat__button chat__button--ghost" data-chat-password-cancel>取消</button>
+          <button type="submit" class="chat__button chat__button--primary">确认修改</button>
+        </div>
+      </form>
+    </div>
   </div>
 
   <p class="chat__notice" data-chat-notice hidden></p>
