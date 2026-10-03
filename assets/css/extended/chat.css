@@ -681,6 +681,78 @@
   color: var(--primary, #111827);
 }
 
+/*
+ * 成员行的次要信息：「上次在线」和禁言标签。
+ *
+ * 靠 DOM 顺序紧贴名字右边（不是绝对定位），所以它天然跟在名字后面，
+ * 名字长了会挤到换行而不是互相压住。
+ */
+.chat__member-name {
+  min-width: 0;
+}
+
+.chat__member-seen {
+  flex: none;
+  font-size: 0.78em;
+  /* 比名字淡一档。不用 opacity：那会让 emoji 之类的彩色字形也一起变淡，
+     在深色模式下会糊掉。用颜色本身调浅更可控。 */
+  color: var(--secondary, #9ca3af);
+  white-space: nowrap;
+}
+
+.chat__member-muted {
+  flex: none;
+  font-size: 0.78em;
+  color: #b45309;
+  background: rgba(180, 83, 9, 0.1);
+  border-radius: 3px;
+  padding: 0 0.3em;
+  white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__member-muted {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.16);
+  }
+}
+
+/* 管理员操作区：靠右贴边。普通用户没有这个元素，所以不会多出空白。 */
+.chat__member-actions {
+  margin-left: auto;
+  padding-left: 0.35rem;
+  display: inline-flex;
+  gap: 0.15rem;
+  flex: none;
+}
+
+.chat__member-action {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0.2rem;
+  line-height: 0;
+  border-radius: 4px;
+  color: var(--secondary, #9ca3af);
+  cursor: pointer;
+}
+
+.chat__member-action:hover {
+  color: var(--primary, #111827);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.chat__member-action--danger:hover {
+  color: #dc2626;
+  background: rgba(220, 38, 38, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__member-action:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+}
+
 
 /* --- 输入区 --- */
 
@@ -753,5 +825,79 @@
   .chat__messages {
     height: 60vh;
     padding: 0.55rem;
+  }
+}
+
+/*
+ * 改密码弹窗。
+ *
+ * 刻意和登录/注册用同一套模态（同一组类名、同一套遮罩），
+ * 而不是另发明一种弹窗 —— 同一个页面上两种弹窗样式会显得很业余。
+ */
+.chat__modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.chat__modal[hidden] {
+  display: none;
+}
+
+.chat__modal-box {
+  width: min(22rem, 100%);
+  padding: 1.1rem 1.15rem;
+  border-radius: var(--radius, 8px);
+  background: var(--background, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__modal-box {
+    background: var(--background, #1f2937);
+    border-color: var(--border, #374151);
+  }
+}
+
+.chat__modal-title {
+  margin: 0 0 0.8rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--primary, #111827);
+}
+
+.chat__modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 0.9rem;
+}
+
+/* 状态栏里那个改密码的小图标按钮，和「退出」并排但视觉上更轻 */
+.chat__icon-button {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0.25rem;
+  line-height: 0;
+  border-radius: 4px;
+  color: var(--secondary, #6b7280);
+  cursor: pointer;
+}
+
+.chat__icon-button:hover {
+  color: var(--primary, #111827);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__icon-button:hover {
+    background: rgba(255, 255, 255, 0.08);
   }
 }

@@ -59,6 +59,14 @@
     send: root.querySelector('[data-chat-send]'),
     me: root.querySelector('[data-chat-me]'),
     logout: root.querySelector('[data-chat-logout]'),
+    passwordButton: root.querySelector('[data-chat-password-button]'),
+    passwordModal: root.querySelector('[data-chat-password-modal]'),
+    passwordForm: root.querySelector('[data-chat-password-form]'),
+    passwordCurrent: root.querySelector('[data-chat-password-current]'),
+    passwordNew: root.querySelector('[data-chat-password-new]'),
+    passwordConfirm: root.querySelector('[data-chat-password-confirm]'),
+    passwordHint: root.querySelector('[data-chat-password-hint]'),
+    passwordCancel: root.querySelector('[data-chat-password-cancel]'),
     membersToggle: root.querySelector('[data-chat-members-toggle]'),
     membersPanel: root.querySelector('[data-chat-members-panel]'),
     membersStatus: root.querySelector('[data-chat-members-status]'),
@@ -140,6 +148,16 @@
   // --- 网络层 ---------------------------------------------------------------
 
   /** 单飞的 refresh：多个请求同时撞 401 时只发一次刷新。 */
+  /**
+   * 刷新会话。返回三态而不是布尔：
+   *
+   *   - 'ok'      拿到了新 access token，可以继续
+   *   - 'expired' refresh token 真的无效（被吊销/改密码/登出）—— 该回登录页
+   *   - 'retry'   被**限流**（429）。**这不是登录失效**，是刚才刷得太勤。
+   *               多个标签页同时 401、或刚改完密码都会撞上。
+   *               调用方绝不能因此把人登出 —— 否则密码是对的、
+   *               会话也是好的，用户却被弹回登录页，看起来像账号出了问题。
+   */
   function refreshSession() {
     if (refreshInFlight === null) {
       refreshInFlight = fetch(API + '/auth/refresh', {
@@ -147,14 +165,16 @@
         credentials: 'include'
       })
         .then(function (response) {
-          return response.ok
+          if (response.status === 429) return 'retry'
+          return response.ok ? 'ok' : 'expired'
         })
         .catch(function () {
-          return false
+          // 网络错误也没法判断，当成可重试 —— 宁可让用户等，不要误登出
+          return 'retry'
         })
-        .then(function (ok) {
+        .then(function (state) {
           refreshInFlight = null
-          return ok
+          return state
         })
     }
     return refreshInFlight
@@ -162,19 +182,25 @@
 
   /**
    * 带自动续期的请求封装。
-   * 401 时先刷新再重试一次；刷新也失败就当作掉线，退回登录面板。
+   *
+   * 401 时先刷新再重试一次。三态处理（见 refreshSession）：
+   *   - 'ok'      重试
+   *   - 'expired' 退回登录面板
+   *   - 'retry'   只是被限流了，**不登出**，把 401 原样还给调用方
+   *
+   * 最后这条是重点：被限流时如果一律 `handleSignedOut()`，就会出现
+   * 「密码明明是对的、账号却是登录状态异常」—— 限流是「等一会」，
+   * 不是「会话没了」。让调用方看到 401 自己决定怎么办。
    */
   function api(path, options, allowRetry) {
     var init = options || {}
     init.credentials = 'include'
     return fetch(API + path, init).then(function (response) {
       if (response.status !== 401 || allowRetry === false || me === null) return response
-      return refreshSession().then(function (ok) {
-        if (!ok) {
-          handleSignedOut()
-          return response
-        }
-        return api(path, options, false)
+      return refreshSession().then(function (state) {
+        if (state === 'ok') return api(path, options, false)
+        if (state === 'expired') handleSignedOut()
+        return response
       })
     })
   }
@@ -763,14 +789,262 @@
     else delete el.membersStatus.dataset.kind
   }
 
+  /**
+   * 「上次在线」的中文描述。
+   *
+   * 分档而不是精确到分秒，因为这个数字的作用是让人判断「这人还活跃吗」，
+   * 「3 分钟前」和「47 秒前」对这个问题没有区别。
+   *
+   * 超过 30 天直接说「很久没上线了」而不是继续数到几年几月 ——
+   * 后者读起来像在数轴上找位置，前者才是结论。
+   */
+  function lastSeenText(lastSeenAt) {
+    if (lastSeenAt === null || lastSeenAt === undefined) return '未知'
+    var elapsed = Date.now() - lastSeenAt
+    if (elapsed < 0) return '刚刚'
+    var minute = 60 * 1000
+    var hour = 60 * minute
+    var day = 24 * hour
+    if (elapsed < minute) return '刚刚'
+    if (elapsed < hour) return Math.floor(elapsed / minute) + ' 分钟前'
+    if (elapsed < day) return Math.floor(elapsed / hour) + ' 小时前'
+    var days = Math.floor(elapsed / day)
+    if (days <= 30) return days + ' 天前'
+    return '很久没上线了'
+  }
+
+  /** 禁言到什么时候的中文描述。已过期的算「未禁言」。 */
+  function mutedText(mutedUntil) {
+    if (mutedUntil === null || mutedUntil === undefined) return null
+    var left = mutedUntil - Date.now()
+    if (left <= 0) return null
+    var minute = 60 * 1000
+    var hour = 60 * minute
+    var day = 24 * hour
+    if (left < hour) return '禁言 ' + Math.max(1, Math.ceil(left / minute)) + ' 分钟'
+    if (left < day) return '禁言 ' + Math.ceil(left / hour) + ' 小时'
+    return '禁言 ' + Math.ceil(left / day) + ' 天'
+  }
+
+  /**
+   * 禁言 / 解除禁言。
+   *
+   * 时长用 `prompt` 问而不是做成一排按钮：档位不好定（5 分钟？1 小时？1 天？），
+   * 而 `prompt` 里可以填任意分钟数。确定后再走接口。
+   *
+   * 失败只提示不刷新名单 —— 服务端状态没变，刷新了也是一样的。
+   */
+  function toggleMute(member, button) {
+    var currentlyMuted = mutedText(member.mutedUntil) !== null
+    if (currentlyMuted) {
+      if (!window.confirm('解除对「' + member.username + '」的禁言？')) return
+      applyMute(member, null, button, '已解除禁言')
+      return
+    }
+
+    var input = window.prompt(
+      '禁言「' + member.username + '」多少分钟？\n填 0 表示不禁言。',
+      '60',
+    )
+    if (input === null) return
+    var minutes = Number.parseInt(input, 10)
+    if (!Number.isFinite(minutes) || minutes < 0) {
+      notice('请填一个非负的整数', 'error')
+      return
+    }
+    if (minutes === 0) {
+      notice('那就不禁言了')
+      return
+    }
+    applyMute(member, minutes, button, '已禁言 ' + member.username)
+  }
+
+  function applyMute(member, minutes, button, doneText) {
+    button.disabled = true
+    api('/api/users/' + encodeURIComponent(member.id) + '/mute', {
+      method: 'POST',
+      body: { minutes: minutes },
+    })
+      .then(function (response) {
+        return response
+          .json()
+          .catch(function () {
+            return null
+          })
+          .then(function (payload) {
+            if (!response.ok) {
+              throw new Error((payload && payload.error) || '操作失败（' + response.status + '）')
+            }
+            return payload
+          })
+      })
+      .then(function (payload) {
+        notice(doneText + (payload && payload.mutedUntil ? '，到期时间已显示在名单里' : ''))
+        // 重新拉全量：禁言状态变了，但成员行上的标签要走服务端才算得准
+        // （前端那个 mutedUntil 是旧数据，自己改会和 DB 漂移）。
+        loadMembers(false)
+      })
+      .catch(function (error) {
+        notice(error.message, 'error')
+      })
+      .then(function () {
+        button.disabled = false
+      })
+  }
+
+  /**
+   * 注销用户。
+   *
+   * **两次确认**：第一次问「要不要删」，第二次要求打��账号名。
+   * 这个操作不可逆（D1 没有备份，被删的人回不来），而它长得就像旁边那个
+   * 小垃圾桶图标 —— 一次误点的代价太大。第二次要求打名字让意图变得明确。
+   */
+  function confirmDeleteMember(member, button) {
+    if (!window.confirm('注销「' + member.username + '」？\n\n' +
+        '他的账号会被删除，所有登录状态会失效，\n' +
+        '他发过的消息会保留，但作者名会改成「已注销」。\n\n' +
+        '这一步不可撤销。')) {
+      return
+    }
+    var typed = window.prompt('请输入「' + member.username + '」以确认注销：')
+    if (typed === null) return
+    if (typed.trim() !== member.username) {
+      notice('输入不匹配，已取消', 'error')
+      return
+    }
+
+    button.disabled = true
+    api('/api/users/' + encodeURIComponent(member.id), { method: 'DELETE' })
+      .then(function (response) {
+        return response
+          .json()
+          .catch(function () {
+            return null
+          })
+          .then(function (payload) {
+            if (!response.ok) {
+              throw new Error((payload && payload.error) || '注销失败（' + response.status + '）')
+            }
+            return payload
+          })
+      })
+      .then(function (payload) {
+        notice(
+          '已注销 ' + member.username +
+            (payload && payload.renamedMessages ? '，保留了 ' + payload.renamedMessages + ' 条消息' : ''),
+        )
+        loadMembers(false)
+      })
+      .catch(function (error) {
+        notice(error.message, 'error')
+        button.disabled = false
+      })
+  }
+
   function memberNode(member) {
     var item = document.createElement('li')
     item.className = 'chat__member'
     if (member.online === true) item.classList.add('is-online')
     if (me !== null && member.id === me.id) item.classList.add('is-me')
+
+    var name = document.createElement('span')
+    name.className = 'chat__member-name'
     // 用户名照旧走 textContent，不经过 HTML 解析
-    item.textContent = member.username
+    name.textContent = member.username
+    item.appendChild(name)
+
+    // 次要信息：只给离线的人显示「上次在线」——在线的人这个信息没有意义。
+    // 紧贴名字右边（DOM 顺序就是视觉顺序），颜色更淡、字号更小。
+    if (member.online !== true) {
+      var seen = document.createElement('span')
+      seen.className = 'chat__member-seen'
+      seen.textContent = lastSeenText(member.lastSeenAt)
+      item.appendChild(seen)
+    }
+
+    var muted = mutedText(member.mutedUntil)
+    if (muted !== null) {
+      var tag = document.createElement('span')
+      tag.className = 'chat__member-muted'
+      tag.textContent = muted
+      item.appendChild(tag)
+    }
+
+    // 管理员操作按钮靠右（margin-left:auto），所以「不显示」时名字和
+    // 次要信息自然贴左——不能给它留空占位，那样普通用户看着会莫名多一段空白。
+    if (me !== null && me.role === 'admin' && member.id !== me.id) {
+      item.appendChild(moderationButtons(member))
+    }
     return item
+  }
+
+  /**
+   * 造一个 SVG 图标。
+   *
+   * 不用 innerHTML 拼字符串：成员列表里的用户名是用户输入，
+   * 这里虽然不直接拼它，但「所有用户数据都走 textContent」这条规矩值得守住 ——
+   * 靠 createElementNS 就不存在「万一有个名字带尖括号」的可能。
+   *
+   * 图形用 path 的 d 属性，都是 16x16 视口的极简形状。
+   */
+  function moderationIcon(kind) {
+    var NS = 'http://www.w3.org/2000/svg'
+    var svg = document.createElementNS(NS, 'svg')
+    svg.setAttribute('viewBox', '0 0 16 16')
+    svg.setAttribute('width', '13')
+    svg.setAttribute('height', '13')
+    svg.setAttribute('aria-hidden', 'true')
+    svg.setAttribute('focusable', 'false')
+
+    var path = document.createElementNS(NS, 'path')
+    path.setAttribute('fill', 'currentColor')
+    path.setAttribute(
+      'd',
+      // 喇叭：禁言。斜杠是单独一条 path，这样能画成「斜杠盖在喇叭上」。
+      kind === 'mute'
+        ? 'M8 2.5 4.8 5H2.5v6h2.3L8 13.5z M10.5 6l1 1 1-1 .8.8-1 1 1 1-.8.8-1-1-1 1-.8-.8 1-1-1-1z'
+        // 垃圾桶：注销。
+        : 'M6 1.5h4l.6 1H14v1.5H2V2.5h3.4z M3.5 5h9l-.7 9.2a1 1 0 0 1-1 .8H5.2a1 1 0 0 1-1-.8z',
+    )
+    svg.appendChild(path)
+    return svg
+  }
+
+  /** 管理员专属的两个小图标：禁言、注销。
+   *
+   * 用 textContent 画图标字符而不是 innerHTML/svg —— 成员名是用户输入，
+   * 这里虽然不直接拼它，但保持「所有用户数据都走 textContent」这条规矩不破。
+   * 真正的 SVG 图标在 `moderationIcon()` 里用 createElementNS 构造。
+   */
+  function moderationButtons(member) {
+    var wrap = document.createElement('span')
+    wrap.className = 'chat__member-actions'
+
+    var muteButton = document.createElement('button')
+    muteButton.type = 'button'
+    muteButton.className = 'chat__member-action'
+    muteButton.title = mutedText(member.mutedUntil) === null ? '禁言' : '解除禁言'
+    muteButton.setAttribute('aria-label', muteButton.title)
+    muteButton.appendChild(moderationIcon('mute'))
+    muteButton.addEventListener('click', function (event) {
+      event.stopPropagation()
+      toggleMute(member, muteButton)
+    })
+
+    var deleteButton = document.createElement('button')
+    deleteButton.type = 'button'
+    deleteButton.className = 'chat__member-action chat__member-action--danger'
+    deleteButton.title = '注销该用户'
+    deleteButton.setAttribute('aria-label', '注销 ' + member.username)
+    deleteButton.appendChild(moderationIcon('trash'))
+    deleteButton.addEventListener('click', function (event) {
+      event.stopPropagation()
+      confirmDeleteMember(member, deleteButton)
+    })
+
+    wrap.appendChild(muteButton)
+    wrap.appendChild(deleteButton)
+    return wrap
   }
 
   function fillMemberList(list, members) {
@@ -1107,7 +1381,16 @@
       if (me === null) return
       // 握手是 DO 直接拿 Cookie 校验的，access token 过期会 401。
       // 所以重连之前先换一张新的，否则会一直连不上。
-      refreshSession().then(function () {
+      //
+      // 只有 'expired' 才登出：被限流（429）说明刷新得太勤、稍后重试即可，
+      // 那时把人踢回登录页纯属自伤 —— 密码是对的，会话也是好的。
+      refreshSession().then(function (state) {
+        if (state === 'expired') {
+          handleSignedOut()
+          return
+        }
+        // 'retry' 也照常连：可能 access token 其实还有效（只是 refresh 被限流了），
+        // 连一下就知道。真正连不上 scheduleReconnect 会再排下一次。
         if (me !== null) connect(true)
       })
     }, delay)
@@ -1174,6 +1457,7 @@
     if (el.membersToggle !== null) el.membersToggle.hidden = true
     if (el.me !== null) el.me.hidden = true
     if (el.logout !== null) el.logout.hidden = true
+    if (el.passwordButton !== null) el.passwordButton.hidden = true
     if (el.exportButton !== null) el.exportButton.hidden = true
     if (el.purgeButton !== null) el.purgeButton.hidden = true
     setStatus('未登录')
@@ -1189,6 +1473,7 @@
       el.me.textContent = me.username
     }
     if (el.logout !== null) el.logout.hidden = false
+    if (el.passwordButton !== null) el.passwordButton.hidden = false
 
     // 导出 / 清空只有管理员看得见。
     // 藏按钮只是「别让人白点」，真正的门禁在服务端（非 admin 会拿到 403）。
@@ -1206,13 +1491,26 @@
     startHeartbeat()
   }
 
-  function handleSignedOut() {
+  /**
+   * 清空本地登录态、回到登录面板（不发通知）。
+   *
+   * 从 `handleSignedOut` 拆出来，因为**有两个调用方、但只有一个该报错**：
+   *   - 会话真的过期了 → 该提示「登录已过期」（用户不明就里，需要解释）；
+   *   - 改密码成功后主动登出 → 该提示「请用新密码重新登录」。
+   * 之前两种情况都走同一个函数，改完密码会先弹红色「登录已过期」
+   * 再弹「密码已修改」，看起来像出了故障 —— 其实什么都没坏。
+   */
+  function resetToAuthPanel() {
     me = null
     closeSocket()
     clearMessages()
     // 名单也要清掉：消息是上一个账号看到的，成员名单同理
     resetMembers()
     showAuth()
+  }
+
+  function handleSignedOut() {
+    resetToAuthPanel()
     notice('登录已过期，请重新登录', 'error')
   }
 
@@ -1235,8 +1533,17 @@
           return
         }
         // 可能只是 access token 过期，refresh 一次还有救
-        return refreshSession().then(function (ok) {
-          if (!ok) {
+        return refreshSession().then(function (state) {
+          if (state === 'retry') {
+            // 被限流：既不能断定登录态坏了，也不能当成已登录。
+            // 最诚实的说法是「稍后重试」—— 用户看到的是服务端在限流，
+            // 而不是「你的登录状态异常」。
+            setStatus('刷新太频繁，请稍后重试', 'connecting')
+            notice('刷新太频繁，请稍后重试', 'error')
+            showAuth()
+            return
+          }
+          if (state === 'expired') {
             showAuth()
             return
           }
@@ -1407,6 +1714,108 @@
           el.logout.disabled = false
           handleSignedOut()
           notice('已退出登录')
+        })
+    })
+  }
+
+  /* --- 修改密码 ------------------------------------------------------- */
+
+  /**
+   * 改完密码之后前端该怎么办。
+   *
+   * 后端在改密码成功时会**吊销这个账号的全部会话**（含当前这个），
+   * 所以此刻起这个页面的 access token 虽然还没过期，但 refresh 已经换不出新的了。
+   * 与其留在一个「能用一阵、然后突然 401」的半死状态，不如直接回登录页 ——
+   * 用户改密码的场景通常就是「我发现别人能登录我的号」，让他重新登进去是正确行为。
+   */
+  function handlePasswordChanged() {
+    closePasswordModal()
+    // 走 resetToAuthPanel 而不是 handleSignedOut：后者会弹红色「登录已过期」，
+    // 和「密码已修改」叠在一起像出了故障。这里该说的是下面这句。
+    resetToAuthPanel()
+    notice('密码已修改，请用新密码重新登录')
+  }
+
+  function openPasswordModal() {
+    if (el.passwordModal === null || el.passwordForm === null) return
+    el.passwordForm.reset()
+    if (el.passwordHint !== null) {
+      el.passwordHint.textContent = ''
+      el.passwordHint.className = 'chat__hint'
+    }
+    el.passwordModal.hidden = false
+    if (el.passwordCurrent !== null) el.passwordCurrent.focus()
+  }
+
+  function closePasswordModal() {
+    if (el.passwordModal !== null) el.passwordModal.hidden = true
+    if (el.passwordForm !== null) el.passwordForm.reset()
+  }
+
+  if (el.passwordButton !== null) {
+    el.passwordButton.addEventListener('click', openPasswordModal)
+  }
+  if (el.passwordCancel !== null) {
+    el.passwordCancel.addEventListener('click', closePasswordModal)
+  }
+  // 点遮罩空白处关闭。keyup 是为了键盘操作：Esc 应该关掉这个模态，
+  // 否则 Tab 进去以后没有键盘出口。
+  if (el.passwordModal !== null) {
+    el.passwordModal.addEventListener('click', function (event) {
+      if (event.target === el.passwordModal) closePasswordModal()
+    })
+  }
+  document.addEventListener('keyup', function (event) {
+    if (event.key === 'Escape' && el.passwordModal !== null && !el.passwordModal.hidden) {
+      closePasswordModal()
+    }
+  })
+
+  if (el.passwordForm !== null) {
+    el.passwordForm.addEventListener('submit', function (event) {
+      event.preventDefault()
+
+      var currentPassword = el.passwordCurrent !== null ? el.passwordCurrent.value : ''
+      var newPassword = el.passwordNew !== null ? el.passwordNew.value : ''
+      var confirmPassword = el.passwordConfirm !== null ? el.passwordConfirm.value : ''
+
+      function fail(message) {
+        if (el.passwordHint === null) notice(message, 'error')
+        else {
+          el.passwordHint.textContent = message
+          el.passwordHint.className = 'chat__hint is-error'
+        }
+      }
+
+      if (newPassword !== confirmPassword) {
+        fail('两次输入的新密码不一致')
+        return
+      }
+      if (newPassword.length < 8) {
+        fail('新密码至少 8 位')
+        return
+      }
+
+      api('/api/me/password', {
+        method: 'POST',
+        body: { currentPassword: currentPassword, newPassword: newPassword },
+      })
+        .then(function (response) {
+          return response
+            .json()
+            .catch(function () {
+              return null
+            })
+            .then(function (payload) {
+              if (!response.ok) {
+                throw new Error((payload && payload.error) || '修改失败（' + response.status + '）')
+              }
+              return payload
+            })
+        })
+        .then(handlePasswordChanged)
+        .catch(function (error) {
+          fail(error.message)
         })
     })
   }
