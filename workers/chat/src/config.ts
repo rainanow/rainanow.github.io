@@ -7,7 +7,11 @@ export const REFRESH_TOKEN_COOKIE = 'refresh_token'
 /**
  * access token 有效期 30 分钟（库默认 900 秒）。
  * 调大是因为聊天室页面会长时间挂着：HTTP 请求每次都要带新的 access token，
- * 30 分钟能把刷新频率压到一个不烦人的程度；WebSocket 只在握手时校验一次，不受影响。
+ * 30 分钟能把刷新频率压到一个不烦人的程度。
+ *
+ * ⚠️ 这个值现在**同时是 WebSocket 的寿命上限**：握手时会把 `exp` 记进连接
+ * （见 `SocketAttachment.exp`），广播时踢掉过期的连接。所以调大它等于
+ * 延长「被注销/改过密码的账号还能继续收消息」的最长时间。改这里要一起想。
  */
 export const ACCESS_TOKEN_TTL_SECONDS = 1800
 

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, lt } from 'drizzle-orm'
+import { and, asc, desc, eq, lt, sql } from 'drizzle-orm'
 import { HTTPException } from 'hono/http-exception'
 import type { Context } from 'hono'
 import { z } from 'zod'
@@ -96,14 +96,39 @@ async function requireAdmin(
  * 想真拦住就必须落库。代价是每条消息多一次 D1 写，这个换得值。
  */
 
-/** 把事件交给该房间的 Durable Object 去推给所有在线连接。 */
+/**
+ * 把事件交给该房间的 Durable Object 去推给所有在线连接。
+ *
+ * ## 刻意做成「尽力而为」：任何失败都在这里吞掉，绝不往调用方抛
+ *
+ * 广播是**副作用**，业务写入（消息落库 / 标记撤回 / 清空房间）才是这个请求的实体。
+ * 让一次 DO 抖动的异常冒到 Hono 的 onError，调用方拿到的是 500 ——
+ * 而消息其实已经稳稳写进 D1 了。前端的反应是「发送失败，再点一次」，
+ * 于是库里多出一条一模一样的消息。换句话说：
+ * **广播失败会伪造出一个「写入失败」，并因此造成真实的重复写入。**
+ *
+ * 吞掉的代价只是「这条消息没实时推给别人」，他们下次拉历史就看到了。
+ * 拿「晚几秒看到」换「不会重复发」，方向是明确的。
+ *
+ * 仍然 `await`（不改成 fire-and-forget）：顺序上要保证广播在响应之前发出，
+ * 否则前端可能先收到 201、又通过历史接口拿到同一条，去重逻辑就得再复杂一层。
+ *
+ * 用 console.error 留痕而不是静默吞：线上真出问题时日志里要看得见。
+ */
 async function broadcast(env: Env, room: string, event: ChatServerEvent): Promise<void> {
-  const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName(room))
-  await stub.fetch('https://chat-room.internal/broadcast', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ event }),
-  })
+  try {
+    const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName(room))
+    const response = await stub.fetch('https://chat-room.internal/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event }),
+    })
+    if (!response.ok) {
+      console.error('广播失败', { room, type: event.type, status: response.status })
+    }
+  } catch (error) {
+    console.error('广播异常', { room, type: event.type, error })
+  }
 }
 
 export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: ChatContext): void {
@@ -250,26 +275,76 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
 
   /**
    * 历史消息，倒序取一页再翻正，前端可以直接 append。
-   * `before` 是上一页最早那条的 createdAt（epoch 毫秒），游标分页，
+   *
+   * 游标是**复合键** `(before, beforeId)` = 上一页最早那条的 `(createdAt, id)`。
    * 不用 offset —— nanoka 也把 offset 卡在 10 万以内防读放大。
+   *
+   * ## 为什么必须是复合键
+   *
+   * `createdAt` 是毫秒整数、**不唯一**。只用 `createdAt < ?` 的话，
+   * 一页正好切在一组同毫秒消息中间时，那几个同毫秒、本页没包含的消息
+   * 下一页会被一起排掉 —— 它们从此再也翻不出来（消息静默丢失）。
+   * 加上 id 之后 `(createdAt, id)` 是全序，游标才能精确地「续上」。
+   *
+   * `beforeId` 缺失时退回单键比较。这是**故意留的兼容口**：
+   * 手工拼的 URL、旧标签页里跑着的旧版前端都还能用，代价只是那些请求
+   * 仍可能有丢条风险（和修之前一样），而不是直接 400。
    */
   app.get('/api/messages', cookieAuthBridge, auth.middleware(), async (c) => {
+    /*
+     * 和其它需要登录的路由保持一致：**查历史之前先确认账号还在**。
+     *
+     * 少了这一步，被管理员注销的账号在 access token 剩余有效期内（≤30 分钟）
+     * 仍能反复拉取全部历史消息 —— 而它的 WebSocket 也已经被踢了
+     * （见 SocketAttachment.exp），会出现「实时收不到、但能刷新出全部记录」
+     * 这种半死状态，看着像 bug，实际是这一条漏了。
+     */
+    const me = await User.findOne(requireSubject(c))
+    if (me === null) throw new HTTPException(401, { message: '账号不存在' })
+
     const room = normalizeRoom(c.req.query('room'))
     const beforeRaw = c.req.query('before')
     const beforeValue = beforeRaw === undefined ? Number.NaN : Number.parseInt(beforeRaw, 10)
+    const beforeId = c.req.query('beforeId')
 
     const conditions = [eq(Message.table.room, room), eq(Message.table.deleted, false)]
     if (Number.isFinite(beforeValue)) {
-      conditions.push(lt(Message.table.createdAt, new Date(beforeValue)))
+      if (beforeId === undefined || beforeId === '') {
+        conditions.push(lt(Message.table.createdAt, new Date(beforeValue)))
+      } else {
+        /*
+         * 行值比较 `(createdAt, id) < (?, ?)`，而不是
+         * `createdAt < ? OR (createdAt = ? AND id < ?)`。
+         *
+         * 两个写法结果一样，但**只有行值形式能稳定用上索引**：
+         * SQLite 对索引列上的行值比较有专门的优化，能把它变成一次索引区间扫描；
+         * 而 OR 形式在查询计划里经常退化成「全房间扫 + 排序」。
+         * 这里的行数上限直接等于 D1 的计费口径，所以写法值得挑。
+         *
+         * 参数传的是**裸毫秒数**而不是 Date：`createdAt` 列在库里就是
+         * 整数（timestamp_ms），绑整数最直接；raw `sql` 模板不会帮我们
+         * 把 Date 转成毫秒，硬塞 Date 会变成字符串比较，那才是真正会出错的地方。
+         */
+        conditions.push(
+          sql`(${Message.table.createdAt}, ${Message.table.id}) < (${beforeValue}, ${beforeId})`,
+        )
+      }
     }
 
     // 这里走 app.db（原始 Drizzle）而不是 Message.findMany：
-    // 需要 `createdAt < ?` 这种范围条件 + 倒序 + limit 的组合，模型 API 的
-    // where 等值对象表达不了，而下方的复合索引正是按这个查询形状建的。
+    // 需要范围条件 + 倒序 + limit 的组合，模型 API 的 where 等值对象表达不了，
+    // 而下面那个复合索引正是按这个查询形状建出来的。
     //
     // 结果需要显式标注：nanoka 的 `Model.table` 为了通用性把列类型放宽成了 unknown，
     // 所以 Drizzle 推不出每列的具体类型（拿到的 row.id 会是 unknown）。
     // 这份标注与 drizzle/schema.ts 里的列定义一一对应。
+    //
+    // ⚠️ ORDER BY 里必须有 id，而且**索引也必须跟着带上 id**：
+    // `messages.id` 是 text 主键（不是 rowid），同一毫秒内它的顺序和索引里的
+    // 隐含顺序（rowid 升序）不一致。只把 id 加进 ORDER BY、不动索引的话，
+    // 老索引就满足不了排序，SQLite 会把**整个房间**的行读出来再排序 ——
+    // 那等于把 `0001_chat_indexes.sql` 省下来的读取额度连本带利花回去。
+    // 索引见 `0006_messages_cursor_index.sql`。
     const rows = (await app.db
       .select({
         id: Message.table.id,
@@ -280,7 +355,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       })
       .from(Message.table)
       .where(and(...conditions))
-      .orderBy(desc(Message.table.createdAt))
+      .orderBy(desc(Message.table.createdAt), desc(Message.table.id))
       .limit(HISTORY_PAGE_SIZE + 1)) as HistoryRow[]
 
     // 多取一条用来判断「还有没有更早的」，省掉一次 count(*)。
@@ -419,7 +494,26 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       try {
         const object = await c.env.MEDIA.head(key)
         if (object === null) continue
-        if (object.customMetadata?.['uploader'] !== target.username) continue
+
+        /*
+         * 归属判断优先用**不可变的 userId**，而不是用户名。
+         *
+         * 用户名是可复用的：账号被注销后 `users` 里那行就没了，别人可以
+         * 注册同名账号 —— 只按用户名比对会让他有权删掉前任上传的文件。
+         * userId 不复用，没有这个问题。
+         *
+         * 退回用户名是为了兼容这次改动**之前**上传的老对象（metadata 里
+         * 没有 uploaderId）。老对象的主人必须还能删自己的文件，
+         * 否则就成了「历史文件谁都删不掉」，比不修还糟。
+         * 判断的是「有没有这个字段」而不是「它是不是空」——
+         * 空字符串也是一个明确的（且匹配不上的）值。
+         */
+        const metadata = object.customMetadata ?? {}
+        const owned =
+          metadata['uploaderId'] !== undefined
+            ? metadata['uploaderId'] === target.userId
+            : metadata['uploader'] === target.username
+        if (!owned) continue
 
         await c.env.MEDIA.delete(key)
 
@@ -449,6 +543,15 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
    * 一次最多 `EXPORT_LIMIT` 条，超了截断并带 `truncated` 标记。
    * 这个上限是被 **CPU 10 ms / 请求**卡住的（实测 5000 条顶格消息要 9–13 ms，会 1102），
    * 不是被响应体积卡住的。理由和实测数据见 `config.ts` 里那个常量。
+   *
+   * ## `truncated` 为什么要多取一条
+   *
+   * 原先取 `EXPORT_LIMIT` 条、再判 `rows.length >= EXPORT_LIMIT`。
+   * 房间**恰好**有 1000 条时，`1000 >= 1000` 成立 → 谎报截断，
+   * 前端会告诉用户「还有更早的没导出」—— 其实一条不多不少全在手里。
+   * 改取 1001 条、判 `> EXPORT_LIMIT`，和 `GET /api/messages` 里
+   * `hasMore = rows.length > HISTORY_PAGE_SIZE` 的写法一致。
+   * 多取这一条的开销可以忽略（序列化的仍然是 1000 条）。
    */
   app.get('/api/rooms/:room/export', cookieAuthBridge, auth.middleware(), async (c) => {
     const room = normalizeRoom(c.req.param('room'))
@@ -464,14 +567,17 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       })
       .from(Message.table)
       .where(and(eq(Message.table.room, room), eq(Message.table.deleted, false)))
-      .orderBy(asc(Message.table.createdAt))
-      .limit(EXPORT_LIMIT)) as HistoryRow[]
+      .orderBy(asc(Message.table.createdAt), asc(Message.table.id))
+      .limit(EXPORT_LIMIT + 1)) as HistoryRow[]
+
+    const truncated = rows.length > EXPORT_LIMIT
+    const page = truncated ? rows.slice(0, EXPORT_LIMIT) : rows
 
     return c.json({
       room,
-      count: rows.length,
-      truncated: rows.length >= EXPORT_LIMIT,
-      messages: rows.map((row) => ({
+      count: page.length,
+      truncated,
+      messages: page.map((row) => ({
         id: row.id,
         username: row.username,
         body: row.body,
@@ -513,7 +619,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
    * ## 改完为什么要吊销所有 refresh token
    *
    * 改密码的**意义**是「别人拿不到我的账号了」。如果只改哈希、不吊销，
-   * 之前泄露出去的 refresh token 还能继续换出新 access token —���
+   * 之前泄露出去的 refresh token 还能继续换出新 access token ——
    * 等于密码改了但没实际生效。吊销之后，那些 token 换不出任何东西。
    *
    * ⚠️ 顺序不能反：先写新哈希、再吊销。反过来的话，中间失败会留下

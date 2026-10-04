@@ -53,6 +53,8 @@
     password: root.querySelector('[data-chat-password]'),
     submit: root.querySelector('[data-chat-submit]'),
     tabs: root.querySelectorAll('[data-chat-mode]'),
+    loginTab: root.querySelector('[data-chat-login-tab]'),
+    registerTab: root.querySelector('[data-chat-register-tab]'),
     hint: root.querySelector('[data-chat-hint]'),
     composer: root.querySelector('[data-chat-composer]'),
     input: root.querySelector('[data-chat-input]'),
@@ -60,13 +62,14 @@
     me: root.querySelector('[data-chat-me]'),
     logout: root.querySelector('[data-chat-logout]'),
     passwordButton: root.querySelector('[data-chat-password-button]'),
-    passwordModal: root.querySelector('[data-chat-password-modal]'),
+    passwordTab: root.querySelector('[data-chat-password-tab]'),
+    authForm: root.querySelector('[data-chat-form]'),
     passwordForm: root.querySelector('[data-chat-password-form]'),
     passwordCurrent: root.querySelector('[data-chat-password-current]'),
     passwordNew: root.querySelector('[data-chat-password-new]'),
     passwordConfirm: root.querySelector('[data-chat-password-confirm]'),
-    passwordHint: root.querySelector('[data-chat-password-hint]'),
     passwordCancel: root.querySelector('[data-chat-password-cancel]'),
+    passwordHint: root.querySelector('[data-chat-password-hint]'),
     membersToggle: root.querySelector('[data-chat-members-toggle]'),
     membersPanel: root.querySelector('[data-chat-members-panel]'),
     membersStatus: root.querySelector('[data-chat-members-status]'),
@@ -97,7 +100,16 @@
   var reconnectDelay = 1000
   var refreshInFlight = null
   var mode = 'login'
+  /**
+   * 翻页游标 = 当前已加载的**最早那条**消息的 `(createdAt, id)`。
+   *
+   * 为什么是复合的：`createdAt` 是毫秒整数、不唯一。只拿它当游标的话，
+   * 一页正好切在一组同毫秒消息中间时，那几个同毫秒、本页没包含的消息
+   * 下一页会被一起排掉 —— 它们再也翻不出来，而且**没有任何提示**。
+   * 加上 id 之后是全序，游标才能精确续上。服务端对应 `before` + `beforeId`。
+   */
   var oldestCreatedAt = null
+  var oldestId = null
   var hasMore = false
   /** 本次连接是不是重连连上的。重连成功后要补拉一次历史，见 catchUp()。 */
   var pendingCatchUp = false
@@ -192,8 +204,66 @@
    * 「密码明明是对的、账号却是登录状态异常」—— 限流是「等一会」，
    * 不是「会话没了」。让调用方看到 401 自己决定怎么办。
    */
+  /**
+   * 这个 body 是不是「调用方随手写的普通对象」。
+   *
+   * fetch 的 body 只认字符串 / Blob / BufferSource / FormData / URLSearchParams /
+   * ReadableStream。传普通对象**不会报错**，而是悄悄变成 `"[object Object]"`
+   * 且 Content-Type 是 `text/plain` —— 后端收到一个合法但内容不对的 JSON，
+   * 于是给出「请输入当前密码」这种驴唇不对马嘴的提示。改密码按钮点了没反应、
+   * 禁言选完时长毫无动静，根子都在这（线上也是这么挂的）。
+   *
+   * 用**品牌检查**（`Object.prototype.toString`）而不是
+   * `Object.getPrototypeOf(body) === Object.prototype`：
+   * 后者跟 realm 绑死 —— 跨 realm 时（jsdom、iframe）原型不是本 realm 的
+   * `Object.prototype`，于是一个普通对象会被判成「不认识」而放过去。
+   * 前端测试就是这么把它抓出来的：断言全红，而 chat.js 在浏览器里看着是好的。
+   *
+   * `toString` 是通用品牌检查，对 Blob / FormData / TypedArray / Date / Map
+   * 都返回各自的品牌，只有真正的普通对象才是 `[object Object]`。
+   */
+  function isPlainBody(body) {
+    if (body === null || typeof body !== 'object') return false
+    return Object.prototype.toString.call(body) === '[object Object]'
+  }
+
+  function hasContentType(headers) {
+    if (headers === undefined || headers === null) return false
+    // Headers 实例
+    if (typeof headers.has === 'function') return headers.has('Content-Type')
+    for (var key in headers) {
+      if (key.toLowerCase() === 'content-type') return true
+    }
+    return false
+  }
+
+  /** 把 Content-Type 补成 application/json，字符串键名和 Headers 实例都照顾到。 */
+  function setJsonContentType(init) {
+    var existing = init.headers
+    if (existing !== undefined && existing !== null && typeof existing.set === 'function') {
+      existing.set('Content-Type', 'application/json')
+      return
+    }
+    var merged = {}
+    for (var key in existing || {}) merged[key] = existing[key]
+    merged['Content-Type'] = 'application/json'
+    init.headers = merged
+  }
+
+  /**
+   * 兜住「对象 body」这种写法：序列化成 JSON 文本并补上 Content-Type。
+   *
+   * 幂等 —— 重试时 init.body 已经是字符串，isPlainBody 为假，直接跳过。
+   */
+  function normalizeBody(init) {
+    if (!isPlainBody(init.body)) return init
+    init.body = JSON.stringify(init.body)
+    if (!hasContentType(init.headers)) setJsonContentType(init)
+    return init
+  }
+
   function api(path, options, allowRetry) {
-    var init = options || {}
+    var init = normalizeBody(options || {})
     init.credentials = 'include'
     return fetch(API + path, init).then(function (response) {
       if (response.status !== 401 || allowRetry === false || me === null) return response
@@ -213,6 +283,7 @@
       node.remove()
     })
     oldestCreatedAt = null
+    oldestId = null
     hasMore = false
     updateMoreButton()
     // 空状态提示要一起复位：它被 insertMessage() 隐藏过之后就一直是 hidden，
@@ -458,8 +529,19 @@
     var node = renderMessage(message)
     node.dataset.createdAt = String(message.createdAt)
 
+    /*
+     * 游标是 `(createdAt, id)` 复合键，取「字典序最小的那一条」。
+     *
+     * 第二个分支不能省：同一毫秒里可能有好几条，先插进来的不一定就是
+     * id 最小的那条。只记「更早的时间戳」的话，游标会指向一条
+     * **比实际最早那条还靠后**的消息 —— 翻页时它后面的同毫秒消息会被跳过。
+     * 判据要和服务端的 ORDER BY（`createdAt DESC, id DESC`）完全一致。
+     */
     if (oldestCreatedAt === null || message.createdAt < oldestCreatedAt) {
       oldestCreatedAt = message.createdAt
+      oldestId = message.id
+    } else if (message.createdAt === oldestCreatedAt && (oldestId === null || message.id < oldestId)) {
+      oldestId = message.id
     }
 
     var existing = el.messages.querySelectorAll('.chat__message')
@@ -487,9 +569,16 @@
 
   // --- 业务动作 -------------------------------------------------------------
 
-  function loadHistory(before) {
+  function loadHistory(before, beforeId) {
     var query = '?room=' + encodeURIComponent(ROOM)
-    if (before !== null && before !== undefined) query += '&before=' + encodeURIComponent(String(before))
+    if (before !== null && before !== undefined) {
+      query += '&before=' + encodeURIComponent(String(before))
+      // 复合游标的第二段。服务端在它缺失时会退回单键比较
+      // （兼容旧链接），但那有丢条风险，所以这里必须带上。
+      if (beforeId !== null && beforeId !== undefined) {
+        query += '&beforeId=' + encodeURIComponent(String(beforeId))
+      }
+    }
 
     return api('/api/messages' + query).then(function (response) {
       if (!response.ok) throw new Error('加载历史消息失败（' + response.status + '）')
@@ -552,10 +641,10 @@
     var previousTop = container.scrollTop
     el.more.disabled = true
 
-    loadHistory(oldestCreatedAt)
+    loadHistory(oldestCreatedAt, oldestId)
       .then(function (page) {
         // 走 insertMessage 而不是自己拼 DOM：插入位置按 createdAt 定位（结果一样），
-        // 而且它**会更新 oldestCreatedAt**。
+        // 而且它**会更新游标（oldestCreatedAt + oldestId 两个）**。
         // 之前这里自己 renderMessage + insertBefore，唯独漏了更新游标，
         // 于是第二次翻页请求的还是同一个 before，服务端原样返回同一页，
         // 消息全部已存在被跳过 —— 表现就是「按钮还在，点了没反应」。
@@ -737,7 +826,18 @@
         return api('/api/uploads', {
           method: 'POST',
           headers: {
-            'Content-Type': file.type || 'application/octet-stream',
+            /*
+             * 用 `blob.type` 而不是 `file.type`：`shrinkImage()` 压缩时会
+             * **换编码**（WebP / 非 PNG 一律重编码成 JPEG，见 canvas.toBlob 那行），
+             * 于是 blob 的字节类型和原 file 的 type 可能不一致 ——
+             * 按 `file.type` 声明就会「说是 webp、发的却是 jpeg」。
+             * 后端只看魔数、所以这个不一致一直没暴露出来，但读代码的人会困惑。
+             * blob.type 永远是这个 blob 的真实类型。
+             */
+            'Content-Type': blob.type || file.type || 'application/octet-stream',
+            // 文件名必须百分号编码：HTTP 头只能是 ASCII，中文文件名直接塞进去
+            // 会被运行时拒掉或截断。后端 decodeURIComponent 之后再清洗。
+            // 这对约定两边都要留着，改一边就会传出一个编码过的文件名。
             'X-Filename': encodeURIComponent(file.name || 'file'),
           },
           body: blob,
@@ -834,36 +934,97 @@
    *
    * 失败只提示不刷新名单 —— 服务端状态没变，刷新了也是一样的。
    */
+  /** 禁言时长档位（分钟）。1 小时起步、到 30 天封顶，和后端的上限一致。 */
+  var MUTE_PRESETS = [
+    { label: '1 小时', minutes: 60 },
+    { label: '1 天', minutes: 60 * 24 },
+    { label: '7 天', minutes: 60 * 24 * 7 },
+    { label: '30 天', minutes: 60 * 24 * 30 },
+  ]
+
+  /**
+   * 点喇叭：解除禁言直接做（不是破坏性操作，无需确认），
+   * 设置禁言则**在这行里**展开时长选项，紧贴喇叭右边。
+   *
+   * 刻意不用 prompt 问「多少分钟」：那既要用户自己想数字，
+   * 又要他在一个系统弹窗里输。给几个常用档位一键点完更省事，
+   * 而且档位本身就是相对时间（「1 天」比「1440 分钟」好判断）。
+   *
+   * 也刻意不做成浮层：选项就插在喇叭**后面**（insertBefore 到 button.nextSibling），
+   * 和它要操作的那一行绑死，不存在「飘到别处去了」这种问题。
+   */
   function toggleMute(member, button) {
     var currentlyMuted = mutedText(member.mutedUntil) !== null
     if (currentlyMuted) {
-      if (!window.confirm('解除对「' + member.username + '」的禁言？')) return
       applyMute(member, null, button, '已解除禁言')
       return
     }
 
-    var input = window.prompt(
-      '禁言「' + member.username + '」多少分钟？\n填 0 表示不禁言。',
-      '60',
-    )
-    if (input === null) return
-    var minutes = Number.parseInt(input, 10)
-    if (!Number.isFinite(minutes) || minutes < 0) {
-      notice('请填一个非负的整数', 'error')
+    /*
+     * 反复点喇叭就收起选项。
+     *
+     * 这里原先调的是 `clearPendingConfirm()` —— 那是**注销确认标签**的清理函数，
+     * 和这个菜单毫无关系（它操作的是 `pendingConfirm`，从没碰过菜单）。
+     * 于是「再点一次就收起」这句注释承诺的行为从来没有实现过：
+     * 菜单只会等 10 秒超时自己消失。它是复制粘贴留下的残骸，
+     * 也正是它让这段看起来「已经有处理了」，所以顺手删掉。
+     */
+    var sibling = button.nextSibling
+    if (sibling !== null && sibling.className === 'chat__mute-menu') {
+      closeMuteMenu(sibling)
       return
     }
-    if (minutes === 0) {
-      notice('那就不禁言了')
-      return
-    }
-    applyMute(member, minutes, button, '已禁言 ' + member.username)
+    // 打开新菜单之前，让上一个「确认删除？」作废 —— 免得屏幕上同时挂着
+    // 两个待确认的提示，用户分不清哪个会被执行。
+    clearPendingConfirm()
+
+    var menu = document.createElement('span')
+    menu.className = 'chat__mute-menu'
+    MUTE_PRESETS.forEach(function (preset) {
+      var option = document.createElement('button')
+      option.type = 'button'
+      option.className = 'chat__mute-option'
+      option.textContent = preset.label
+      option.addEventListener('click', function () {
+        closeMuteMenu(menu)
+        applyMute(member, preset.minutes, button, '已禁言 ' + member.username)
+      })
+      menu.appendChild(option)
+    })
+    // 插在喇叭右边（不是 appendChild 到末尾）—— 两个图标之间多出一小排按钮，
+    // 眼睛顺着喇叭看过去就是它，不用在整行里找。
+    button.parentNode.insertBefore(menu, button.nextSibling)
+
+    // 10 秒后自动收起，避免选项一直挂在名单上
+    var timer = window.setTimeout(function () {
+      closeMuteMenu(menu)
+    }, 10000)
+    menu.dataset.timer = String(timer)
+  }
+
+  /**
+   * 收起禁言时长菜单。
+   *
+   * **必须把定时器一起清掉**。原先只做 `removeChild`，那个 10 秒的 setTimeout
+   * 照样会到点执行，只是发现 `parentNode` 已经是 null 而空跑一次 ——
+   * 看着无害，但反复开关几次就攒下同样数量的待执行定时器，
+   * 而且它们都还攥着已经脱离文档的菜单节点。手动收起时清掉才是对的。
+   */
+  function closeMuteMenu(menu) {
+    if (menu === null || menu === undefined) return
+    var timer = menu.dataset.timer
+    if (timer !== undefined && timer !== '') window.clearTimeout(Number(timer))
+    if (menu.parentNode !== null) menu.parentNode.removeChild(menu)
   }
 
   function applyMute(member, minutes, button, doneText) {
     button.disabled = true
     api('/api/users/' + encodeURIComponent(member.id) + '/mute', {
       method: 'POST',
-      body: { minutes: minutes },
+      headers: jsonHeaders(),
+      // 注意必须是 JSON 文本：传对象会被 fetch 变成 "[object Object]"。
+      // api() 里有兜底，但这里写清楚，读代码的人不用去猜。
+      body: JSON.stringify({ minutes: minutes }),
     })
       .then(function (response) {
         return response
@@ -893,25 +1054,99 @@
   }
 
   /**
-   * 注销用户。
+   * 两段式删除确认：第一次点只亮出「确认删除？」，第二次点才真删。
    *
-   * **两次确认**：第一次问「要不要删」，第二次要求打��账号名。
-   * 这个操作不可逆（D1 没有备份，被删的人回不来），而它长得就像旁边那个
-   * 小垃圾桶图标 —— 一次误点的代价太大。第二次要求打名字让意图变得明确。
+   * （这里原先还压着一段旧注释，讲的是「第二次要求手打账号名」——
+   * 那是被否决掉的方案，下面第 ② 条正好解释了为什么不采用它。
+   * 两段注释并存只会让读的人以为实现的是旧那套，已删。）
+   *
+   * ## 为什么不用 window.confirm / prompt
+   *
+   * ① 原生弹窗**没法把提示放在按钮旁边** —— 它总是居中模态，
+   *    而用户要确认的是「我刚才点的那一行」。视线要来回挪。
+   * ② `prompt` 要求手打账号名，代价太高：注销一个昵称叫「bob」的人要打三个字母，
+   *    而这只是一次低频管理操作，不值得这个摩擦。
+   * ③ 原生弹窗的样式由浏览器决定，和站点其余部分不一致。
+   *
+   * ## 为什么要有 5 秒时限
+   *
+   * 没有时限的话，「确认删除？」会一直挂在那里。
+   * 之后用户可能已经忘了它是什么（比如去看了眼别的消息），
+   * 这时再点 x 就是「误删」。**时限把确认绑定在刚才那个动作上**，
+   * 5 秒足够看清「确认删除？」这几个字，不够长到让人忘了上下文。
+   *
+   * 过期时不是立刻消失，而是把文字换掉 —— 直接消失会让人以为是自己点错了。
    */
+  var CONFIRM_WINDOW_MS = 5000
+
+  /**
+   * 当前正在等第二次点击的确认。同一时刻只有一个，
+   * 所以点别处的按钮、或再点一次别处的按钮，都会让前一个确认过期。
+   */
+  var pendingConfirm = null
+
+  function clearPendingConfirm() {
+    if (pendingConfirm === null) return
+    if (pendingConfirm.timer !== null) window.clearTimeout(pendingConfirm.timer)
+    if (pendingConfirm.label !== null && pendingConfirm.label.parentNode !== null) {
+      pendingConfirm.label.parentNode.removeChild(pendingConfirm.label)
+    }
+    pendingConfirm = null
+  }
+
+  /**
+   * 第一次点：亮出确认文字并开始计时。
+   * 第二次点（仍在 5 秒内）：返回 true，调用方去执行真正的操作。
+   *
+   * @param button 触发的按钮
+   * @param text 确认文字
+   * @param side 'left' 文字在按钮左边（注销用），'right' 文字在按钮右边（清空用）
+   *
+   * 这里原先还有个 `host` 参数（文档说它是「放确认文字的容器」），
+   * 但函数体里从没用过它 —— 摆位一律走 `button.parentNode`（理由见下）。
+   * 一个**有文档、有传参、却完全不生效**的参数比没有参数更坏：
+   * 读的人会以为传进去的容器在起作用，改的时候不敢动。
+   * 已经删掉，调用方少传一个参数。
+   */
+  function armDestructiveConfirm(button, text, side) {
+    // 已经在等确认了 → 这一次点就是「真的执行」
+    if (pendingConfirm !== null && pendingConfirm.button === button) {
+      clearPendingConfirm()
+      return true
+    }
+    // 点了别的按钮：前一个确认作废
+    clearPendingConfirm()
+
+    var label = document.createElement('span')
+    label.className = 'chat__confirm-label' + (side === 'right' ? ' chat__confirm-label--right' : '')
+    label.textContent = text
+    // 用 before/after 摆位而不是 insertBefore：
+    // 按钮可能被移过位置，直接算 sibling 容易算错。
+    if (side === 'right') {
+      button.parentNode.insertBefore(label, button.nextSibling)
+    } else {
+      button.parentNode.insertBefore(label, button)
+    }
+
+    var timer = window.setTimeout(function () {
+      if (pendingConfirm === null || pendingConfirm.label !== label) return
+      // 过期：把文字换掉再消失，让人知道「刚才那个提示已经作废」
+      label.classList.add('is-expired')
+      label.textContent = '已取消'
+      window.setTimeout(function () {
+        if (label.parentNode !== null) label.parentNode.removeChild(label)
+      }, 1200)
+      pendingConfirm = null
+    }, CONFIRM_WINDOW_MS)
+
+    pendingConfirm = { button: button, label: label, timer: timer }
+    return false
+  }
+
   function confirmDeleteMember(member, button) {
-    if (!window.confirm('注销「' + member.username + '」？\n\n' +
-        '他的账号会被删除，所有登录状态会失效，\n' +
-        '他发过的消息会保留，但作者名会改成「已注销」。\n\n' +
-        '这一步不可撤销。')) {
-      return
-    }
-    var typed = window.prompt('请输入「' + member.username + '」以确认注销：')
-    if (typed === null) return
-    if (typed.trim() !== member.username) {
-      notice('输入不匹配，已取消', 'error')
-      return
-    }
+    if (me === null || member.id === me.id) return
+    // 注销的提示按要求放在 x 的**左边**
+    if (!armDestructiveConfirm(button, '确认删除？', 'left')) return
 
     button.disabled = true
     api('/api/users/' + encodeURIComponent(member.id), { method: 'DELETE' })
@@ -1283,15 +1518,13 @@
    * 清空整个房间。服务端是**硬删**，所以这里必须二次确认 —— 点下去没有撤销。
    */
   function purgeRoom() {
-    if (me === null) return
+    if (me === null || el.purgeButton === null) return
 
-    var confirmed = window.confirm(
-      '确定清空「' + ROOM + '」房间的全部消息吗？\n\n' +
-        '消息里的图片和文件会一起删除，无法恢复。',
-    )
-    if (!confirmed) return
+    // 和注销用同一套两段式确认，唯一区别是提示文字排在按钮**右边**
+    // （注销是左边）。见 armDestructiveConfirm 的注释。
+    if (!armDestructiveConfirm(el.purgeButton, '确认删除？', 'right')) return
 
-    if (el.purgeButton !== null) el.purgeButton.disabled = true
+    el.purgeButton.disabled = true
     notice('正在清空…')
 
     api('/api/rooms/' + encodeURIComponent(ROOM), { method: 'DELETE' })
@@ -1458,6 +1691,16 @@
     if (el.me !== null) el.me.hidden = true
     if (el.logout !== null) el.logout.hidden = true
     if (el.passwordButton !== null) el.passwordButton.hidden = true
+    // 回到「未登录」这一侧，把登录/注册两个 tab 还回来 ——
+    // 「修改密码」模式会把它们藏起来（见 enterPasswordPanelView）。
+    if (el.loginTab !== null) el.loginTab.hidden = false
+    if (el.registerTab !== null) el.registerTab.hidden = false
+    // 「修改密码」tab 只在已登录时出现：未登录时改了也没用（改不了别人的号），
+    // 而且那个 tab 里没有用户名输入框，单独露出来会让人困惑。
+    if (el.passwordTab !== null) el.passwordTab.hidden = true
+    // 登出前如果停在 password 模式，务必拨回 login ——
+    // 否则重新登录后会直接看见一个空的改密码表单。
+    if (mode === 'password') setMode('login')
     if (el.exportButton !== null) el.exportButton.hidden = true
     if (el.purgeButton !== null) el.purgeButton.hidden = true
     setStatus('未登录')
@@ -1474,6 +1717,7 @@
     }
     if (el.logout !== null) el.logout.hidden = false
     if (el.passwordButton !== null) el.passwordButton.hidden = false
+    if (el.passwordTab !== null) el.passwordTab.hidden = false
 
     // 导出 / 清空只有管理员看得见。
     // 藏按钮只是「别让人白点」，真正的门禁在服务端（非 admin 会拿到 403）。
@@ -1521,9 +1765,43 @@
     })
   }
 
+  /**
+   * 本地预览自检：页面跑在 localhost 上、API 却指向远端 —— 这个组合**必然登录不上**。
+   *
+   * 为什么难查：Cookie 的 SameSite 只比 scheme + 域名，**不比端口**。
+   * `http://localhost:1313` → `http://localhost:8787` 是同站，Lax Cookie 正常带；
+   * 但只要 API 落到 `https://api.yulo.top`，两者就成跨站，Lax Cookie 一律不带，
+   * 服务端看到的就是「没登录」。现象于是变成：登录接口 200、紧接着 `/api/me` 401，
+   * 前端只能报一句「登录状态没拿到」—— 跟密码对不对完全无关。
+   *
+   * 触发它只需要一个失误：起 hugo server 时忘了带
+   *   HUGO_PARAMS_CHAT_APIBASE=http://localhost:8787
+   * 这个坑已经踩过两次（第 13 条坑 + 2026-09-30 日志），所以在这里直接喊出来，
+   * 不再让人去翻 Cookie 策略。
+   *
+   * 线上不会命中：`location.hostname` 是 `yulo.top`，第一个判断就返回了。
+   */
+  function checkLocalPreviewTarget() {
+    if (!/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) return false
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/.test(API)) return false
+
+    showAuth()
+    setStatus('本地预览配置有误', 'offline')
+    notice(
+      'API 地址没指到本机，登录必然失败（当前：' + API + '）。' +
+        '请带上 HUGO_PARAMS_CHAT_APIBASE=http://localhost:8787 重启 hugo server，' +
+        '并用 http://localhost:1313 打开本页。',
+      'error',
+    )
+    return true
+  }
+
   function boot() {
     setStatus('正在检查登录状态…', 'connecting')
     notice('')
+
+    // 配置不对就别去请求了：请求全会失败，而且那些失败信息会把真正的原因盖住。
+    if (checkLocalPreviewTarget()) return
 
     loadMe()
       .then(function (profile) {
@@ -1570,14 +1848,36 @@
     Array.prototype.forEach.call(el.tabs, function (tab) {
       tab.classList.toggle('is-active', tab.dataset.chatMode === next)
     })
-    if (el.submit !== null) el.submit.textContent = next === 'login' ? '登录' : '注册'
+
+    // 改密码是第三个 tab，所以现在有两个表单要互斥显示。
+    // 写成「password 模式显示改密码表单、其余显示登录/注册表单」，
+    // 而不是给两个表单各自一堆独立判断 —— 后者加第四个 tab 时必然漏一处。
+    var onPassword = next === 'password'
+    if (el.passwordForm !== null) el.passwordForm.hidden = !onPassword
+    if (el.authForm !== null) el.authForm.hidden = onPassword
+    if (el.passwordHint !== null) el.passwordHint.hidden = !onPassword
+
+    if (el.submit !== null) {
+      el.submit.textContent = next === 'login' ? '登录' : '注册'
+    }
+
     if (el.hint !== null) {
+      el.hint.hidden = onPassword
       el.hint.textContent =
         next === 'login'
           ? '还没有账号？切到「注册」创建一个，用户名 2-20 位，密码至少 8 位。'
           : '用户名 2-20 位（中文、字母、数字、下划线），密码至少 8 位。'
     }
-    if (el.password !== null) el.password.autocomplete = next === 'login' ? 'current-password' : 'new-password'
+
+    if (el.passwordHint !== null) {
+      el.passwordHint.textContent = onPassword
+        ? '改完会要求你重新登录：这是为了让人旧的登录状态立刻失效。'
+        : ''
+    }
+
+    if (el.password !== null) {
+      el.password.autocomplete = next === 'login' ? 'current-password' : 'new-password'
+    }
     notice('')
   }
 
@@ -1729,47 +2029,82 @@
    * 用户改密码的场景通常就是「我发现别人能登录我的号」，让他重新登进去是正确行为。
    */
   function handlePasswordChanged() {
-    closePasswordModal()
     // 走 resetToAuthPanel 而不是 handleSignedOut：后者会弹红色「登录已过期」，
-    // 和「密码已修改」叠在一起像出了故障。这里该说的是下面这句。
+    // 和「密码已修改」叠在一起像出了故障。这里该说的是下面那句。
     resetToAuthPanel()
+    setMode('login')
     notice('密码已修改，请用新密码重新登录')
   }
 
-  function openPasswordModal() {
-    if (el.passwordModal === null || el.passwordForm === null) return
+  /** 把改密码表单的输入和提示都清干净。 */
+  function resetPasswordForm() {
+    if (el.passwordForm === null) return
     el.passwordForm.reset()
     if (el.passwordHint !== null) {
       el.passwordHint.textContent = ''
       el.passwordHint.className = 'chat__hint'
     }
-    el.passwordModal.hidden = false
+  }
+
+  /**
+   * 已登录时打开改密码面板的视图切换：露出 auth 面板、收起聊天区。
+   *
+   * **这一步就是「点了没反应」的根因。**
+   * 改密码表单和「登录/注册」共用同一个 `<section data-chat-auth>`，
+   * 而登录成功后 `enterRoom()` 会把整个 section 设成 hidden。
+   * 于是只切 mode（`passwordForm.hidden = false`）时，表单自己确实不藏了，
+   * 但它是被**父节点**藏着的 —— 屏幕上什么都不变，看着就像按钮坏了。
+   *
+   * 原来的测试为什么没抓到：断言写的是 `!passwordForm.hidden`，
+   * 只看元素**自己**的 hidden，不看祖先。这跟「用户名框被父 form 藏住」
+   * 是同一个坑 —— 那边当时改对了，这边漏了。
+   */
+  function enterPasswordPanelView() {
+    if (el.auth !== null) el.auth.hidden = false
+    if (el.room !== null) el.room.hidden = true
+    // 已登录时「登录 / 注册」两个 tab 没有意义：点进去只会看见一个
+    // 对着已登录身份的登录表单，而且那块没有「取消」，进去就出不来了。
+    if (el.loginTab !== null) el.loginTab.hidden = true
+    if (el.registerTab !== null) el.registerTab.hidden = true
+    if (el.passwordTab !== null) el.passwordTab.hidden = false
+  }
+
+  /**
+   * 打开「修改密码」面板。
+   *
+   * 刻意**复用登录/注册面板**而不是开浮层：同一个位置、同一套表单样式，
+   * 视觉上完全一致，也省掉一整套 modal 的 CSS、焦点管理、Esc/遮罩关闭逻辑。
+   *
+   * 顺序不能反：`showAuth()` 里有「停在 password 就拨回 login」这一条，
+   * 先 setMode 会被它弹回登录态。
+   */
+  function openPasswordPanel() {
+    if (el.passwordForm === null) return
+    resetPasswordForm()
+    enterPasswordPanelView()
+    setMode('password')
     if (el.passwordCurrent !== null) el.passwordCurrent.focus()
   }
 
-  function closePasswordModal() {
-    if (el.passwordModal !== null) el.passwordModal.hidden = true
-    if (el.passwordForm !== null) el.passwordForm.reset()
+  /** 关掉改密码面板、回到聊天区。「取消」走这里。 */
+  function closePasswordPanel() {
+    resetPasswordForm()
+    setMode('login')
+    if (el.auth !== null) el.auth.hidden = true
+    if (el.room !== null) el.room.hidden = false
+    if (el.passwordTab !== null) el.passwordTab.hidden = false
+    // 顶栏全程没动过（状态、用户名、退出按钮都还在），所以不用重建。
+    // 只把焦点还回输入框，免得停在已经藏起来的表单里。
+    if (el.input !== null) el.input.focus()
   }
 
   if (el.passwordButton !== null) {
-    el.passwordButton.addEventListener('click', openPasswordModal)
+    el.passwordButton.addEventListener('click', openPasswordPanel)
   }
+
   if (el.passwordCancel !== null) {
-    el.passwordCancel.addEventListener('click', closePasswordModal)
+    el.passwordCancel.addEventListener('click', closePasswordPanel)
   }
-  // 点遮罩空白处关闭。keyup 是为了键盘操作：Esc 应该关掉这个模态，
-  // 否则 Tab 进去以后没有键盘出口。
-  if (el.passwordModal !== null) {
-    el.passwordModal.addEventListener('click', function (event) {
-      if (event.target === el.passwordModal) closePasswordModal()
-    })
-  }
-  document.addEventListener('keyup', function (event) {
-    if (event.key === 'Escape' && el.passwordModal !== null && !el.passwordModal.hidden) {
-      closePasswordModal()
-    }
-  })
 
   if (el.passwordForm !== null) {
     el.passwordForm.addEventListener('submit', function (event) {
@@ -1798,7 +2133,8 @@
 
       api('/api/me/password', {
         method: 'POST',
-        body: { currentPassword: currentPassword, newPassword: newPassword },
+        headers: jsonHeaders(),
+        body: JSON.stringify({ currentPassword: currentPassword, newPassword: newPassword }),
       })
         .then(function (response) {
           return response

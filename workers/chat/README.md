@@ -55,7 +55,8 @@ workers/chat/
 │   ├── schema.ts            # nanoka 生成，勿手改
 │   └── migrations/
 │       ├── 0000_*.sql       # drizzle-kit 生成（手工加过 COLLATE NOCASE）
-│       └── 0001_chat_indexes.sql  # 手写索引，为了省 D1 读取额度
+│       ├── 0001_chat_indexes.sql        # 手写索引，为了省 D1 读取额度
+│       └── 0006_messages_cursor_index.sql  # 手写：复合游标的配套索引（见第 21 条）
 ├── src/
 │   ├── index.ts             # 入口：导出 Worker 与 ChatRoom
 │   ├── app.ts               # 组装 Hono 应用（按 isolate 缓存）
@@ -387,6 +388,12 @@ JWT 是无状态的，删掉 Cookie 并不能让已经泄露的 refresh token �
 没有索引时一次历史翻页就要全表扫描，按 5000 条消息估算差 100 倍。
 这个索引不在 drizzle 快照里，所以后续 `drizzle-kit generate` 不会重复建也不会删它。
 
+> 注意：这个索引后来被 `0006_messages_cursor_index.sql` **替换**掉了 ——
+> 历史游标改成 `(createdAt, id)` 复合键之后，它满足不了新的 `ORDER BY`
+> （原因和验证方法见第 21 条）。现在生效的是
+> `messages_room_deleted_created_id_idx (room, deleted, createdAt, id)`，
+> 前三个列和它相同，所以它是纯粹的替代而不是叠加。
+
 ### 7. `users.username` 用了 `COLLATE NOCASE`（手改了生成出来的迁移）
 
 SQLite 的比较和唯一索引都跟随列的排序规则。列声明成 NOCASE 之后：
@@ -580,19 +587,202 @@ rotation 开着意味着**每一次成功 refresh 都会往 `auth_blacklist` 写
 
 ---
 
+### 18. 对象不能当 fetch 的 `body` 直接传（会变成 `"[object Object]"`）
+
+`fetch` 的 `body` 只认字符串 / `Blob` / `BufferSource` / `FormData` /
+`URLSearchParams` / `ReadableStream`。给它一个普通对象**不会报错**，
+而是 `String()` 成 `"[object Object]"`、`Content-Type` 自动变成 `text/plain`。
+后端收到一个语法合法但内容不对的 JSON，于是回一句「请输入当前密码」——
+驴唇不对马嘴，而且用户看到的提示离按钮很远。
+
+线上真实事故（2026-10-04 复盘）：**改密码永远失败**；
+**禁言返回 200 却什么都没做**（后端把残缺请求当成了「解除禁言」，见第 19 条），
+管理员看到「已禁言 XXX」还以为处理好了 —— 后者比前者坏得多。
+
+修法分两层，缺一不可：
+
+**① 公共入口兜住。** `api()` 收到纯对象就 `JSON.stringify` 并补 `Content-Type`。
+只挑「纯对象」下手，`Blob` / `FormData` / `TypedArray` 一律放行
+（上传走的就是 `body: blob`，序列化它会把上传弄坏）。
+
+**② 调用点也写清楚。** 两个调用点都显式写成 `JSON.stringify(...)` + `jsonHeaders()`。
+兜底是为了防下一个犯同样错误的人，不是为了让自己这行写得含糊。
+
+> ⚠️ 判定纯对象要用**品牌检查**：
+> `Object.prototype.toString.call(body) === '[object Object]'`。
+> **不要**用 `Object.getPrototypeOf(body) === Object.prototype` ——
+> 后者跟 realm 绑死，跨 realm（jsdom、iframe）时普通对象的原型不是本 realm 的
+> `Object.prototype`，于是会被判成「不认识」而放行。
+> 这个坑是前端测试抓出来的：断言全红，而 chat.js 在真浏览器里看起来完全正常
+> —— 也就是说，**这里如果判错，只在一种环境里坏，而那种环境恰好是测试**。
+
+回归测试：`npm run frontend-test` 的「请求体序列化」一节（12 项，直接对
+切出来的归一化函数做单元断言 —— 不需要 admin、也不需要真的改掉测试账号的密码）。
+
+---
+
+### 19. 接口不能把「字段缺失」和「显式 null」合并成同一个值
+
+`moderation.ts` 的禁言接口原先写的是：
+
+```ts
+const parsed = muteSchema.safeParse({ minutes: body?.minutes ?? null })
+```
+
+而 `minutes: null` 的语义是**解除禁言**。于是 `{}`（字段缺失）和
+`{ minutes: null }`（明确要求解除）落到了同一个分支里 —— 一个残缺请求
+会**真地把人解除禁言，并返回 200**。
+
+这类「用错也返回成功」的接口是最难查的一种：没有异常、没有错误码、
+没有任何东西进日志，只有一句看起来完全正常的成功提示。而它是被第 18 条
+那条前端 bug 顺手暴露出来的。
+
+**规则：缺失 → 400，显式 null → 业务语义。** 判据写 `'minutes' in body`，
+而不是 `body.minutes ?? null`。`??` 会抹掉「有没有这个字段」这个信息，
+而这里恰恰只有这个信息能区分两种意图。
+
+回归测试：`npm run smoke` 里 3 项（缺字段 400 / `null` body 400 /
+被拒的请求没有偷改禁言状态）。
+
+---
+
+### 20. WebSocket 的寿命必须被「建立它的那张凭证」卡住
+
+WebSocket 只在握手时验一次令牌，之后 DO 再也不看它。于是这三件事对一条
+**已经建好**的连接毫无影响：
+
+- access token 到期；
+- 改密码（`revokeAllSessions` 清空了会话表）；
+- 账号被管理员注销（`users` 行都没了）。
+
+后果是「人已经删了，只要他不刷新页面就能一直收消息」，而且成员名单里还显示在线。
+发声/上传/握手都查 D1，所以「发」是拦住的，漏的恰好是「收」。
+
+两层修法：
+
+**① 握手时确认「这个人还有活着的会话」。** 和用户名合成一条 SQL：
+
+```sql
+SELECT u.username,
+       EXISTS (SELECT 1 FROM user_sessions WHERE userId = u.id AND expiresAt >= ?2) AS live
+FROM users AS u WHERE u.id = ?1
+```
+
+少了这条，改完密码 30 分钟内照样能拿旧令牌重连进房间 —— 改密码等于没改。
+
+**② 把令牌的 `exp` 记进 `SocketAttachment`，广播前踢掉过期的。**
+这是「连接的最长寿命 = 它凭以建立的那张凭证的寿命」这句设计的落地。
+
+> 为什么放在**广播路径**上，而不是开个 alarm 定时扫：
+> 没有广播的时候也就没有内容可漏；而广播一来 DO 必然醒着。
+> 等于零额外唤醒、零额外查询。代价是过期连接最多多活「到下一条消息为止」，
+> 而这段时间房间里本来就没有新内容。
+
+推论：`ACCESS_TOKEN_TTL_SECONDS` 现在**同时是 WebSocket 的寿命上限**，
+调大它等于延长「被注销的账号还能收多久消息」。改那个值时要一起想。
+
+另外顺手修掉一处重复广播：同一条连接异常断开时运行时**既叫 `webSocketError`
+又叫 `webSocketClose`**，于是「leave」会播两次 —— 房间里其他人看到同一个人
+连着退出两回。用一个不持久化的 `WeakSet` 按连接去重。
+
+回归测试：`npm run smoke` 的「会话吊销后 WebSocket 开不出来」一节 3 项
+（吊销前连得上 → 改密码 → 旧令牌握手被拒 401）。
+`npm run verify-build` 另有 3 项静态断言钉住 `exp` / 会话校验 / 踢人调用还在。
+
+---
+
+### 21. 复合索引必须和 `ORDER BY` 一起改，否则会把省下的读取额度连本带利花回去
+
+历史消息的游标从单键 `createdAt` 改成了 `(createdAt, id)` 复合键。
+动机是**修丢消息**：`createdAt` 是毫秒整数、不唯一，一页正好切在一组同毫秒
+消息中间时，单键游标会把「同毫秒、本页没包含」的那几条一起排掉，
+而它们**从此再也翻不出来**，且没有任何提示。
+
+危险的地方在这里：`messages.id` 是 **text 主键、不是 rowid**，
+所以同一毫秒内它的顺序和索引里的隐含顺序（rowid 升序）**不一致**。
+只把 `id` 加进 `ORDER BY`、不动索引的话，老索引就满足不了排序，
+SQLite 会把**整个房间**的行读出来再排序 —— 那比压根没有索引更贵，
+因为它把 `0001_chat_indexes.sql` 省下来的读取额度连本带利花回去了。
+
+所以 `0006_messages_cursor_index.sql` 把 `id` 加到索引末尾，并删掉原索引
+（新索引的前缀 `(room, deleted, createdAt)` 与原索引完全相同，原索引成了纯冗余，
+留着只会让每条消息的 INSERT 多维护一个索引）。
+
+**以后改查询形状都要做一遍这个验证：**
+
+```sql
+EXPLAIN QUERY PLAN
+SELECT id FROM messages
+WHERE room = 'general' AND deleted = 0 AND (createdAt, id) < (1790000000000, 'ffff')
+ORDER BY createdAt DESC, id DESC LIMIT 51;
+```
+
+判据有两条，缺一不可：
+
+1. 出现 `USING COVERING INDEX messages_room_deleted_created_id_idx`；
+2. **不出现** `USE TEMP B-TREE FOR ORDER BY`。
+
+第 2 条是关键。只看到「用了索引」还不够 —— 用了索引、又额外排序，
+照样是全表读。2026-10-04 实测四种查询形状（首屏 / 行值游标翻页 /
+旧单键游标 / 导出的 ASC）全部满足上面两条。
+
+游标条件的写法也有讲究：用**行值比较** `(createdAt, id) < (?, ?)`，
+而不是 `createdAt < ? OR (createdAt = ? AND id < ?)`。两者结果一样，
+但只有行值形式能被 SQLite 稳定地转成一次索引区间扫描（上面那条
+`SEARCH ... AND (createdAt,id)<(?,?)` 就是实测结果）。
+
+参数传**裸毫秒数**而不是 `Date`：`createdAt` 列在库里就是整数（`timestamp_ms`），
+而 raw `sql` 模板不会帮忙把 `Date` 转成毫秒 —— 硬塞进去会变成字符串比较，
+那才是真正会出错的地方。
+
+导出接口的 `truncated` 也一起修了：原先取 `EXPORT_LIMIT` 条再判
+`>= EXPORT_LIMIT`，房间恰好有 1000 条时会**谎报截断**。
+改成取 1001 条判 `>`。
+
+---
+
+### 22. 挂在前面的中间件提前 `return`，会让路由里的「清理动作」永远跑不到
+
+给 `/auth/logout` 加限流时踩到的。`logoutThrottle` 挂在路由**前面**，
+被限流时直接 `return` —— 于是路由里那两句 `deleteCookie` 从来不执行。
+而前端收到**任何**响应（包括 429）都会把自己切回未登录状态。
+
+结果是「界面上显示已退出、Cookie 却还在」，下次刷新页面又自动登录了。
+用户会认为「退出登录坏了」——**这比不限流还糟**。
+
+所以被限流时也要把两个 Cookie 清掉：不花钱的动作照做，只把「写黑名单」那一步限掉。
+
+同一轮里另外三处：
+
+- **登出原先完全没有限流。** `revokeRefreshToken` 每次都要往 `auth_blacklist`
+  写一行，而这条路由没有鉴权门槛（认不出令牌也照跑）—— 和第 17 条
+  「refresh 必须限流」是同一个性质，只是那条更早被注意到。
+- **广播失败不能把已经成功的写报成 500。** `Message.create` 落库之后才广播；
+  如果 DO 抖一下让异常冒到 `onError`，调用方拿到 500，而消息其实已经在库里了。
+  前端的反应是把文本还回输入框、用户再按一次 → **库里多出一条重复消息**。
+  也就是说广播失败会「伪造出一个写入失败」，并因此造成真实的重复写入。
+  `broadcast()` 内部吞掉异常（并 `console.error` 留痕），响应状态只反映业务写。
+- **R2 的归属判定要用不可变的 `userId`，不能用用户名。** 用户名可复用：
+  账号注销后那行 `users` 就没了，别人能注册同名账号 —— 按用户名比对会让他
+  有权删掉前任上传的文件，额度还退到新账号头上。老对象（metadata 里没有
+  `uploaderId`）退回按用户名比，否则就成了「历史文件谁都删不掉」，比不修还糟。
+
+---
+
 ## 测试覆盖
 
-一共 **192 项**，分四个脚本。（项数会随测试增加变化，`2026-10-02` 实测值如下。）
+一共 **313 项**，分四个脚本。（项数会随测试增加变化，`2026-10-04` 实测值如下。）
 
 ```bash
 npm run typecheck      # tsc --noEmit，CI 里也跑
-npm run verify-build   # 8 项， 只看 Hugo 产物，不需要任何服务
-npm run purge-test     # 17 项， 纯逻辑，不需要任何服务
-npm run smoke          # 108 项，需要 wrangler dev
-npm run frontend-test  # 59 项，需要 wrangler dev + 构建出的 public/chat/
+npm run verify-build   # 17 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
+npm run purge-test     # 17 项，纯逻辑，不需要任何服务
+npm run smoke          # 126 项，需要 wrangler dev
+npm run frontend-test  # 153 项，需要 wrangler dev + 构建出的 public/chat/
+npm run rate-limit-test # 19 项，自己起一个 STRICT_RATE_LIMIT 的 dev server
 ```
 
-`npm run smoke`（108 项，后端）：
+`npm run smoke`（126 项，后端）：
 
 - 健康检查、CORS 预检（含非白名单来源拿不到允许头）
 - 注册 / 大小写不同的重名被拒 / 非法输入
@@ -612,8 +802,12 @@ npm run frontend-test  # 59 项，需要 wrangler dev + 构建出的 public/chat
 - **refresh 限流**：有效 token 打满后 429；**废 token 也会被限住**（不是后门）
 - **审计**：撤回记下了「操作者」（管理员撤别人时 deletedBy ≠ 作者）；
   清空房间在 `room_purges` 留了一行流水
+- **禁言接口**：缺 `minutes` 字段 → 400、`body` 是 JSON `null` → 400，
+  且被拒的请求**不会偷改禁言状态**（见第 19 条）
+- **会话吊销后 WebSocket 开不出来**：先证明吊销前连得上，改密码后再握手 → 401
+  （见第 20 条。这是「改密码要真的把人踢下线」的服务端那一半）
 
-`npm run frontend-test`（59 项，真实 `chat.js` + jsdom + 真实 Worker）：
+`npm run frontend-test`（153 项，真实 `chat.js` + jsdom + 真实 Worker）：
 
 - `chat.js` 引用的 18 个 `data-chat-*` 钩子在真实页面里都存在
 - 未登录 → 注册 → 自动登录 → 加载历史 → WebSocket 连上
@@ -622,8 +816,13 @@ npm run frontend-test  # 59 项，需要 wrangler dev + 构建出的 public/chat
 - 外站图片不会被渲染成 `<img>`（媒体白名单生效）
 - 撤回后前端跟着移除；**被限流时显示服务端的中文原因、且消息不会被移除**
 - 退出后回到登录面板、无未捕获 JS 错误
+- **请求体序列化**：把 `chat.js` 里那段归一化逻辑按固定标记切片、单独 eval 出来做
+  单元断言（对象 body 变 JSON 文本 + 补 Content-Type、字符串/`null`/`Blob`/`FormData`
+  原样放行、重复调用幂等），外加一条「代码里没有 `body: {` 这种写法」的静态断言。
+  见第 18 条 —— 这几条是冲着那个「改密码点了没反应」来的，
+  而且**不需要 admin、也不需要真的改掉测试账号的密码**。
 
-`npm run verify-build`（8 项，只检查 Hugo 构建产物，不需要 dev server）：
+`npm run verify-build`（17 项，只检查 Hugo 构建产物，不需要 dev server）：
 
 - `/chat/` 存在、加载了 `chat.js`、有聊天室骨架
 - **其它任何页面都没有** `chat.js`、也没有聊天室骨架
@@ -633,10 +832,47 @@ npm run frontend-test  # 59 项，需要 wrangler dev + 构建出的 public/chat
   这一项是后来加的 —— 那个数字原先在后端两处、前端一处各写一遍，
   而常量本身没人 import（是个死常量）。现在两边各有单一来源，
   「它们相等」这件事由这条检查钉住。
+- **后端源码不变量**（9 项，见第 19/20/22 条）：refresh 的会话校验排在限流**之后**、
+  `/auth/logout` 挂着限流、`broadcast` 里的 `stub.fetch` 包在 `try` 里、
+  `SocketAttachment` 带 `exp`、握手查 `user_sessions`、广播前踢过期连接、
+  禁言区分「字段缺失」与 `null`。
+
+  > 这一类只能做**静态**断言（比位置、比包含关系），因为要证明它们得让 DO
+  > 在测试中途挂掉、或者把限流打满一个窗口 —— 而本地限流是放宽的，
+  > 那种断言在开发机上永远绿。**它比没有强，但要清楚它弱在哪**：
+  > 拦得住「有人把这段逻辑挪走/删掉」，拦不住「逻辑还在、但写错了」。
+  > 能真跑的部分交给 smoke 和 frontend-test。
+  >
+  > 写法上有个硬要求：断言一律先确认「锚点字符串还在」，再比位置。
+  > 反过来写的话，一次改名会让 `indexOf` 返回 -1、比较结果碰巧为真 ——
+  > 断言变成空转，那还不如不写。
 
 **这个脚本已经接进 CI**（`.github/workflows/hugo.yaml` 的 `Verify chat script placement` 步骤），
 所以那次事故不会再靠肉眼发现。它只 import `node:fs` / `node:path` / `node:url`，
 零第三方依赖，所以 CI 里不需要先 `npm ci`。
+
+### 已知测试盲区（写出来免得以后误以为覆盖了）
+
+两条分支**在当前测试框架里跑不到**，不是「懒得写」，是构造不出来：
+
+1. **`evictIfExpired()` 真正关掉连接那一下。** 要触发它，得让连接的 `exp`
+   在测试过程中过去 —— 而连接上的 `exp` 来自 access token，测试里那把 token
+   的有效期是 30 分钟。想构造就只能：
+   - 手工签一个短 exp 的 JWT —— 等于在测试里自己实现一遍签名（万一库里
+     改了 claim 约定，这条测试会因为错误的原因变红，比没有更误导）；
+   - 或者等 30 分钟。
+   所以这条目前只有 3 项静态断言守着（`exp` 进 attachment、握手查会话、
+   广播前调 `evictIfExpired`）。**静态断言拦得住「调用被删掉」，
+   拦不住「函数体写错了」** —— 改这段时请手工验一次。
+2. **`markUpload()` 返回 `false` 那个分支**（额度在预检之后被抢走）。
+   预检和守卫用的是**同一组条件**，所以单线程下两者永远一致；
+   要让它分歧必须有真正的并发。而并发的上传会先撞上「上传限流」
+   （2 次 / 3 秒），两个 429 混在一起就分不清是谁挡的。
+   现在被覆盖到的是它的**成功路径**（每次上传都会走这条带条件的 UPSERT，
+   写错了所有上传都会 429），**拒绝路径没有**。
+
+另外，`npm run rate-limit-test` 这一套自己起 `STRICT_RATE_LIMIT` 的 dev server，
+**不在 CI 里跑**（CI 起 dev server 成本太高）。改限流相关代码时要手动跑一次。
 
 `npm run purge-test`（17 项，纯逻辑，不需要 dev server）：
 

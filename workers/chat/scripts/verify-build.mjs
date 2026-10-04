@@ -165,6 +165,92 @@ console.log('\n消息长度上限：前后端是否一致')
   }
 }
 
+/**
+ * 后端源码不变量。
+ *
+ * ## 为什么这一类只能做静态断言
+ *
+ * 下面每一条讲的都是「某个东西必须出现在另一条语句的**前面/里面**」——
+ * 位置、包含关系、顺序。这些没法用 HTTP 断言出来：
+ *
+ *   - 「会话校验排在限流之后」：要证明它，得拿一个已吊销的令牌打满一个窗口，
+ *     再断言第 N 次是 429 —— 而本地限流被放宽了，那条断言在开发机上永远绿。
+ *   - 「广播失败不抛给调用方」：要证明它，得让 Durable Object 在测试中途挂掉。
+ *
+ * 所以这里退一步，直接检查源码结构。**这比没有强，但要知道它弱在哪**：
+ * 它拦得住「有人把这段逻辑挪走/删掉」，拦不住「逻辑还在、但写错了」。
+ * 真正跑得起来的那部分交给 smoke 和 frontend-test。
+ *
+ * 断言一律先确认「锚点字符串还在」，再比位置。反过来写的话，一次改名会让
+ * `indexOf` 返回 -1、比较结果碰巧为真 —— 断言变成空转，那还不如不写。
+ */
+console.log('\n后端源码不变量（顺序 / 包含关系这类没法用 HTTP 断言的）')
+{
+  const readSource = (relativePath) => {
+    try {
+      return readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8')
+    } catch (error) {
+      console.log(`  （读不到 ${relativePath}：${error.message}）`)
+      return ''
+    }
+  }
+
+  const authSource = readSource('../src/routes/auth.ts')
+  const roomSource = readSource('../src/room.ts')
+  const typesSource = readSource('../src/types.ts')
+  const moderationSource = readSource('../src/moderation.ts')
+  const chatSource = readSource('../src/routes/chat.ts')
+
+  // ① refresh：会话校验必须在限流之后。
+  // 放在前面等于给「已吊销但仍验签通过的令牌」开了一条无限可打的免费路径。
+  const throttleAnchor = authSource.indexOf('const refreshThrottle')
+  const consumeAnchor = authSource.indexOf('await consumeRateLimit', throttleAnchor)
+  const sessionAnchor = authSource.indexOf('isSessionActive(c.env.DB, pendingJti)', consumeAnchor)
+  check('auth.ts 里能找到 refreshThrottle 的限流调用', consumeAnchor !== -1, `位置 ${consumeAnchor}`)
+  check(
+    'refresh 的会话校验排在限流之后（否则被吊销的令牌可无限打）',
+    sessionAnchor !== -1 && consumeAnchor !== -1 && sessionAnchor > consumeAnchor,
+    `限流在 ${consumeAnchor}，会话校验在 ${sessionAnchor}`,
+  )
+
+  // ② 登出：必须有独立限流（它每次都要往 auth_blacklist 写一行）
+  check(
+    '/auth/logout 挂了限流中间件',
+    /app\.post\(\s*'\/auth\/logout'\s*,\s*logoutThrottle/.test(authSource),
+    '找不到 logoutThrottle —— 登出会变成一条无门槛的 D1 写路径',
+  )
+
+  // ③ 广播：必须内部吞掉异常。
+  // 判定用「try 出现在 await stub.fetch 之前」，而不是简单找 try/catch ——
+  // 后者在函数里随便哪里有个 try 都会为真。
+  const broadcastStart = chatSource.indexOf('async function broadcast')
+  const broadcastEnd = chatSource.indexOf('export function registerChatRoutes')
+  const broadcastBody =
+    broadcastStart === -1 || broadcastEnd <= broadcastStart
+      ? ''
+      : chatSource.slice(broadcastStart, broadcastEnd)
+  check('能在 chat.ts 里切出 broadcast 函数体', broadcastBody.length > 0)
+  const tryAt = broadcastBody.indexOf('try {')
+  const fetchAt = broadcastBody.indexOf('await stub.fetch')
+  check(
+    'broadcast 里的 stub.fetch 包在 try 里（广播失败不能报成写入失败）',
+    tryAt !== -1 && fetchAt !== -1 && tryAt < fetchAt,
+    `try 在 ${tryAt}，fetch 在 ${fetchAt}`,
+  )
+
+  // ④ WebSocket 的寿命上限：exp 记进 attachment，广播前踢掉过期的
+  check('SocketAttachment 带上了令牌到期时间 exp', /exp:\s*number/.test(typesSource))
+  check('握手时确认这个人还有活着的会话', /FROM user_sessions WHERE userId = u\.id/.test(roomSource))
+  check('广播前会踢掉已过期的连接', /evictIfExpired\(ws\)/.test(roomSource))
+
+  // ⑤ 禁言：必须区分「字段缺失」（400）与「显式 null」（解除禁言）
+  check(
+    '禁言区分了「没有 minutes 字段」和「minutes 是 null」',
+    /'minutes'\s+in\s+body/.test(moderationSource),
+    "少了这条，一个残缺请求会被当成「解除禁言」并返回 200",
+  )
+}
+
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)
 if (failures.length > 0) {
   console.log('\n失败列表：')

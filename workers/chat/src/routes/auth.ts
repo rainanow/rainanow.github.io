@@ -122,6 +122,11 @@ const loginThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
  */
 const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   let bucket = `refresh-ip:${clientIp(c)}`
+  /**
+   * 待校验的会话 jti。有值表示「验签通过、认得出账号」，需要在**限流之后**
+   * 再确认这个会话还没被吊销。
+   */
+  let pendingJti: string | null = null
 
   const token = getCookie(c, REFRESH_TOKEN_COOKIE)
   if (token !== undefined && token.length > 0) {
@@ -132,27 +137,7 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
       )
       if (payload.type === 'refresh' && typeof payload.sub === 'string' && payload.sub.length > 0) {
         bucket = `refresh:${payload.sub}`
-
-        /*
-         * 有效会话校验。**这是「改密码」能真正生效的那一步。**
-         *
-         * 改密码会清空这个 userId 在 user_sessions 里的全部行，于是这里
-         * 判成无效 → refresh 被拒。之前泄露出去的 refresh token 也就换不出
-         * 任何 access token 了。
-         *
-         * 放在限流**之后**是有意的：先记账再判定，这样「拿一个已被吊销的 token
-         * 疯狂打 refresh」同样会被限流住，不会变成一条无开销的免费路径。
-         *
-         * token 验签失败的情况不用在这里处理 —— 交给下面的 refreshHandler，
-         * 它本来就会拒。少一处判断就少一处不一致。
-         */
-        if (typeof payload.jti === 'string' && payload.jti.length > 0) {
-          const active = await isSessionActive(c.env.DB, payload.jti)
-          if (!active) {
-            deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
-            return c.json({ error: '登录状态已失效，请重新登录' }, 401)
-          }
-        }
+        if (typeof payload.jti === 'string' && payload.jti.length > 0) pendingJti = payload.jti
       }
     } catch {
       // 令牌无效/过期：解不出 sub，退回按 IP 记账（见上面第三点）
@@ -168,6 +153,103 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (attempt.blocked) {
     c.header('Retry-After', String(attempt.retryAfterSeconds))
     return c.json({ error: `刷新太频繁了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
+  }
+
+  /*
+   * 有效会话校验。**这是「改密码」能真正生效的那一步。**
+   *
+   * 改密码会清空这个 userId 在 user_sessions 里的全部行，于是这里判成无效
+   * → refresh 被拒。之前泄露出去的 refresh token 也就换不出任何 access token 了。
+   *
+   * ## 为什么必须排在限流**之后**
+   *
+   * 这一段原先写在限流前面（和这里注释写的意思正好相反）。那样等于：
+   * 任何一个**验签通过但已被吊销**的 refresh token 都能无限次打这个接口 ——
+   * 每次一次 D1 读，`auth_blacklist` 一行不写、限流桶一次不记，
+   * 是一条完全免费的可刷路径。而拿到这种 token 的门槛很低：
+   * 改一次自己的密码就有了。
+   *
+   * 先记账再判定之后，这类请求最多 20 次/分钟。
+   *
+   * ## 代价（想清楚了才这么改）
+   *
+   * 会话被吊销的人会先看到 429、而不是 401。前端的 `refreshSession()` 把 429
+   * 判成 `'retry'`（不登出），所以极端情况下他会多留在页面上一次刷新周期。
+   * 这不是死路：下一次刷新桶里已经有余额，就会拿到 401 并退回登录面板；
+   * 而且那把旧令牌到点后 WebSocket 也会被踢（见 `SocketAttachment.exp`）。
+   * 相比之下「免费可刷」是不能接受的，所以选这一边。
+   *
+   * token 验签失败的情况不用在这里处理 —— 交给下面的 refreshHandler，
+   * 它本来就会拒。少一处判断就少一处不一致。
+   */
+  if (pendingJti !== null && !(await isSessionActive(c.env.DB, pendingJti))) {
+    deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
+    return c.json({ error: '登录状态已失效，请重新登录' }, 401)
+  }
+
+  await next()
+}
+
+/**
+ * 登出限额：同一账号（或同一 IP）60 秒内最多 60 次。
+ *
+ * ## 为什么这条路由也要限
+ *
+ * 它原先**完全没有限流**，是账号相关的路由里最后一条裸奔的。
+ * 而 `revokeRefreshToken` 每次都会往 `auth_blacklist` **写一行 D1** ——
+ * 也就是说这是一条「无门槛（认不出令牌也照跑）、每次必写库」的公开路径。
+ * 这和当初给 `/auth/refresh` 限流是同一个理由，只是那条更早被注意到。
+ *
+ * ## 阈值为什么比 refresh 宽三倍
+ *
+ * 登出不像 refresh 那样会自动重复：它只在用户主动点「退出」时发一次。
+ * 而人可能来回点几次、或者几个标签页各点一次，所以给到 60 次/分钟 ——
+ * 正常使用永远碰不到，但对「拿一个 Cookie 循环打」已经压到了可忽略的量级。
+ *
+ * ## 桶键
+ *
+ * 优先按账号（能从令牌里认出 sub 就按账号），认不出就退回按 IP。
+ * 和 refresh 同理：几百人共用出口 IP 的场合，只按 IP 会误伤整栋楼。
+ */
+const LOGOUT_ALLOWED_PER_WINDOW = 60
+const LOGOUT_WINDOW_SECONDS = 60
+
+const logoutThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
+  let bucket = `logout-ip:${clientIp(c)}`
+
+  const token = getCookie(c, REFRESH_TOKEN_COOKIE)
+  if (token !== undefined && token.length > 0) {
+    try {
+      const payload = await verify<{ sub?: unknown; type?: unknown }>(token, c.env.AUTH_SECRET)
+      if (payload.type === 'refresh' && typeof payload.sub === 'string' && payload.sub.length > 0) {
+        bucket = `logout:${payload.sub}`
+      }
+    } catch {
+      // 令牌无效/过期：退回按 IP 记账（理由同 refresh —— 无效令牌不能变成免费路径）
+    }
+  }
+
+  const attempt = await consumeRateLimit(
+    c.env.DB,
+    bucket,
+    effectiveLimit(c.env, LOGOUT_ALLOWED_PER_WINDOW + 1),
+    LOGOUT_WINDOW_SECONDS,
+  )
+  if (attempt.blocked) {
+    c.header('Retry-After', String(attempt.retryAfterSeconds))
+    /*
+     * 即使被限流，也必须把两个 Cookie 清掉。
+     *
+     * 这个中间件挂在路由**前面**，直接 return 的话路由里那段 deleteCookie
+     * 永远跑不到；而前端收到任何响应（包括 429）都会把自己切回未登录状态。
+     * 结果就是「界面上显示已退出、Cookie 却还在」——下次刷新页面又自动登录了，
+     * 用户会认为「退出登录坏了」。这比不限流还糟。
+     *
+     * 所以宁可把「清 Cookie」这个不花钱的动作照做，只把「写黑名单」这一步限掉。
+     */
+    deleteCookie(c, ACCESS_TOKEN_COOKIE, { path: '/' })
+    deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
+    return c.json({ error: `操作太频繁了，${attempt.retryAfterSeconds} 秒后再试` }, 429)
   }
 
   await next()
@@ -289,7 +371,7 @@ export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
    * 这里用库导出的 `verify()` 验明正身，再把 jti 写进 D1 吊销名单；
    * 之后 `refreshHandler()` 内部的 `hasForSubject` 就会拒绝它。
    */
-  app.post('/auth/logout', async (c) => {
+  app.post('/auth/logout', logoutThrottle, async (c) => {
     const refreshToken = getCookie(c, REFRESH_TOKEN_COOKIE)
     if (refreshToken !== undefined && refreshToken.length > 0) {
       try {
