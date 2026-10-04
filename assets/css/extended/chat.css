@@ -150,6 +150,13 @@
   max-width: 22rem;
 }
 
+/* 表单底部的一排按钮。`.chat__form` 是纵向 flex，不包一层的话
+   两个按钮会一上一下地堆起来，「取消」看着像个独立操作。 */
+.chat__form-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .chat__field {
   display: flex;
   flex-direction: column;
@@ -828,57 +835,6 @@
   }
 }
 
-/*
- * 改密码弹窗。
- *
- * 刻意和登录/注册用同一套模态（同一组类名、同一套遮罩），
- * 而不是另发明一种弹窗 —— 同一个页面上两种弹窗样式会显得很业余。
- */
-.chat__modal {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 1rem;
-  background: rgba(0, 0, 0, 0.45);
-}
-
-.chat__modal[hidden] {
-  display: none;
-}
-
-.chat__modal-box {
-  width: min(22rem, 100%);
-  padding: 1.1rem 1.15rem;
-  border-radius: var(--radius, 8px);
-  background: var(--background, #fff);
-  border: 1px solid var(--border, #e5e7eb);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
-}
-
-@media (prefers-color-scheme: dark) {
-  .chat__modal-box {
-    background: var(--background, #1f2937);
-    border-color: var(--border, #374151);
-  }
-}
-
-.chat__modal-title {
-  margin: 0 0 0.8rem;
-  font-size: 1rem;
-  font-weight: 600;
-  color: var(--primary, #111827);
-}
-
-.chat__modal-actions {
-  display: flex;
-  gap: 0.5rem;
-  justify-content: flex-end;
-  margin-top: 0.9rem;
-}
-
 /* 状态栏里那个改密码的小图标按钮，和「退出」并排但视觉上更轻 */
 .chat__icon-button {
   appearance: none;
@@ -899,5 +855,89 @@
 @media (prefers-color-scheme: dark) {
   .chat__icon-button:hover {
     background: rgba(255, 255, 255, 0.08);
+  }
+}
+
+/*
+ * 破坏性操作的两段式确认。
+ *
+ * 第一次点按钮，只在旁边亮出「确认删除？」；5 秒内再点一次才真执行。
+ * 不做「点一下就删」是因为这两个操作都不可逆；也不做 window.confirm，
+ * 因为原生弹窗没法把提示放在按钮旁边（视线要来回挪），
+ * 而且样式和站点其余部分不一致。
+ */
+.chat__confirm-label {
+  font-size: 0.78em;
+  color: #b91c1c;
+  white-space: nowrap;
+  /* 不写 margin-right：它紧贴左边的按钮（注销）或右边的按钮（清空），
+     插入位置已经决定了贴哪一边。 */
+}
+
+.chat__confirm-label--right {
+  color: #b91c1c;
+}
+
+/* 5 秒到了：文字换成「已取消」再淡出，而不是直接消失 ——
+   直接消失会让人以为是自己点错了。 */
+.chat__confirm-label.is-expired {
+  color: var(--secondary, #6b7280);
+  opacity: 0.7;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__confirm-label,
+  .chat__confirm-label--right {
+    color: #f87171;
+  }
+}
+
+/*
+ * 禁言时长选项：点喇叭后**在这一行里**展开的一排小按钮，紧贴喇叭右边。
+ *
+ * 曾经写成 `position: absolute`（想的是「别把这一行撑宽」），结果是什么都看不见：
+ * `.chat__member-actions` 没有 position，绝对定位于是往上找定位祖先，
+ * 菜单飘到成员面板外面去了，和它要操作的那一行彻底脱节。
+ * 修法不是补一个 `position: relative` —— 那就成了浮层，
+ * 而是让它老实待在行内：喇叭旁边多一小排按钮，看得见也点得到。
+ */
+.chat__mute-menu {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex: none;
+  padding: 0.12rem;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  background: var(--background, #fff);
+  white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__mute-menu {
+    background: var(--background, #1f2937);
+    border-color: var(--border, #374151);
+  }
+}
+
+.chat__mute-option {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.78em;
+  border-radius: 4px;
+  color: var(--content, #374151);
+  cursor: pointer;
+}
+
+.chat__mute-option:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--primary, #111827);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat__mute-option:hover {
+    background: rgba(255, 255, 255, 0.1);
   }
 }

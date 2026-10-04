@@ -905,6 +905,35 @@ section('管理员：禁言与注销')
     const speak2 = await request('/api/messages', { method: 'POST', jar: targetJar, body: { body: '解除后发言', room: 'modprobe' } })
     check('解除后能发消息（201）', speak2.status === 201, `实际 ${speak2.status}`)
 
+    // ③b 请求体残缺必须 400，**不能**被当成「解除禁言」。
+    //
+    // 起因是前端一个 P0：`body: { minutes: n }` 被 fetch 变成 "[object Object]"，
+    // 而后端 `body?.minutes ?? null` 把「字段缺失」和「显式 null」合并成同一个值，
+    // 于是残缺请求返回 200 且真的解除了禁言 —— 管理员看到「已解除禁言」
+    // 还以为自己点对了。这类「用错也返回成功」的接口最难查，所以单独盯住。
+    const reMute = await request(`/api/users/${targetProfile.id}/mute`, {
+      method: 'POST', jar: adminJar, body: { minutes: 60 },
+    })
+    check('重新禁言成功（后面用来验证 400 不改状态）', reMute.status === 200, `实际 ${reMute.status}`)
+
+    const noField = await request(`/api/users/${targetProfile.id}/mute`, {
+      method: 'POST', jar: adminJar, body: {},
+    })
+    check('缺 minutes 字段要 400', noField.status === 400, `实际 ${noField.status}`)
+
+    const nullBody = await request(`/api/users/${targetProfile.id}/mute`, {
+      method: 'POST', jar: adminJar, body: null,
+    })
+    check('body 是 JSON null 要 400', nullBody.status === 400, `实际 ${nullBody.status}`)
+
+    const afterBad = await (await request('/api/members', { jar: adminJar })).json()
+    const targetRow = (afterBad.members ?? []).find((m) => m.username === targetName)
+    check(
+      '被拒的请求没有偷改禁言状态',
+      targetRow !== undefined && targetRow.muted === true,
+      `实际 muted=${targetRow && targetRow.muted}`,
+    )
+
     // ④ 不能对自己操作
     const adminProfile = await (await request('/api/me', { jar: adminJar })).json()
     const selfMute = await request(`/api/users/${adminProfile.id}/mute`, { method: 'POST', jar: adminJar, body: { minutes: 10 } })
@@ -936,6 +965,69 @@ section('管理员：禁言与注销')
     check('消息本身被保留（注销不该删别人的发言）', stillThere.length > 0, `实际 ${stillThere.length}`)
     check('作者名改成了「已注销」', stillThere.every((m) => m.username === '已注销'), `实际 ${stillThere.map((m) => m.username).join(',')}`)
   }
+}
+
+/*
+ * 会话被吊销之后，WebSocket **开不出新连接**。
+ *
+ * 这是「改密码 / 注销账号要真的把人踢下线」这件事的服务端那一半。
+ * 前端只会在自己收到 401 时才关掉 socket，而别人那条连接不会主动配合；
+ * 所以判据必须落在 DO 的握手上：他名下的 user_sessions 被清空之后，
+ * 那把**还没过期**的 access token 也开不出新连接。
+ *
+ * 为什么这段单独放最后、用全新账号：它会把受害者的会话全部吊销，
+ * 掺进别的 section 会让那些用例依赖「谁先跑」。
+ */
+section('会话吊销后 WebSocket 开不出来')
+{
+  const victimName = `ws${Date.now().toString(36).slice(-5)}`
+  const victimPass = 'ws-revoke-password-1'
+  await request('/auth/register', { method: 'POST', body: { username: victimName, password: victimPass } })
+  const victimLogin = await request('/auth/login', {
+    method: 'POST',
+    body: { username: victimName, password: victimPass },
+  })
+  const victimJar = jarFrom(victimLogin)
+
+  // 先证明「正常情况下连得上」。少了这一步，下面那条断言可能只是因为
+  // 这个房间/这个账号本来就连不上 —— 那种测试比没有更糟。
+  const before = openSocket({ jar: victimJar, room: 'wsrevoke' })
+  let beforeStatus = 'connected'
+  try {
+    await before.opened
+  } catch (error) {
+    beforeStatus = error.message
+  }
+  before.socket.terminate()
+  check('吊销之前连得上（否则下一条断言没有意义）', beforeStatus === 'connected', `实际 ${beforeStatus}`)
+
+  // 改密码 = 清空他名下的全部会话
+  const revoked = await request('/api/me/password', {
+    method: 'POST',
+    jar: victimJar,
+    body: { currentPassword: victimPass, newPassword: 'ws-revoke-password-2' },
+  })
+  check('用它自己的令牌改密码成功', revoked.status === 200, `实际 ${revoked.status}`)
+
+  /*
+   * 关键点：那把 access token **仍然在有效期内**（30 分钟），只是它背后的会话没了。
+   * 老代码只验「签名对不对 + 用户行在不在」，所以这里能连上 ——
+   * 改完密码，攻击者照样能重连进房间继续读，“改密码”也就白改了。
+   * 新代码在握手时多问一句「这个人还有活着的会话吗」，于是拒掉。
+   */
+  const after = openSocket({ jar: victimJar, room: 'wsrevoke' })
+  let afterStatus = 'connected'
+  try {
+    await after.opened
+  } catch (error) {
+    afterStatus = error.message
+  }
+  after.socket.terminate()
+  check(
+    '会话被吊销后，旧令牌开不出新 WebSocket（401）',
+    afterStatus === 'HTTP 401',
+    `实际 ${afterStatus}`,
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)

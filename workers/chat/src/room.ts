@@ -14,7 +14,7 @@
 
 import { verify } from '@nanokajs/auth'
 
-import { ACCESS_TOKEN_COOKIE, DEFAULT_ROOM } from './config'
+import { ACCESS_TOKEN_COOKIE, ACCESS_TOKEN_TTL_SECONDS, DEFAULT_ROOM } from './config'
 import type { Env } from './env'
 import { readAccessToken } from './origins'
 import type { BroadcastRequest, ChatServerEvent, SocketAttachment } from './types'
@@ -43,6 +43,9 @@ export class ChatRoom implements DurableObject {
    * 多写一行 D1，不会写错也不会漏写。用 storage 持久化反而多一次写。
    */
   private readonly lastSeenWrites = new Map<string, number>()
+
+  /** 已经处理过离场的连接，用来挡「error 和 close 各播一次 leave」。见 handleDeparture。 */
+  private readonly departed = new WeakSet<WebSocket>()
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -106,9 +109,12 @@ export class ChatRoom implements DurableObject {
     const token = readAccessToken(request, ACCESS_TOKEN_COOKIE)
     if (token === undefined) return unauthorized('Missing token')
 
-    let payload: { sub?: unknown; type?: unknown }
+    let payload: { sub?: unknown; type?: unknown; exp?: unknown }
     try {
-      payload = await verify<{ sub?: unknown; type?: unknown }>(token, this.env.AUTH_SECRET)
+      payload = await verify<{ sub?: unknown; type?: unknown; exp?: unknown }>(
+        token,
+        this.env.AUTH_SECRET,
+      )
     } catch {
       return unauthorized('Invalid token')
     }
@@ -116,12 +122,39 @@ export class ChatRoom implements DurableObject {
       return unauthorized('Invalid token')
     }
 
-    const user = await this.env.DB.prepare('SELECT username FROM users WHERE id = ?1')
-      .bind(payload.sub)
-      .first<{ username: string }>()
-    if (user === null) return unauthorized('Unknown user')
+    const nowSeconds = Math.floor(Date.now() / 1000)
 
-    const attachment: SocketAttachment = { userId: payload.sub, username: user.username }
+    /*
+     * 令牌的到期时间就是这条连接的寿命上限，所以要带走（见 SocketAttachment.exp）。
+     *
+     * 取不到 exp 时退回「从现在起 ACCESS_TOKEN_TTL_SECONDS」，**不是**直接拒绝：
+     * 宁可给一个偏宽的期限，也不能因为一个字段没读到就让整个聊天室连不上。
+     */
+    const exp = typeof payload.exp === 'number' ? payload.exp : nowSeconds + ACCESS_TOKEN_TTL_SECONDS
+    if (exp <= nowSeconds) return unauthorized('Token expired')
+
+    /*
+     * 一次查询同时回答两个问题：这个人还在不在、他名下的会话还有没有活的。
+     *
+     * 「还有没有活的会话」等价于「他是否仍然处于登录状态」。改密码会清空
+     * 他在 `user_sessions` 里的全部行（`revokeAllSessions`），注销账号也会 ——
+     * 于是这里判成 false，那把旧 access token 在过期之前**开不出新连接**。
+     * 少了这一条，改密码之后 30 分钟内照样能拿旧令牌重连，等于没改。
+     *
+     * 合成一条 SQL 而不是两条：D1 按查询次数计费，免费套餐单次调用又只有
+     * 50 次查询的预算，能省就省。
+     */
+    const row = await this.env.DB.prepare(
+      `SELECT u.username AS username,
+              EXISTS (SELECT 1 FROM user_sessions WHERE userId = u.id AND expiresAt >= ?2) AS live
+       FROM users AS u WHERE u.id = ?1`,
+    )
+      .bind(payload.sub, nowSeconds)
+      .first<{ username: string; live: number }>()
+    if (row === null) return unauthorized('Unknown user')
+    if (row.live !== 1) return unauthorized('Session revoked')
+
+    const attachment: SocketAttachment = { userId: payload.sub, username: row.username, exp }
 
     const pair = new WebSocketPair()
     const server = pair[1]
@@ -138,36 +171,79 @@ export class ChatRoom implements DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] })
   }
 
-  async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  async webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
     // 心跳的 "ping" 已经被 setWebSocketAutoResponse 拦掉了，根本走不到这里。
     // 剩下的是客户端发来的其它内容：这个聊天室是「只推不收」的，
     // 消息一律由 POST /api/messages 进来（那边才有校验和落库），所以这里什么都不做。
     // 仍然实现它，是为了让运行时有明确的处理器可调，而不是走未定义分支。
+    //
+    // 唯一做的事是「顺手验一下这张凭证还活着吗」——见 SocketAttachment.exp。
+    this.evictIfExpired(ws)
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    const attachment = ws.deserializeAttachment() as SocketAttachment | null
     try {
       // 客户端发起的关闭要由服务端回一个 close 才算完成握手；不回的话连接可能悬着。
       ws.close(code, reason)
     } catch {
       // 已经关了，无所谓。
     }
-    if (attachment !== null) {
-      this.publishPresence('leave', attachment.username)
-      this.markOffline(attachment.userId)
-    }
+    this.handleDeparture(ws)
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error('chatroom websocket error', error)
+    // 异常断开同样要记：用户掉线时往往就是这个路径，
+    // 只在 webSocketClose 里写的话，拔网线/杀进程的人会永远停在「在线」。
+    this.handleDeparture(ws)
+  }
+
+  /**
+   * 一条连接离开时统一走这里。
+   *
+   * ## 为什么要去重
+   *
+   * 同一条连接**可能先后触发两个回调**：异常断开时运行时既叫 `webSocketError`
+   * 又叫 `webSocketClose`。于是「leave」会被广播两次 ——
+   * 房间里其他人看到的是同一个人连着退出两回。
+   * `markOffline` 有节流挡着、不会重复写库，但广播是每次都发的，挡不住。
+   *
+   * 用 WeakSet 按连接对象去重、**不持久化**：DO 被驱逐后集合清空，
+   * 最坏结果只是多播一次 leave，不影响正确性；用 storage 持久化反而多一次写。
+   */
+  private handleDeparture(ws: WebSocket): void {
+    if (this.departed.has(ws)) return
+    this.departed.add(ws)
+
     const attachment = ws.deserializeAttachment() as SocketAttachment | null
-    if (attachment !== null) {
-      this.publishPresence('leave', attachment.username)
-      // 异常断开同样要记：用户掉线时往往就是这个路径，
-      // 只在 webSocketClose 里写的话，拔网线/杀进程的人会永远停在「在线」。
-      this.markOffline(attachment.userId)
+    if (attachment === null) return
+    this.publishPresence('leave', attachment.username)
+    this.markOffline(attachment.userId)
+  }
+
+  /**
+   * 这张凭证已经过期的话，把连接关掉。
+   *
+   * 返回 true 表示「已经关掉了，别再往它发东西」。
+   * 老代码不查这个，于是被注销/改过密码的账号只要不刷新页面就一直在接收消息。
+   *
+   * attachment 里没有 exp（比如是本改动之前建的老连接）时**不关** ——
+   * `undefined <= number` 恒为 false，这里用 typeof 把意图显式写出来，
+   * 免得下一个人以为少写了一个判断。
+   */
+  private evictIfExpired(ws: WebSocket): boolean {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | null
+    if (attachment === null || typeof attachment.exp !== 'number') return false
+    if (attachment.exp > Math.floor(Date.now() / 1000)) return false
+
+    try {
+      // 4401 是个自定义码，语义是「你的凭证没了」。前端重连前本来就会先刷新一次
+      // 令牌，所以给什么码都不影响它走对路；给个可辨认的码只是让日志对得上。
+      ws.close(4401, 'session expired')
+    } catch {
+      // 已经关了
     }
+    return true
   }
 
   /**
@@ -242,9 +318,19 @@ export class ChatRoom implements DurableObject {
     return this.onlineUserIds().length
   }
 
+  /**
+   * 把事件推给房间里所有**凭证还有效**的连接。
+   *
+   * 推之前先踢掉过期的：这一步就是「人已经被注销了，内容却还在往外流」的解药。
+   * 放在广播路径上而不是开个 alarm 定时扫，是因为
+   * **没有广播的时候也就没有内容可漏**，而广播一来 DO 必然醒着 ——
+   * 等于零额外唤醒、零额外查询。代价是过期连接在被关掉之前最多
+   * 多活「到下一条消息为止」，而这段时间里房间里本来就没有新内容。
+   */
   private publish(event: ChatServerEvent): void {
     const data = JSON.stringify(event)
     for (const ws of this.ctx.getWebSockets()) {
+      if (this.evictIfExpired(ws)) continue
       try {
         ws.send(data)
       } catch {

@@ -124,7 +124,20 @@ export function registerModerationRoutes({ app, User, Message, UserPurge, auth }
     if (target === null) return c.json({ error: '用户不存在' }, 404)
 
     const body = (await c.req.json().catch(() => null)) as { minutes?: unknown } | null
-    const parsed = muteSchema.safeParse({ minutes: body?.minutes ?? null })
+
+    // 必须区分「没传 minutes」和「minutes 显式是 null」：
+    //   `{ minutes: null }` = 解除禁言，这是正当请求；
+    //   `{}` 或压根不是对象 = 请求体残缺，是调用方的 bug，要 400。
+    //
+    // 旧写法 `body?.minutes ?? null` 把这两种情况**合并成同一个值**，
+    // 于是一个前端 bug（body 变成 "[object Object]"）会静默地解除禁言，
+    // 而且返回 200 —— 管理员看到「已解除禁言」还以为自己点对了。
+    // 这类「用错也返回成功」的接口最难查，宁可 400。
+    if (body === null || typeof body !== 'object' || !('minutes' in body)) {
+      return c.json({ error: '禁言时长不合法：缺少 minutes 字段' }, 400)
+    }
+
+    const parsed = muteSchema.safeParse({ minutes: body.minutes })
     if (!parsed.success) {
       return c.json({ error: '禁言时长不合法' }, 400)
     }

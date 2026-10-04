@@ -103,13 +103,36 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
         // key 里带 uuid，内容永不改变，所以可以放心长缓存
         cacheControl: 'public, max-age=31536000, immutable',
       },
-      // uploader 用来判断「这个对象是不是这条消息的作者传的」，防止误删别人的文件；
-      // day 用来在撤回时把额度退回到正确的那一天
-      customMetadata: { filename, uploader: user.username, day },
+      /*
+       * uploaderId / uploader 用来判断「这个对象是不是这条消息的作者传的」，
+       * 防止有人在消息里写上别人的图片 URL 再撤回，把别人的文件删了。
+       *
+       * 两个都存，但**判断以 uploaderId 为准**（撤回那边先读它）。
+       * 用户名可复用：账号被注销后那行 users 就没了，别人能注册同名账号 ——
+       * 只按用户名比对会让他有权删掉前任的文件。userId 不复用，没这个问题。
+       * `uploader` 保留是为了能读懂老对象、也方便人肉排查。
+       *
+       * day 用来在撤回时把额度退回到**上传的那一天**，不能退到今天。
+       */
+      customMetadata: { filename, uploaderId: user.id, uploader: user.username, day },
     })
 
     // 存进 R2 之后才记账 —— 反过来会让失败的上传也吃掉用户额度
-    await markUpload(c.env.DB, sub, buffer.byteLength)
+    const marked = await markUpload(c.env.DB, sub, buffer.byteLength)
+    if (!marked) {
+      /*
+       * 走到这里说明：在我们上面「够不够」的预检之后、这笔记账之前，
+       * 额度（个人的或全站的）被别人抢完了。预检是纯读的，这种竞态挡不住。
+       *
+       * 刚传上去的对象必须删掉 —— 它没有被任何消息引用，留着就是一个
+       * 白占 R2 的孤儿，而且那条 URL 是公开可访问的（内容其实还在）。
+       * 删失败也不改结论：这次上传本来就不该成功。
+       */
+      await c.env.MEDIA.delete(key).catch((error: unknown) => {
+        console.error('额度被抢占后删除对象失败', { key, error })
+      })
+      return c.json({ error: '今天的上传额度刚刚被用完了，明天再来吧' }, 429)
+    }
 
     return c.json(
       {

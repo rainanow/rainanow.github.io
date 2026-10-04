@@ -122,34 +122,6 @@
     直接塞在状态栏里：那个位置宽度只够一个输入框，而这里需要三个。
     复用同一套视觉，而不是另发明一种弹窗。
   */ -}}
-  <div class="chat__modal" data-chat-password-modal hidden>
-    <div class="chat__modal-box" role="dialog" aria-modal="true" aria-labelledby="chat-password-title">
-      <h2 class="chat__modal-title" id="chat-password-title">修改密码</h2>
-      <form class="chat__form" data-chat-password-form>
-        <label class="chat__field">
-          当前密码
-          <input type="password" name="currentPassword" data-chat-password-current
-                 autocomplete="current-password" maxlength="128" required>
-        </label>
-        <label class="chat__field">
-          新密码
-          <input type="password" name="newPassword" data-chat-password-new
-                 autocomplete="new-password" minlength="8" maxlength="128" required>
-        </label>
-        <label class="chat__field">
-          确认新密码
-          <input type="password" name="confirmPassword" data-chat-password-confirm
-                 autocomplete="new-password" minlength="8" maxlength="128" required>
-        </label>
-        <p class="chat__hint" data-chat-password-hint></p>
-        <div class="chat__modal-actions">
-          <button type="button" class="chat__button chat__button--ghost" data-chat-password-cancel>取消</button>
-          <button type="submit" class="chat__button chat__button--primary">确认修改</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
   <p class="chat__notice" data-chat-notice hidden></p>
 
   {{- /*
@@ -194,8 +166,17 @@
   {{- /* 未登录：登录 / 注册 */ -}}
   <section class="chat__auth" data-chat-auth hidden>
     <div class="chat__tabs" role="tablist">
-      <button type="button" class="chat__tab is-active" data-chat-mode="login" role="tab">登录</button>
-      <button type="button" class="chat__tab" data-chat-mode="register" role="tab">注册</button>
+      <button type="button" class="chat__tab is-active" data-chat-mode="login" role="tab" data-chat-login-tab>登录</button>
+      <button type="button" class="chat__tab" data-chat-mode="register" role="tab" data-chat-register-tab>注册</button>
+      {{- /*
+        改密码是第三个 tab，不是二级弹窗。
+        刻意复用这一块而不是另开浮层：同一个位置、同一套 .chat__form 样式、
+        同一个提示区，视觉上完全一致，也省掉一整套 modal 的 CSS 与焦点管理。
+        可见性由 JS 按登录状态控制：
+          - 未登录 → 「登录 / 注册」两个 tab（改了也没用，改不了别人的号）；
+          - 已登录 → 只留「修改密码」（对着已登录身份摆一个登录表单只会让人困惑）。
+      */ -}}
+      <button type="button" class="chat__tab" data-chat-mode="password" role="tab" data-chat-password-tab hidden>修改密码</button>
     </div>
 
     <form class="chat__form" data-chat-form>
@@ -212,7 +193,40 @@
       <button type="submit" class="chat__button chat__button--primary" data-chat-submit>登录</button>
     </form>
 
+    {{- /*
+      改密码表单。**字段与原先的二级界面完全一致**（当前密码 / 新密码 / 确认新密码），
+      只是换了个位置。「确认新密码」是必要的：后端只收 newPassword，
+      两边不一致时前端要挡住 —— 否则用户改完才发现打错一位，前功尽弃。
+    */ -}}
+    <form class="chat__form" data-chat-password-form hidden>
+      <label class="chat__field">
+        当前密码
+        <input type="password" name="currentPassword" data-chat-password-current
+               autocomplete="current-password" maxlength="128" required>
+      </label>
+      <label class="chat__field">
+        新密码
+        <input type="password" name="newPassword" data-chat-password-new
+               autocomplete="new-password" minlength="8" maxlength="128" required>
+      </label>
+      <label class="chat__field">
+        确认新密码
+        <input type="password" name="confirmPassword" data-chat-password-confirm
+               autocomplete="new-password" minlength="8" maxlength="128" required>
+      </label>
+      {{- /*
+        「取消」和「确认修改」并排，取消在左。
+        取消是必需的：这个面板一打开就把聊天区收了起来（它和「登录/注册」
+        共用同一块地方），没有出口的话，用户点错一下就只能靠改密码才能出来。
+      */ -}}
+      <div class="chat__form-row">
+        <button type="button" class="chat__button" data-chat-password-cancel>取消</button>
+        <button type="submit" class="chat__button chat__button--primary">确认修改</button>
+      </div>
+    </form>
+
     <p class="chat__hint" data-chat-hint></p>
+    <p class="chat__hint" data-chat-password-hint hidden></p>
   </section>
 
   {{- /* 已登录：消息列表 + 输入框 */ -}}

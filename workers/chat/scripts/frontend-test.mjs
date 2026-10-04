@@ -65,6 +65,13 @@ console.log(`前端测试：页面 ${PAGE_PATH} → 后端 ${WORKER}`)
 
 const html = readFileSync(new URL(PAGE_PATH, import.meta.url), 'utf8')
 const chatJs = readFileSync(new URL('../../../assets/js/chat.js', import.meta.url), 'utf8')
+// 样式表也读一份，用来断言「没有浮层」这类只能从 CSS 上看出来的事。
+// 先剥掉注释：这些注释里**写着** position: absolute / window.confirm 之类的
+// 反面教材，不剥就会命中注释，得到一条永远为假的断言。
+const chatCss = readFileSync(new URL('../../../assets/css/extended/chat.css', import.meta.url), 'utf8').replace(
+  /\/\*[\s\S]*?\*\//g,
+  '',
+)
 
 const dom = new JSDOM(html, {
   url: 'https://yulo.top/chat/',
@@ -156,6 +163,27 @@ const $ = (selector) => document.querySelector(selector)
 const visible = (selector) => {
   const node = $(selector)
   return node !== null && !node.hidden
+}
+
+/*
+ * 和 visible() 是两个东西，不能混用：
+ *
+ *   visible()     只看元素**自己**的 hidden；
+ *   visibleDeep() 还会一路往上看祖先节点。
+ *
+ * 需要两个是因为这两种情况都真实存在：
+ *   - 用户名框自己没 hidden，是父 <form> 藏的（要用 visible() 的反面去判断）；
+ *   - 改密码表单自己也没 hidden，是外层 <section data-chat-auth> 藏的。
+ * 用错的那个就会写出「永远为真」的断言 —— 改密码按钮「点了没反应」
+ * 这个 bug 就是从这来的：`!passwordForm.hidden` 全绿，屏幕上却什么都没有。
+ */
+const visibleDeep = (selector) => {
+  const node = $(selector)
+  if (node === null) return false
+  for (let el = node; el !== null; el = el.parentElement) {
+    if (el.hidden === true) return false
+  }
+  return true
 }
 
 function submitForm(selector) {
@@ -525,8 +553,12 @@ try {
       '[data-chat-password-current]': 1,
       '[data-chat-password-new]': 1,
       '[data-chat-password-confirm]': 1,
-      '[data-chat-password-modal]': 1,
       '[data-chat-password-form]': 1,
+      '[data-chat-password-tab]': 1,
+      '[data-chat-password-cancel]': 1,
+      '[data-chat-login-tab]': 1,
+      '[data-chat-register-tab]': 1,
+      '[data-chat-auth]': 1,
     }
     for (const [selector, want] of Object.entries(expected)) {
       const got = document.querySelectorAll(selector).length
@@ -546,9 +578,28 @@ try {
   // --- 成员名单的次要信息与管理按钮 ---
   section('成员名单：上次在线与管理员按钮')
   {
-    // 「上次在线」只给离线的人显示，在线的人那个位置是空的
-    const rows = [...document.querySelectorAll('.chat__member')]
+    /*
+     * 占位行（「（暂无）」）不是成员，必须排掉。
+     *
+     * 它的 class 是 `chat__member chat__member--none`：没有 .chat__member-name、
+     * 没有 .chat__member-seen，而且**不带 is-online** —— 混进 rows 里就会：
+     *   ① 让「每行都有名字元素」判红；
+     *   ② 被算成一个「离线成员」，再让「离线的人都显示了上次在线时间」判红。
+     * 触发条件很隐蔽：某个分组恰好是空的、只剩占位行时才会露头
+     * （smoke 跑完会把账号删掉一批，之后接着跑这个测试就撞上了）。
+     * 属于「测试依赖上一轮留下的状态」那一类，修法是让断言只看真正的成员行。
+     */
+    const rows = [...document.querySelectorAll('.chat__member')].filter(
+      (row) => !row.classList.contains('chat__member--none'),
+    )
+    check(
+      '取到了真实的成员行（不是只剩占位行）',
+      rows.length > 0,
+      '一行真实成员都没有，下面几条断言就是空的，测不出东西',
+    )
     check('成员行里有名字元素', rows.every((r) => r.querySelector('.chat__member-name') !== null))
+
+    // 「上次在线」只给离线的人显示，在线的人那个位置是空的
     const offlineRows = rows.filter((r) => !r.classList.contains('is-online'))
     check(
       '离线成员显示了上次在线时间',
@@ -571,18 +622,54 @@ try {
     check('自己的那一行没有管理按钮', meRow !== undefined && meRow.querySelector('.chat__member-action') === null)
   }
 
-  // --- 改密码弹窗 ---
-  section('改密码弹窗')
+  // --- 改密码是第三个 tab，不是二级界面 ---
+  section('修改密码并入登录/注册面板')
   {
     check('登录后改密码按钮可见', visible('[data-chat-password-button]'))
-    check('弹窗默认是关着的', $('[data-chat-password-modal]').hidden === true)
+    check('面板里有三个 tab', document.querySelectorAll('.chat__tab').length === 3, `实际 ${document.querySelectorAll('.chat__tab').length} 个`)
+    check('第三个 tab 是「修改密码」', ($('[data-chat-password-tab]')?.textContent ?? '') === '修改密码')
+    check('登录后「修改密码」tab 可见', visible('[data-chat-password-tab]'))
+
+    // 起点：登录/注册表单在，改密码表单藏着
+    check('默认显示登录/注册表单', visible('[data-chat-form]'))
+    check('默认隐藏改密码表单', $('[data-chat-password-form]').hidden === true)
 
     $('[data-chat-password-button]').dispatchEvent(new window.Event('click', { bubbles: true }))
-    check('点笔图标打开弹窗', visible('[data-chat-password-modal]'))
-    check('弹窗里有三个输入框（当前密码 / 新密码 / 确认）',
-      $('[data-chat-password-current]') !== null &&
-      $('[data-chat-password-new]') !== null &&
-      $('[data-chat-password-confirm]') !== null)
+    check('点笔图标切到「修改密码」', visible('[data-chat-password-form]'))
+    check('此时登录/注册表单收起', $('[data-chat-form]').hidden === true)
+    check('第三个 tab 高亮', $('[data-chat-password-tab]').classList.contains('is-active'))
+
+    /*
+     * **关键：祖先也要一起看。**
+     *
+     * 这里踩过一次（用户报「修改密码的按钮点了没反应」）：
+     * 改成「改密码并入登录/注册面板」之后，表单确实切过去了、
+     * `passwordForm.hidden` 也是 false —— 但整个
+     * `<section data-chat-auth>` 被 enterRoom() 藏起来了，
+     * 屏幕上什么都没出现。而原来的断言写的是 `!passwordForm.hidden`，
+     * 只看元素**自己**，于是测试全绿、bug 照样上线。
+     *
+     * 所以这一条必须用 visibleDeep（连祖先一起查）。
+     * 顺带把「面板打开时聊天区被收起」也钉住 —— 那是同一个视图切换的另一半。
+     */
+    check('改密码面板真的露出来了（祖先也不藏）', visibleDeep('[data-chat-password-form]'))
+    check('打开改密码时收起了聊天区', $('[data-chat-room]').hidden === true)
+    check('已登录时「登录」tab 收起（避免进去出不来）', $('[data-chat-login-tab]').hidden === true)
+    check('已登录时「注册」tab 收起', $('[data-chat-register-tab]').hidden === true)
+
+    /*
+     * 改密码模式下登录/注册表单整体收起，所以用户名框自然也不可见。
+     * 刻意不删掉那个 input：删了会让「切回登录时用户名是空的」这个行为变得难以验证。
+     * 这里正好用 visibleDeep —— 用户名框自己没 hidden，是父 form 藏的，
+     * 只有连祖先一起查才问得出「它到底看不看得见」。
+     */
+    check('改密码模式下看不到用户名输入框', visibleDeep('[data-chat-username]') === false)
+
+    // 字段与原来的二级界面一致
+    check('改密码表单有当前密码', $('[data-chat-password-current]') !== null)
+    check('改密码表单有新密码', $('[data-chat-password-new]') !== null)
+    check('改密码表单有确认新密码', $('[data-chat-password-confirm]') !== null)
+    check('改密码表单有取消按钮', $('[data-chat-password-cancel]') !== null)
 
     // 两次不一致要挡在提交之前
     $('[data-chat-password-current]').value = 'old-password-x'
@@ -593,9 +680,246 @@ try {
       ($('[data-chat-password-hint]')?.textContent ?? '').includes('不一致'), 5000)
     check('两次新密码不一致时提示且不提交', ($('[data-chat-password-hint]')?.textContent ?? '').includes('不一致'))
 
-    // 取消能关掉
+    /*
+     * 取消：回到聊天区。
+     *
+     * 没有「取消」的话这个面板就是个单向门 —— 它一打开就把聊天区收起来，
+     * 用户点错一下就只能靠改密码才能出来。
+     */
     $('[data-chat-password-cancel]').dispatchEvent(new window.Event('click', { bubbles: true }))
-    check('取消能关掉弹窗', $('[data-chat-password-modal]').hidden === true)
+    check('点取消回到聊天区', visible('[data-chat-room]'))
+    check('点取消收起整个 auth 面板', $('[data-chat-auth]').hidden === true)
+    check('取消后仍是登录状态（登录/注册 tab 保持收起）', $('[data-chat-login-tab]').hidden === true)
+
+    // 再打开一次：上次填的值和提示都不该留着
+    $('[data-chat-password-button]').dispatchEvent(new window.Event('click', { bubbles: true }))
+    check('重新打开时输入框是空的（上次填的没留下）', $('[data-chat-password-current]').value === '')
+    /*
+     * 不能断言提示区是空字符串 —— 这个元素一身兼两职：
+     * setMode('password') 会往里写固定的说明文案，fail() 会往里写错误。
+     * 所以「上一条错误有没有留下」要看的是 is-error 这个类，不是文本内容。
+     */
+    check(
+      '重新打开时上一次的错误提示没留下',
+      !$('[data-chat-password-hint]').className.includes('is-error'),
+      `className=${$('[data-chat-password-hint]').className}`,
+    )
+    check(
+      '重新打开时显示的是常规说明文案',
+      ($('[data-chat-password-hint]')?.textContent ?? '').includes('重新登录'),
+    )
+    $('[data-chat-password-cancel]').dispatchEvent(new window.Event('click', { bubbles: true }))
+  }
+
+  /*
+   * 请求体序列化 —— 这是「改密码按钮点了没反应」的真正原因。
+   *
+   * ## 病根
+   *
+   * fetch 的 body 只认字符串 / Blob / BufferSource / FormData /
+   * URLSearchParams / ReadableStream。给它一个普通对象**不会报错**，
+   * 而是 String() 成 `"[object Object]"`，Content-Type 还自动变成 text/plain。
+   * 后端收到一个语法合法但内容不对的 JSON，于是回「请输入当前密码」——
+   * 用户看到的就是「点了没反应」（提示离按钮很远，他不一定注意到）。
+   *
+   * 禁言那次更隐蔽：后端老代码 `body?.minutes ?? null` 把「字段缺失」和
+   * 「显式 null」合并成一个值，于是残缺请求返回 **200** 且真的把人解除了禁言。
+   *
+   * ## 为什么在这里做单元断言而不是点一遍
+   *
+   * 真的提交一次改密码需要知道当前密码、而且会改掉测试账号的密码
+   * （后面的用例还要用它登录）。改密码那条链路在 jsdom 里跑不完，
+   * 硬凑出来的测试反而测不准。
+   *
+   * 所以：**按固定标记切片**，把 chat.js 里那四个函数单独 eval 出来直接断言。
+   * 刻意不用正则去匹配函数体 —— 正则改一次措辞就静默匹配不到，
+   * 那时断言变成空转，比没有还糟（本项目已经踩过这个坑）。
+   */
+  section('请求体序列化（对象 body 不能变成 "[object Object]"）')
+  {
+    const start = chatJs.indexOf('function isPlainBody(body) {')
+    const end = chatJs.indexOf('function api(path, options, allowRetry)', start)
+    check('能从 chat.js 里切出 body 归一化那段', start !== -1 && end > start, `start=${start} end=${end}`)
+
+    if (start !== -1 && end > start) {
+      window.eval(`${chatJs.slice(start, end)}\nwindow.__normalizeBody = normalizeBody`)
+      const normalizeBody = window.__normalizeBody
+      check('切片 eval 后拿到了 normalizeBody', typeof normalizeBody === 'function')
+
+      // ① 对象 body → JSON 文本 + Content-Type
+      const objectBody = normalizeBody({ method: 'POST', body: { minutes: 60 } })
+      check(
+        '对象 body 被序列化成 JSON 文本',
+        objectBody.body === '{"minutes":60}',
+        `实际 ${JSON.stringify(objectBody.body)}`,
+      )
+      check(
+        '同时补上 Content-Type: application/json',
+        objectBody.headers?.['Content-Type'] === 'application/json',
+        `实际 ${JSON.stringify(objectBody.headers)}`,
+      )
+
+      // ② 已经是字符串的 body 不许再动（再包一层引号就成了 JSON 字符串字面量）
+      const asText = normalizeBody({ body: '{"a":1}', headers: { 'content-type': 'application/json' } })
+      check('字符串 body 原样不动', asText.body === '{"a":1}', `实际 ${JSON.stringify(asText.body)}`)
+      check(
+        '已有 content-type（小写）时不重复加一个',
+        Object.keys(asText.headers).length === 1,
+        `实际 ${JSON.stringify(asText.headers)}`,
+      )
+
+      // ③ 已有 Content-Type 的，只序列化、不覆盖它
+      const explicit = normalizeBody({ body: { n: 1 }, headers: { 'Content-Type': 'application/json; charset=utf-8' } })
+      check(
+        '已有 Content-Type 时保留原值不覆盖',
+        explicit.headers['Content-Type'] === 'application/json; charset=utf-8',
+        `实际 ${explicit.headers['Content-Type']}`,
+      )
+
+      // ④ Blob / FormData 这些 fetch 本来认识的东西必须放行，否则上传会坏
+      const blob = new window.Blob(['hello'], { type: 'image/png' })
+      const keptBlob = normalizeBody({ body: blob })
+      check('Blob body 原样放行（不被序列化）', keptBlob.body === blob)
+      check('Blob 请求不会被硬塞 JSON Content-Type', keptBlob.headers === undefined)
+      const form = new window.FormData()
+      check('FormData body 原样放行', normalizeBody({ body: form }).body === form)
+      const nullBody = normalizeBody({ body: null })
+      check('body 为 null 时什么都不做', nullBody.body === null && nullBody.headers === undefined)
+
+      // ⑤ 幂等：api() 401 重试会拿同一个 options 再进来一次
+      const twice = normalizeBody(normalizeBody({ body: { a: 1 } }))
+      check(
+        '重复调用是幂等的（重试不会二次序列化）',
+        twice.body === '{"a":1}',
+        `实际 ${JSON.stringify(twice.body)}`,
+      )
+    }
+
+    // 调用点本身也不该再把对象交给 fetch（兜底是兜底，写法要正确）
+    const codeLines = chatJs
+      .split('\n')
+      .filter((line) => !/^\s*\*/.test(line) && !/^\s*\/\//.test(line))
+      .join('\n')
+    check(
+      '代码里没有「body 直接给对象字面量」的写法',
+      !/\bbody:\s*\{/.test(codeLines),
+      '找到 body: { — fetch 会把它变成 "[object Object]"',
+    )
+  }
+
+  // --- 页面里不该有任何浮层 ---
+  section('没有浮层与原生弹窗')
+  {
+    check('页面上没有 modal 容器', document.querySelectorAll('.chat__modal').length === 0)
+    const src = chatJs
+    check('chat.js 不再引用 modal', !/chat__modal|chat__modal-box/.test(src))
+    /*
+     * 只看**实际调用**，不看注释 ——
+     * armDestructiveConfirm 的文档注释里就写着「为什么不用 window.confirm」，
+     * 直接全文匹配会永远为假。这是「grep 命中注释」这类坑的典型。
+     * 判据：行首不是 * 或 //（即不在注释里）且出现 window.xxx(。
+     */
+    const codeLines = src
+      .split('\n')
+      .filter((line) => !/^\s*\*/.test(line) && !/^\s*\/\//.test(line))
+      .join('\n')
+    check('代码里不再调 window.confirm（注释里提到不算）', !/window\.confirm\s*\(/.test(codeLines))
+    check('代码里不再调 window.prompt', !/window\.prompt\s*\(/.test(codeLines))
+    check('代码里不再调 window.alert', !/window\.alert\s*\(/.test(codeLines))
+  }
+
+  /*
+   * 破坏性操作的两段式确认 —— 这里只做**静态**断言。
+   *
+   * 为什么不在 jsdom 里真的点两下：这个测试账号是**普通用户**，
+   * 管理员专属的「清空」按钮对它压根不显示（见上面「管理员按钮」那节）。
+   * 而要拿到管理员就得直接改本地库 —— 那是 smoke 的做法（它有 withLocalDb）。
+   *
+   * 所以分工是：这里守「代码里没有 modal / 原生弹窗」这条不变量，
+   * 交互本身（点一次出提示、再点才执行、5 秒过期）交给 smoke 那节去真验。
+   * 硬要在 jsdom 里模拟只会写出一个测不准的测试。
+   */
+  section('两段式确认的代码形态')
+  {
+    const src = chatJs
+    check('代码里有两段式确认函数', /function armDestructiveConfirm/.test(src))
+    check('确认窗口是 5 秒', /CONFIRM_WINDOW_MS\s*=\s*5000/.test(src), '找不到 5000ms 的窗口常量')
+    check('确认文字是「确认删除？」', src.includes('确认删除？'))
+    check('注销的提示排在按钮左边', /armDestructiveConfirm\([\s\S]*?'left'\)/.test(src))
+    check('清空的提示排在按钮右边', /armDestructiveConfirm\([\s\S]*?'right'\)/.test(src))
+    check('到期会显示「已取消」', src.includes('已取消'))
+  }
+
+  /*
+   * 禁言时长选项必须留在成员行**里面**、贴着喇叭。
+   *
+   * 这里只做静态断言，理由和上面那节一样：这个测试账号是**普通用户**，
+   * 管理员的喇叭按钮压根不渲染（见「成员名单」那节的断言），jsdom 里点不到。
+   * 想点就得直接改本地库把自己提成 admin —— 那是 smoke 的活。
+   *
+   * 要守的两条不变量：
+   *   1. 菜单插在喇叭**后面**（insertBefore 到 button.nextSibling），不是追加到行尾；
+   *   2. CSS 里不许再出现 `position: absolute` —— 上一版就是它把菜单飘到了
+   *      `.chat__member-actions` 外面（那个容器没有 position），
+   *      点完喇叭屏幕上什么也看不见，「列表没显示在按钮旁边」就是这么来的。
+   */
+  section('禁言时长贴着喇叭展开')
+  {
+    check(
+      '菜单插在喇叭右边（insertBefore 到 nextSibling）',
+      /insertBefore\(menu, button\.nextSibling\)/.test(chatJs),
+      '不能用 appendChild：那会把菜单甩到整行末尾，和喇叭脱节',
+    )
+    const start = chatCss.indexOf('.chat__mute-menu {')
+    const end = chatCss.indexOf('.chat__mute-option {')
+    const rule = start === -1 || end === -1 ? '' : chatCss.slice(start, end)
+    check('找得到 .chat__mute-menu 规则', rule !== '', 'CSS 里没有这条规则，下面的断言会全部失真')
+    check(
+      '禁言菜单不再绝对定位（不飘出成员行）',
+      !/position:\s*absolute/.test(rule),
+      '绝对定位时它的定位祖先不是成员行，会跑到面板外面去',
+    )
+    check('禁言菜单是行内布局', /display:\s*inline-flex/.test(rule))
+    check('禁言菜单不会被压扁', /flex:\s*none/.test(rule))
+  }
+
+  /*
+   * 本地预览防呆：页面在 localhost、API 却指向远端时，必须在发请求之前就喊出来。
+   *
+   * 这条用**另一个 jsdom**跑真代码，而不是只做静态断言：
+   * url 设成 http://localhost:1313/chat/，chat.js 一个字都不改
+   * （data-api 仍是构建产物里的 https://api.yulo.top）。
+   * 防呆命中时 boot() 在 loadMe() 之前就返回，所以这里不会产生任何网络请求 ——
+   * 正是要验证的那个「别去请求，先把原因说清楚」。
+   */
+  section('本地预览防呆')
+  {
+    check('有本地预览自检函数', /function checkLocalPreviewTarget/.test(chatJs))
+    check(
+      '自检排在 loadMe() 之前',
+      /if \(checkLocalPreviewTarget\(\)\) return[\s\S]{0,200}?loadMe\(\)/.test(chatJs),
+      '自检必须挡在 loadMe() 前面，否则真正的配置错误会被 401 盖成「登录状态没拿到」',
+    )
+
+    const localDom = new JSDOM(html, {
+      url: 'http://localhost:1313/chat/',
+      runScripts: 'outside-only',
+      pretendToBeVisual: true,
+    })
+    localDom.window.eval(chatJs)
+    const banner = localDom.window.document.querySelector('[data-chat-notice]')
+    const text = banner === null ? '' : banner.textContent
+    check(
+      '本地页面指向远端 API 时当场报配置错误',
+      text.includes('HUGO_PARAMS_CHAT_APIBASE'),
+      text === '' ? '提示区是空的，防呆没生效' : `实际提示：${text}`,
+    )
+    check(
+      '提示里写明了当前错误的 API 地址',
+      text.includes('https://api.yulo.top'),
+      `实际提示：${text}`,
+    )
+    localDom.window.close()
   }
 
   /*
@@ -679,6 +1003,11 @@ try {
   check('退出后回到登录面板', visible('[data-chat-auth]'))
   check('退出后隐藏聊天区', !visible('[data-chat-room]'))
   check('退出后清空了消息列表', document.querySelectorAll('.chat__message').length === 0)
+  // 未登录了，「登录 / 注册」两个 tab 必须还回来 ——
+  // 它们在已登录时被改密码面板收起来了，只有 showAuth() 会恢复。
+  check('退出后「登录」tab 回来了', $('[data-chat-login-tab]').hidden === false)
+  check('退出后「注册」tab 回来了', $('[data-chat-register-tab]').hidden === false)
+  check('退出后「修改密码」tab 收起来了', $('[data-chat-password-tab]').hidden === true)
 
   section('运行期错误')
   check('没有未捕获的 JS 错误', errors.length === 0, errors.join(' | '))
