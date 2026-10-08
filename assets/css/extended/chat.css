@@ -6,7 +6,9 @@
  * 打进同一张 stylesheet，自动享受压缩 + 指纹 + 长缓存，不用额外的 <link>。
  *
  * 颜色一律取主题的 CSS 变量（--theme / --entry / --primary / --secondary / --border），
- * 这样明暗模式切换是免费的，不用为 dark 写第二套规则。
+ * 这样明暗模式切换是免费的。只有极少数「明暗方向必须相反」的地方（气泡、消息区面板）
+ * 才用 `:root:not([data-theme="dark"])` / `:root[data-theme="dark"]` 覆盖**单个变量**，
+ * 而不是复制一整套规则。
  * 每个变量都给了 fallback，避免哪天主题改名变成一堆透明块。
  */
 
@@ -17,14 +19,13 @@
   margin: 1.25rem 0 2rem;
 
   /*
-   * ── 气泡 / 输入框的底色 ──
+   * ── 浮层色（登录框、房间列表的 hover / 当前房间）──
    *
-   * ## 为什么不能继续用 --entry / --theme
+   * ## 为什么不能直接用 --entry / --theme
    *
-   * 浅色主题里 `--entry` 和 `--theme` 是**同一个值**（都是纯白），所以气泡落在
-   * 正文的白色背景上完全看不出边界，输入框用的是 `--theme`、同样贴在一起。
-   * 深色那边 `--entry` 比 `--theme` 略亮，气泡还看得见，但输入框照样是页面底色。
-   * 也就是说：这两个变量**都不是**「比背景深一档的浮层色」。
+   * 浅色主题里 `--entry` 和 `--theme` 是**同一个值**（都是纯白），浮层落在
+   * 正文的白色背景上完全看不出边界。深色那边 `--entry` 比 `--theme` 略亮，
+   * 看得见但不稳。也就是说：这两个变量**都不是**「比背景深一档的浮层色」。
    *
    * ## 为什么用 color-mix 而不是写死两个灰
    *
@@ -37,12 +38,30 @@
    *
    * 万一浏览器不支持 color-mix，紧挨着的前一句 `var(--code-bg)` 兜住 ——
    * 那是主题里现成的「浮层色」（浅色 #f5f5f5 / 深色 rgb(55,56,62)），明暗都合适。
+   *
+   * ⚠️ 这一对**不要**拿去给气泡用（气泡见下面的 --chat-bubble）。
+   * 它现在只剩「落在白色正文页上」的那几个用途，所以**必须比白色更暗**。
    */
   --chat-surface: var(--code-bg, #f5f5f5);
   --chat-surface: color-mix(in srgb, var(--theme) 92%, var(--primary) 8%);
-  /* 自己发的气泡、以及输入框：比别人的再深一档，一眼能分出「我说的」和「我在打字」 */
+  /* 再深一档：登录框、房间列表的「当前房间」——都是落在白色正文页上的浮层 */
   --chat-surface-strong: var(--code-bg, #f5f5f5);
   --chat-surface-strong: color-mix(in srgb, var(--theme) 85%, var(--primary) 15%);
+
+  /*
+   * ── 气泡自己的底色 ──
+   *
+   * 单独占一对变量，而不是直接改上面那对。原因：`--chat-surface` /
+   * `--chat-surface-strong` 还被房间列表的 hover 与选中态用来做「反馈」
+   * （见 .chat__room-link），那两个是落在**白色页面背景**上的 ——
+   * 跟着气泡一起改，就等于把「鼠标划过去没有任何反馈、当前房间也看不出来」
+   * 这个已经修过的 bug 原样放回去。
+   *
+   * 浅色主题下这对变量会被覆盖成纯白（见紧跟的 :root:not([data-theme="dark"])），
+   * 深色主题下就用上面那两档浮层色。
+   */
+  --chat-bubble: var(--chat-surface);
+  --chat-bubble-mine: var(--chat-surface-strong);
 
   /*
    * ── 消息区 / 输入框的「面板色」──
@@ -58,6 +77,24 @@
    * 写死就等于只对浅色负责 —— 深色主题的文字是浅色的，一块浅底会让正文彻底看不见。
    */
   --chat-panel: var(--code-bg, #f5f5f5);
+}
+
+/*
+ * 浅色主题：气泡改纯白（`--theme` 在浅色下就是纯白），从 #f5f5f5 的面板里浮起来。
+ *
+ * 方向和以前相反：以前是「比页面背景更深一档」，因为那时正文背景是纯白；
+ * 浅色的背景现在换成灰面板了，气泡再往下压只会和面板糊在一起
+ * （旧的 #ececec 与面板 #f5f5f5 只差 9 级，肉眼几乎看不出边界）。
+ *
+ * 深色**不覆盖**：深色下 `--theme` 就是页面底色，纯白气泡配浅色正文等于看不见。
+ *
+ * 用 `:root:not([data-theme="dark"])` 而不是再写一份 `light`：属性值只可能是
+ * light / dark / auto，`auto` 会被 head.html 的内联脚本在首屏之前解析掉，
+ * 所以「不是 dark」等价于「浅色」。这样以后主题加枚举值也不会漏。
+ */
+:root:not([data-theme="dark"]) .chat {
+  --chat-bubble: var(--theme, #fff);
+  --chat-bubble-mine: var(--theme, #fff);
 }
 
 /*
@@ -363,7 +400,11 @@
   white-space: nowrap;
 }
 
-/* 自己发的：用户名用正文主色，别人的淡一档（这是唯一的区分方式了） */
+/*
+ * 自己发的：用户名用正文主色，别人的淡一档。
+ * ⚠️ 浅色主题下自己的气泡和别人的都是纯白，所以「我说的」现在**只靠这一条**区分，
+ * 别顺手删。
+ */
 .chat__message.is-mine .chat__author {
   color: var(--primary, #111827);
 }
@@ -409,8 +450,8 @@
   margin: 0;
   padding: 0.4rem 0.65rem;
   border-radius: var(--radius, 6px);
-  /* 浮层色，比页面背景深一档 —— 变量怎么来的见 .chat 里那一段 */
-  background: var(--chat-surface, #f2f2f2);
+  /* 气泡色（浅色 = 纯白，深色 = 比页面底色亮一档的浮层色）—— 见 .chat 里那一段 */
+  background: var(--chat-bubble, #f2f2f2);
   /* 字体不指定，直接继承博客正文——这是「和博客一致」最省事也最准的做法 */
   font-size: 0.92rem;
   line-height: 1.6;
@@ -419,9 +460,14 @@
   color: var(--content, #374151);
 }
 
-/* 自己发的换个底色区分（比别人的气泡再深一档） */
+/*
+ * 自己发的换底色区分。
+ * 注意：浅色主题下这一条和上面那条**取到的是同一个值**（都是纯白）——
+ * 那时「我说的」靠 .chat__author 的主色来区分（见上面那一条）。
+ * 深色下两者才不同（自己的更亮一档）。
+ */
 .chat__message.is-mine .chat__body {
-  background: var(--chat-surface-strong, #e2e2e2);
+  background: var(--chat-bubble-mine, #e2e2e2);
 }
 
 /*
