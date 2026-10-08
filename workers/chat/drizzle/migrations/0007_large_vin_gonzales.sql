@@ -1,0 +1,1 @@
+ALTER TABLE `messages` ADD `kind` text DEFAULT 'user' NOT NULL;

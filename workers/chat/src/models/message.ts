@@ -20,6 +20,20 @@ export const messageFields = {
   username: t.string().min(2).max(20),
   // 同 routes/chat.ts：读常量而不是写死 500。改消息长度上限只需要动 config.ts 一处。
   body: t.string().min(1).max(MAX_MESSAGE_LENGTH),
+  /**
+   * `'user'`（默认）或 `'system'`。
+   *
+   * 系统消息（谁进了房间、谁撤回了一条）和普通消息**共用这张表**，而不是另开一张，
+   * 理由只有一个但足够：历史是按 `(createdAt, id)` 游标翻页的，两套数据分表存就得
+   * 在接口层做「两路归并 + 跨表游标」，复杂度全砸在最不该复杂的地方。
+   * 同表存之后，它们天然按时间交错，翻页、清空、导出全都不用改。
+   *
+   * 代价是系统消息也要占满那些 NOT NULL 列（`userId` / `username`），
+   * 所以它们填的是 `SYSTEM_USER_ID` 这个哨兵值 + `SYSTEM_USERNAME`，
+   * 由 `kind` 这个字段来区分，而不是靠「userId 是不是空」——
+   * 靠空值判断的话，改列约束就得重建整张表（SQLite 不支持 ALTER 去掉 NOT NULL）。
+   */
+  kind: t.string().default('user'),
   deleted: t.boolean().default(false),
   /**
    * 撤回的审计字段。**没有这两个，README 里那句「软删方便留着追责」就是空的** ——

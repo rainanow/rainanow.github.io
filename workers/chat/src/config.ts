@@ -63,6 +63,54 @@ export const EXPORT_LIMIT = 1000
 export const MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 
 /**
+ * 管理员的上传上限。**普通用户仍是 16 MB**，只有管理员这一档放宽到 100 MB。
+ *
+ * ## 为什么是 100 MB 而不是「无限」
+ *
+ * 「无限」在 Cloudflare 免费版上是不存在的，有三道墙，而且都不是我们自己的代码：
+ *
+ *   | 墙 | 免费版 | 后果 |
+ *   | --- | --- | --- |
+ *   | 账号级请求体上限 | 100 MB | 超了是平台直接回 **413**，我们的代码根本不会被调用 |
+ *   | Worker 单实例内存 | 128 MB | 超了运行时换一个新 isolate 给后续请求 |
+ *   | Worker CPU | 10 ms / 请求 | 超了是 **1102**，`Worker exceeded resource limits` |
+ *
+ * 后两道才是真正约束「我们把上限设成多少」的东西。所以 100 MB 这个数字
+ * 不是选的，是**平台请求体上限**本身 —— 再往上写也没有意义。
+ *
+ * ## 上限之所以能真的做到 100 MB：大文件不走内存
+ *
+ * 把 100 MB `arrayBuffer()` 进内存，光是那一次拷贝就可能吃掉几毫秒 CPU，
+ * 加上常驻内存，10 ms / 128 MB 两道墙都贴着。所以 `routes/media.ts` 里
+ * **超过 `MAX_UPLOAD_BYTES` 的那一档走流式**：只嗅探开头 4 KB 判类型，
+ * 剩下的字节原样转交给 R2，Worker 里始终不持有整份文件。
+ *
+ * 代价是那一档拿不到真实字节数，只能用 `Content-Length` 记账 ——
+ * 所以流式那一档**必须**带 Content-Length（见 `routes/media.ts` 的 411）。
+ */
+export const MAX_UPLOAD_BYTES_ADMIN = 100 * 1024 * 1024
+
+/**
+ * `messages.kind` 的两个取值。
+ *
+ * `'system'` 是「谁进了房间 / 谁撤回了一条」这类**不是某个人说出来的**行。
+ * 它们和用户消息同表存（理由见 `system-message.ts`），靠这一列二分。
+ */
+export const KIND_USER = 'user'
+export const KIND_SYSTEM = 'system'
+
+/**
+ * 系统消息的「作者」。`messages.userId` / `username` 都是 NOT NULL，
+ * 所以系统行也必须填值 —— 用一个不可能和真实账号撞上的哨兵：
+ * 全零 uuid（RFC 4122 的 nil uuid，`crypto.randomUUID()` 永远不会产出它）。
+ *
+ * 靠 `kind` 区分而不是靠这个哨兵值本身，是因为将来万一加了别的系统作者，
+ * 判断逻辑不用跟着改。
+ */
+export const SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000'
+export const SYSTEM_USERNAME = '系统'
+
+/**
  * 上传和读取媒体的路径前缀。
  * 消息正文里存的就是这个前缀开头的相对路径（如 `/api/media/2026-09/xxx.png`），
  * 前端渲染时会校验前缀，只把自家 URL 变成图片/链接 —— 防止有人拿外链当图床或追踪访问者。

@@ -288,6 +288,75 @@ console.log('\n后端源码不变量（顺序 / 包含关系这类没法用 HTTP
     corsAnchor !== -1 && breakerAnchor !== -1 && breakerAnchor > corsAnchor,
     `CORS 在 ${corsAnchor}，熔断在 ${breakerAnchor}`,
   )
+
+  /*
+   * ⑧ 上传上限：前端那份数字必须等于后端那份。
+   *
+   * 和 `MAX_MESSAGE_LENGTH` 完全同一个性质 —— 跨构建共享的常量只能靠一条
+   * 自动检查钉住。上限在**前端**是「提前拦住 + 提示文案里的数字」，
+   * 在**后端**是真正的门禁；两边漂了不会报任何错，只会变成
+   * 「文案说 16 MB、后端其实放行 100 MB」（或者反过来，前端拦住了后端允许的文件）。
+   *
+   * 读源码而不是构建产物：chat.js 会被 Hugo 指纹化 + 压缩，
+   * 而这两个数字在源码里本来就是明文常量。
+   *
+   * 只认**声明行**（`export const X = …` / `var X = …`）：
+   * 两个文件里都有大段注释在解释这两个常量，不限定形式就会命中注释。
+   */
+  const chatJsSource = readSource('../../../assets/js/chat.js')
+  const configSource = readSource('../src/config.ts')
+  const readNumber = (source, name) => {
+    const pattern = new RegExp(
+      `(?:export\\s+const|var)\\s+${name}\\s*=\\s*([0-9_]+(?:\\s*\\*\\s*[0-9_]+)*)`,
+    )
+    const matched = pattern.exec(source)
+    if (matched === null) return null
+    return matched[1]
+      .split('*')
+      .reduce((total, piece) => total * Number.parseInt(piece.trim().replace(/_/g, ''), 10), 1)
+  }
+
+  for (const name of ['MAX_UPLOAD_BYTES', 'MAX_UPLOAD_BYTES_ADMIN']) {
+    const frontendValue = readNumber(chatJsSource, name)
+    const backendValue = readNumber(configSource, name)
+    check(
+      `能读出前后端的 ${name}`,
+      frontendValue !== null && backendValue !== null,
+      `前端 ${frontendValue} / 后端 ${backendValue}`,
+    )
+    check(
+      `${name} 前后端一致`,
+      frontendValue !== null && frontendValue === backendValue,
+      `前端 ${frontendValue} ≠ 后端 ${backendValue} —— 改 config.ts 时要一起改 chat.js`,
+    )
+  }
+
+  /*
+   * ⑨ 大文件必须走流式。
+   *
+   * 这一条**本地测不出来**：把 100 MB `arrayBuffer()` 进内存，在开发机上
+   * 只是慢一点，只有线上才会撞 128 MB 内存 / 10 ms CPU 那两道墙
+   * （表现是 1102，请求被运行时掐掉）。所以这里退一步，把「实现方式」
+   * 钉在源码上：有人哪天图省事把它改回「读进内存再传」，这条会红。
+   */
+  const mediaSource = readSource('../src/routes/media.ts')
+  check(
+    '大文件那一档用 FixedLengthStream 包流（R2 只收长度已知的流）',
+    /new FixedLengthStream\(/.test(mediaSource),
+    'R2 的 put 会抛「Provided readable stream must have a known length」',
+  )
+  check(
+    '流式之前只嗅探开头几个字节（不能整份读进内存）',
+    /await readHead\(/.test(mediaSource),
+  )
+  check(
+    '只有超过普通用户上限时才走流式',
+    /if \(declared > MAX_UPLOAD_BYTES\)/.test(mediaSource),
+  )
+  check(
+    '没有 Content-Length 就拒掉（否则 chunked 那条路会把请求体全读进内存）',
+    /411/.test(mediaSource),
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)

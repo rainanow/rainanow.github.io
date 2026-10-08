@@ -9,6 +9,7 @@
  */
 
 import { readdirSync, statSync } from 'node:fs'
+import http from 'node:http'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import WebSocket from 'ws'
@@ -168,6 +169,70 @@ function uploadRequest(path, { jar, contentType, filename, bytes }) {
   return fetch(`${BASE}${path}`, { method: 'POST', headers, body: bytes })
 }
 
+/**
+ * 用 `node:http` 发一次上传，专门用来构造 `fetch()` 造不出来的请求形状。
+ *
+ * 这个测试脚本里**只有这里**这么发请求，两个原因：
+ *
+ *   ① `fetch()` 只要拿到 body 就一定会带上真实的 Content-Length，
+ *      而我们要测的恰恰是「声明值和实际不符」与「压根没有长度」两种情况；
+ *   ② 服务端在这些情况下（411 / 413 / 429）**不会读完请求体**就回话，
+ *      平台于是会把连接直接重置。用 fetch 的话下一条请求会复用那条
+ *      已经死掉的连接，报一个莫名其妙的 `ECONNRESET` —— 看着像服务端坏了，
+ *      其实是客户端没换连接。所以这里 `agent: false`：一个请求一条连接。
+ *
+ * 不真的写那 17 MB 是**有意**的：这些断言验的是「按声明值走哪条分支」
+ * （大小上限、配额），而这些分支都在读请求体之前。真正需要完整字节的
+ * 是「流式上传没被截断」那条，它老老实实发 17 MB（见下面的 ②③）。
+ */
+function rawUpload(path, { jar, contentType, filename, declaredLength, chunk }) {
+  return new Promise((resolve) => {
+    const target = new URL(`${BASE}${path}`)
+    const headers = {
+      'Content-Type': contentType,
+      Origin: ORIGIN,
+      'X-Filename': encodeURIComponent(filename),
+      Cookie: cookieHeader(jar),
+    }
+    // 不设这个头 → node 自动改用 `Transfer-Encoding: chunked`（正好是 411 那条用例）
+    if (declaredLength !== undefined) headers['Content-Length'] = String(declaredLength)
+
+    let seen = null
+    const outbound = http.request(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname + target.search,
+        method: 'POST',
+        headers,
+        agent: false,
+      },
+      (response) => {
+        seen = { status: response.statusCode, body: '' }
+        response.setEncoding('utf8')
+        response.on('data', (piece) => {
+          seen.body += piece
+        })
+        response.on('end', () => resolve(seen))
+        // 读完之前连接被重置：状态码和已读到的内容仍然算数
+        response.on('error', () => resolve(seen))
+      },
+    )
+
+    /*
+     * 写入报错有两种可能：服务端已经回话了（正是我们要的），或者连接真坏了。
+     * 所以**不立刻**把结果定成 0 —— 先给响应一点时间到；到不了才按 0 报，
+     * 那种情况下断言会红，说明确实什么都没收到。
+     */
+    outbound.on('error', () => {
+      setTimeout(() => resolve(seen ?? { status: 0, body: '' }), 300)
+    })
+
+    if (chunk !== undefined) outbound.write(chunk)
+    outbound.end()
+  })
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // --- 极简 WebSocket 客户端 -------------------------------------------------
@@ -214,7 +279,15 @@ function openSocket({ jar, origin = ORIGIN, room = 'general' } = {}) {
     socket.once('error', reject)
   })
 
-  return { socket, next, opened }
+  /*
+   * `inbox` 也交出去。
+   *
+   * `next()` 是「等一个**匹配**的事件」，而有些断言要问的是反面：
+   * 「这件事**没有**发生」（同一个人开第二个标签页时不该再播一条「加入了房间」）。
+   * 那种断言没法用 `next()` 表达 —— 它只会一直等到超时，看不出「一条也没有」
+   * 和「来了别的、但不是这条」的区别。直接数 inbox 才说得清。
+   */
+  return { socket, next, opened, inbox }
 }
 
 // --- 开始 ------------------------------------------------------------------
@@ -1058,6 +1131,342 @@ section('会话吊销后 WebSocket 开不出来')
     afterStatus === 'HTTP 401',
     `实际 ${afterStatus}`,
   )
+}
+
+/*
+ * ── 系统消息 ──
+ *
+ * 房间里「谁进了 / 谁走了 / 谁撤回了一条」会写成**一条真正的消息**落库
+ * （`messages.kind = 'system'`），而不是只在前端拼一句话。这一节守的就是它：
+ * 事件推得到、历史查得到、一个人开多个标签页不会刷屏、管理员也撤不掉它。
+ *
+ * 为什么单开一个房间（sysmsg）：进出提示是按**房间**广播的，
+ * 混在 general 里的话，别的 section 每开一次 socket 就会往这里塞一条
+ * 「XX 加入了房间」，断言会变成看运气。
+ */
+section('系统消息：进出房间')
+{
+  // 这一节要新注册一个「同伴」账号来当旁观者，先把注册/限流计数腾出来
+  // （注册限额是 5 次/小时、实际只放行 4 次，前面几节已经用掉不少）。
+  resetLocalRateLimits()
+
+  /*
+   * 重新登录拿一个干净的 jar。
+   *
+   * 上一节（改密码）把主账号名下的**全部会话**都吊销了（这正是那一节要验的东西），
+   * 所以最早那个 `jar` 虽然 access token 还没过期，但 DO 握手时会问
+   * 「他还有活着的会话吗」，问出 false → 401。
+   * HTTP 那几处用老 jar 也能过，但混用两个 jar 只会让以后的人困惑。
+   */
+  const reloginMain = await request('/auth/login', { method: 'POST', body: { username, password } })
+  const mainJar = jarFrom(reloginMain)
+  check('主角重新登录成功（下面几条断言的前提）', typeof mainJar.access_token === 'string')
+
+  const peerName = `peer${Date.now().toString(36).slice(-5)}`
+  const peerPass = 'peer-password-123'
+  await request('/auth/register', { method: 'POST', body: { username: peerName, password: peerPass } })
+  const peerLogin = await request('/auth/login', {
+    method: 'POST',
+    body: { username: peerName, password: peerPass },
+  })
+  const peerJar = jarFrom(peerLogin)
+  check('同伴账号注册并登录成功（后面几条断言的前提）', typeof peerJar.access_token === 'string')
+
+  const ROOM = 'sysmsg'
+
+  // 同伴先进房间，当旁观者。他自己那条加入提示也会推到他自己的连接上
+  // （DO 的 publish 是发给房间里所有连接，包括刚进来的这条）——
+  // 所以下面的断言都按**文案**匹配，不能只按 kind，否则会撞上他自己的那条。
+  const watch = openSocket({ jar: peerJar, room: ROOM })
+  await watch.opened
+  const waitSystem = (fragment, timeoutMs = 5000) =>
+    watch.next(
+      (e) => e.type === 'message' && e.message?.kind === 'system' && e.message.body.includes(fragment),
+      timeoutMs,
+    )
+  const countSystem = (fragment) =>
+    watch.inbox.filter(
+      (e) => e.type === 'message' && e.message?.kind === 'system' && e.message.body.includes(fragment),
+    ).length
+
+  // ① 主角进房间 → 旁观者收到一条系统消息
+  const mainTabOne = openSocket({ jar: mainJar, room: ROOM })
+  await mainTabOne.opened
+  const joined = await waitSystem(username)
+  check('有人进房间时广播了一条系统消息', joined.message.kind === 'system')
+  check(
+    '文案是「XX 加入了房间」',
+    joined.message.body === `${username} 加入了房间`,
+    `实际 ${joined.message.body}`,
+  )
+  check(
+    '系统消息的作者是哨兵值，不是真实账号',
+    joined.message.userId === '00000000-0000-0000-0000-000000000000',
+    `实际 ${joined.message.userId}`,
+  )
+
+  // ② 同一个人再开一个标签页：不该再播一条（进出提示按**人**算，不按连接算）
+  const mainTabTwo = openSocket({ jar: mainJar, room: ROOM })
+  await mainTabTwo.opened
+  await sleep(800)
+  check(
+    '同一个人开第二个标签页，不再播「加入了房间」',
+    countSystem(`${username} 加入了房间`) === 1,
+    `实际收到 ${countSystem(`${username} 加入了房间`)} 条`,
+  )
+
+  // ③ 关掉第二个标签页：人还在（第一个还连着），不该播「离开了房间」
+  mainTabTwo.socket.close()
+  await sleep(800)
+  check(
+    '关掉其中一个标签页，不播「离开了房间」',
+    countSystem(`${username} 离开了房间`) === 0,
+    `实际收到 ${countSystem(`${username} 离开了房间`)} 条`,
+  )
+
+  // ④ 关掉最后一条连接 → 这才是真的离开
+  mainTabOne.socket.close()
+  const left = await waitSystem(`${username} 离开了房间`)
+  check('最后一条连接断开时，播了「离开了房间」', left.message.body === `${username} 离开了房间`)
+
+  // ⑤ 持久化：刷新（重新拉历史）之后这几条还在
+  const history = await request(`/api/messages?room=${ROOM}`, { jar: mainJar })
+  const historyPage = await history.json()
+  const stored = historyPage.messages.filter((m) => m.kind === 'system')
+  check(
+    '系统消息进了历史（刷新之后还在）',
+    stored.some((m) => m.body === `${username} 加入了房间`) &&
+      stored.some((m) => m.body === `${username} 离开了房间`),
+    `历史里 ${stored.length} 条系统消息：${stored.map((m) => m.body).join(' / ')}`,
+  )
+  check(
+    '历史接口也带 kind 字段',
+    historyPage.messages.every((m) => typeof m.kind === 'string'),
+  )
+
+  /*
+   * ⑥ 系统提示不能被撤回。
+   *
+   * 这里的账号在这之前已经被上一节提成管理员了（`setLocalRole` 写的是库，
+   * 一直有效）—— 而管理员**能**撤别人的消息，所以这条 403 只可能是
+   * `kind !== 'user'` 那一道挡下来的，不是权限挡的。这正是要验的东西。
+   */
+  setLocalRole(username, 'admin')
+  const noticeId = stored.find((m) => m.body.includes('加入了房间')).id
+  const withdrawNotice = await request(`/api/messages/${noticeId}`, { method: 'DELETE', jar: mainJar })
+  check(
+    '管理员也撤不掉系统提示（403，不是 404/200）',
+    withdrawNotice.status === 403,
+    `实际 ${withdrawNotice.status}`,
+  )
+  const afterTry = await request(`/api/messages?room=${ROOM}`, { jar: mainJar })
+  const afterTryPage = await afterTry.json()
+  check(
+    '被拒绝之后那条提示还在',
+    afterTryPage.messages.some((m) => m.id === noticeId),
+  )
+
+  // ⑦ 撤回自己的消息 → 记一条「XX 撤回了一条消息」
+  const doomed = await request('/api/messages', {
+    method: 'POST',
+    jar: mainJar,
+    body: { body: '这条马上会被撤回', room: ROOM },
+  })
+  const doomedMessage = (await doomed.json()).message
+  const selfDelete = await request(`/api/messages/${doomedMessage.id}`, {
+    method: 'DELETE',
+    jar: mainJar,
+  })
+  check('撤回自己的消息返回 200', selfDelete.status === 200, `实际 ${selfDelete.status}`)
+
+  const selfNotice = await waitSystem('撤回了一条消息')
+  check(
+    '撤回之后留下一条「XX 撤回了一条消息」',
+    selfNotice.message.body === `${username} 撤回了一条消息`,
+    `实际 ${selfNotice.message.body}`,
+  )
+
+  // ⑧ 管理员撤回**别人**的消息 → 提示里必须同时出现操作者和作者
+  const peerMessage = await request('/api/messages', {
+    method: 'POST',
+    jar: peerJar,
+    body: { body: '同伴说的话', room: ROOM },
+  })
+  const peerMessageBody = (await peerMessage.json()).message
+  const adminDelete = await request(`/api/messages/${peerMessageBody.id}`, {
+    method: 'DELETE',
+    jar: mainJar,
+  })
+  check('管理员能撤回别人的消息', adminDelete.status === 200, `实际 ${adminDelete.status}`)
+
+  const adminNotice = await waitSystem('（管理员）撤回')
+  check(
+    '管理员撤回别人的消息时，提示里写清了是谁撤的、撤的谁的',
+    adminNotice.message.body === `${username}（管理员）撤回了 ${peerName} 的一条消息`,
+    `实际 ${adminNotice.message.body}`,
+  )
+
+  // ⑨ 撤回提示也要落库（刷新之后还在）
+  const withWithdraw = await request(`/api/messages?room=${ROOM}`, { jar: mainJar })
+  const withWithdrawPage = await withWithdraw.json()
+  check(
+    '撤回提示同样进了历史',
+    withWithdrawPage.messages.some((m) => m.body === `${username} 撤回了一条消息`),
+    `历史里没有这条：${withWithdrawPage.messages.map((m) => m.body).join(' / ')}`,
+  )
+
+  watch.socket.close()
+}
+
+/*
+ * ── 管理员的大文件上传 ──
+ *
+ * 普通用户 16 MB、管理员 100 MB，分界线就是「要不要走流式」：
+ * 超过 16 MB 之后不能再 `arrayBuffer()`（100 MB 拷进内存贴着 isolate 的
+ * 128 MB 内存和 10 ms CPU 两道墙），改成「嗅探开头几个字节 + 把剩下的流原样
+ * 转交 R2」，中间过一层 `FixedLengthStream` 做长度校验。
+ *
+ * 这一节验的就是那条路真的通了、而且**没有被静默截断**——
+ * 流式上传最典型的失败方式就是「接口返回 201，R2 里只有一个零头」。
+ */
+section('管理员大文件上传（> 16 MB 走流式）')
+{
+  const BIG_MB = 17
+  // 假 PNG：前 8 个字节是真的魔数（嗅探靠它），后面全是零。
+  // 这里验的是「大小这条路」，不是解码，所以内容无所谓。
+  const big = new Uint8Array(BIG_MB * 1024 * 1024)
+  big.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+  /*
+   * 自己登两个号：一个提成管理员、一个当普通用户。
+   *
+   * 不复用上一节的 jar —— 那一节结束时把连接都关掉了，而且这里的两个角色
+   * 必须泾渭分明（16 MB 那条线就是按 role 分的）。注册限额又要用到，
+   * 所以同样先清一次计数。
+   */
+  resetLocalRateLimits()
+  const adminLogin = await request('/auth/login', { method: 'POST', body: { username, password } })
+  const adminJar = jarFrom(adminLogin)
+  const plainName = `plain${Date.now().toString(36).slice(-5)}`
+  const plainPass = 'plain-password-123'
+  await request('/auth/register', { method: 'POST', body: { username: plainName, password: plainPass } })
+  const plainLogin = await request('/auth/login', {
+    method: 'POST',
+    body: { username: plainName, password: plainPass },
+  })
+  const plainJar = jarFrom(plainLogin)
+  check(
+    '两个账号都登录成功（下面按角色分档的前提）',
+    typeof adminJar.access_token === 'string' && typeof plainJar.access_token === 'string',
+  )
+
+  setLocalRole(username, 'admin')
+  // 库里的 role 是**累积**的：这个脚本跑过几轮之后，别把角色当成默认值。
+  setLocalRole(plainName, 'user')
+  clearUploadQuota()
+
+  /*
+   * ① 管理员：真的发 17 MB，放行，且返回的大小是真实字节数。
+   *
+   * 这条放在最前面：它是**唯一**必须老老实实发完整字节的用例
+   * （后面几条在服务端都是「没读完请求体就回话」的快路径，
+   * 会把连接重置，不适合再挂一条大请求在后面）。
+   */
+  const asAdmin = await uploadRequest('/api/uploads', {
+    jar: adminJar,
+    contentType: 'image/png',
+    filename: 'big.png',
+    bytes: big,
+  })
+  check(`管理员能传 ${BIG_MB} MB（201）`, asAdmin.status === 201, `实际 ${asAdmin.status}`)
+  const asset = await asAdmin.json()
+  check('返回的大小是真实字节数', asset.size === big.byteLength, `实际 ${asset.size}`)
+  check('按魔数识别成 image', asset.kind === 'image', `实际 ${asset.kind}`)
+
+  // ② 读回来核对：**没有被截断**才是真的存进去了。
+  //    流式上传最典型的失败方式就是「接口回 201、R2 里只有一个零头」。
+  const served = await fetch(asset.url, { headers: { Cookie: cookieHeader(adminJar) } })
+  check('上传后能读回来', served.status === 200, `实际 ${served.status}`)
+  const roundTrip = await served.arrayBuffer()
+  check(
+    `R2 里存下来的字节数是完整的 ${BIG_MB} MB（流式没被截断）`,
+    roundTrip.byteLength === big.byteLength,
+    `实际 ${roundTrip.byteLength}`,
+  )
+
+  // ③ 账本记的是真实大小（声明值撒谎也改不了账）
+  //
+  // `withLocalDb` 不返回回调的返回值（它只管开库/关库），所以结果用外面的变量接。
+  let globalBytes
+  withLocalDb((db) => {
+    globalBytes = db.prepare('SELECT bytes FROM upload_usage WHERE id = ?').get('total:global')
+  })
+  check(
+    '累计字节账本按真实大小记账',
+    globalBytes !== undefined && globalBytes.bytes === big.byteLength,
+    `实际 ${JSON.stringify(globalBytes)}`,
+  )
+
+  /*
+   * ④ 普通用户：16 MB 就是天花板。
+   *
+   * 只**声明** 17 MB、不真的发 —— 大小这一关在读请求体之前就判了，
+   * 发过去的字节一个都不会被看。声明 `Content-Length` 而不写满，
+   * 正好也覆盖了「声明值就是唯一依据」这件事。
+   */
+  const asUser = await rawUpload('/api/uploads', {
+    jar: plainJar,
+    contentType: 'image/png',
+    filename: 'big.png',
+    declaredLength: big.byteLength,
+  })
+  check(`普通用户传 ${BIG_MB} MB 被拒（413）`, asUser.status === 413, `实际 ${asUser.status}`)
+  let asUserBody = {}
+  try {
+    asUserBody = JSON.parse(asUser.body)
+  } catch {
+    // 连接被重置时响应体可能是空的，下面的断言会红并打出原文
+  }
+  check(
+    '拒绝理由里写的是 16 MB',
+    typeof asUserBody.error === 'string' && asUserBody.error.includes('16 MB'),
+    `实际 ${asUser.body.slice(0, 120)}`,
+  )
+
+  /*
+   * ⑤ 不带 Content-Length 的上传必须被挡（411）。
+   *
+   * 这一条守的是「流式」这条路的入口：没有长度就既确认不了大小、也包不出
+   * `FixedLengthStream`；而**放它进来**的后果是把整个请求体读进内存
+   * （平台允许 100 MB，一次就顶到 isolate 的 128 MB）。以前这条是允许的。
+   * 浏览器 `fetch()` 传 Blob / File 一定会带长度，所以这不影响真实前端。
+   *
+   * 必须写一点再结束，否则 node 会补一个 `Content-Length: 0`，
+   * 那就变成了「空请求」（400），测不到分块那条路。
+   */
+  const noLength = await rawUpload('/api/uploads', {
+    jar: adminJar,
+    contentType: 'image/png',
+    filename: 'nolength.png',
+    chunk: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  })
+  check('不带 Content-Length 的上传被拒（411）', noLength.status === 411, `实际 ${noLength.status}`)
+
+  /*
+   * ⑥ 大文件同样受配额约束：全站存储塞满之后，这一档也要被挡住。
+   *
+   * 同样是「只声明、不发字节」—— 配额检查也在读请求体之前，
+   * 所以这条断言验的是「这一档会被配额拦下」，而不是「发了 17 MB 才被拦」。
+   */
+  forceGlobalBytesQuota()
+  const blocked = await rawUpload('/api/uploads', {
+    jar: adminJar,
+    contentType: 'image/png',
+    filename: 'big2.png',
+    declaredLength: big.byteLength,
+  })
+  check('全站存储到顶后，管理员的大文件也被挡（429）', blocked.status === 429, `实际 ${blocked.status}`)
+  clearUploadQuota()
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)

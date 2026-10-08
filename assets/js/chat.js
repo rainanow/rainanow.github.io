@@ -35,8 +35,34 @@
    * 空字符串表示没配，那就一律不渲染成媒体（只当普通链接）。
    */
   var MEDIA_BASE = (root.dataset.mediaBase || '').replace(/\/+$/, '')
-  /** 单文件上限，和后端 MAX_UPLOAD_BYTES 保持一致。 */
+  /**
+   * 单文件上限（普通用户），和后端 `MAX_UPLOAD_BYTES` 保持一致。
+   *
+   * 两边是两套构建，没法共用一个常量，所以这对数字由 `npm run verify-build` 钉住。
+   */
   var MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+  /** 管理员那档，对应后端 `MAX_UPLOAD_BYTES_ADMIN`（100 MB 是平台的请求体硬上限）。 */
+  var MAX_UPLOAD_BYTES_ADMIN = 100 * 1024 * 1024
+  /**
+   * 当前登录的人的上传上限。
+   *
+   * 分档只在前端做**提示**（提前拦住、把文案写对）；真正的门禁在后端 ——
+   * 那边按 `user.role` 判，前端改不了。
+   * `me` 是闭包变量，这里必须**调用时**读，不能一开始就取出来存成常量。
+   */
+  function uploadLimit() {
+    return me !== null && me.role === 'admin' ? MAX_UPLOAD_BYTES_ADMIN : MAX_UPLOAD_BYTES
+  }
+  function uploadLimitMB() {
+    return Math.round(uploadLimit() / 1024 / 1024)
+  }
+  /**
+   * `messages.kind` 的取值，对应后端 `KIND_SYSTEM`。
+   *
+   * 系统提示（谁进了房间、谁撤回了一条）和普通消息走**同一条通路**：
+   * 同样的 `message` 事件、同样的 `insertMessage()` 排序去重，只有渲染不同。
+   */
+  var KIND_SYSTEM = 'system'
   /** 图片压缩后的最长边。1600 够看清内容，又不至于把手机流量吃光。 */
   var IMAGE_MAX_EDGE = 1600
 
@@ -151,6 +177,18 @@
     var clock = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
     if (date.toDateString() === now.toDateString()) return clock
     return date.getMonth() + 1 + '月' + date.getDate() + '日 ' + clock
+  }
+
+  /**
+   * 顶栏那行状态文字。
+   *
+   * **只有人数，没有「已连接」**：连接与否已经由前面那个彩色小圆点
+   * （`.chat__status::before` 的绿/黄/红）表达得一清二楚，再写一遍是冗余。
+   * 顶栏本来就挤（状态 + 成员 + 房间 + 导出 + 清空 + 用户名 + 改密 + 退出），
+   * 每个字都要算成本。
+   */
+  function onlineStatus(count) {
+    return '在线 ' + count + ' 人'
   }
 
   function jsonHeaders() {
@@ -468,7 +506,57 @@
     return body.replace(MEDIA_MARKUP, '').trim() === ''
   }
 
+  /** 时间元素，普通消息和系统提示共用（口径一致，都是本地时间的 HH:MM）。 */
+  function timeElement(createdAt) {
+    var time = document.createElement('time')
+    time.className = 'chat__time'
+    time.dateTime = new Date(createdAt).toISOString()
+    time.textContent = formatTime(createdAt)
+    return time
+  }
+
+  /**
+   * 系统提示：**谁进了房间**、**谁撤回了一条消息**。
+   *
+   * ## 为什么要和普通消息长得完全不一样
+   *
+   * 它不是「有人说了什么」，而是聊天记录里的一行注记。渲染成气泡会让人
+   * 以为有个叫「系统」的人在发言；渲染成完整的一条（带作者行、撤回按钮、
+   * 大内边距）会把对话**截断** —— 一连串人进出之后，真正在聊的内容会被
+   * 这些提示冲散。所以这里是一条**居中的窄条**：小字、淡色、上下很薄，
+   * 一眼能跳过，又不至于看不见。
+   *
+   * ## 为什么没有撤回按钮
+   *
+   * 撤回提示本身没有语义（而且撤回它又会再生成一条提示）。后端也会挡
+   * （`kind !== 'user'` → 403），所以不渲染按钮不是「忘了加」。
+   *
+   * ## 安全性
+   *
+   * `body` 是服务端拼好的（见 workers/chat/src/system-message.ts），
+   * 但它里面含**用户名** —— 用户名是用户可控的，所以只能进 `textContent`，
+   * 绝不能进 innerHTML。这也是为什么这里不调用 `renderInline()`：
+   * 那是给用户消息用的 markdown 渲染，系统提示不需要也不该解析任何标记。
+   */
+  function renderSystemMessage(message) {
+    var row = document.createElement('article')
+    row.className = 'chat__message chat__message--system'
+    row.dataset.id = message.id
+
+    var text = document.createElement('span')
+    text.className = 'chat__system-text'
+    text.textContent = message.body
+
+    row.appendChild(text)
+    // 时间放在文字后面、同一个窄条里（CSS 用更低的透明度压住它），
+    // 不单独占一行 —— 多一行就多一份高度，那就不是「窄」了。
+    row.appendChild(timeElement(message.createdAt))
+    return row
+  }
+
   function renderMessage(message) {
+    if (message.kind === KIND_SYSTEM) return renderSystemMessage(message)
+
     var article = document.createElement('article')
     article.className = 'chat__message'
     article.dataset.id = message.id
@@ -482,10 +570,7 @@
     // 尖括号由 CSS 的 ::before / ::after 拼，这里只放用户名本身
     author.textContent = message.username
 
-    var time = document.createElement('time')
-    time.className = 'chat__time'
-    time.dateTime = new Date(message.createdAt).toISOString()
-    time.textContent = formatTime(message.createdAt)
+    var time = timeElement(message.createdAt)
 
     // 撤回按钮每条消息都渲染、一直可见；能不能点由权限决定：
     // 自己发的、以及管理员的可以点，其余置成 disabled 灰掉。
@@ -812,8 +897,11 @@
   function uploadFile(file) {
     if (me === null) return
 
-    if (file.size > MAX_UPLOAD_BYTES) {
-      notice('文件超过 16 MB，先压缩或裁剪一下再传', 'error')
+    if (file.size > uploadLimit()) {
+      notice(
+        '文件超过 ' + uploadLimitMB() + ' MB，先压缩或裁剪一下再传',
+        'error',
+      )
       return
     }
 
@@ -1487,6 +1575,18 @@
         }
 
         payload.messages.forEach(function (message) {
+          /*
+           * 系统提示排成一行引用（`> …`），而不是「**系统** 时间」那种作者行。
+           *
+           * 不带这一档的话，导出的 markdown 里会出现 **系统** 12:30 这样的行 ——
+           * 读的人会以为有个叫「系统」的人在说话。它其实只是一条注记，
+           * 和聊天记录里的渲染口径要保持一致（那边也是窄条、无作者）。
+           */
+          if (message.kind === KIND_SYSTEM) {
+            lines.push('> ' + message.body + ' — ' + formatStamp(message.createdAt))
+            lines.push('')
+            return
+          }
           lines.push('**' + message.username + '** ' + formatStamp(message.createdAt))
           lines.push('')
           lines.push(message.body)
@@ -1573,7 +1673,7 @@
 
   function handleEvent(event) {
     if (event.type === 'ready') {
-      setStatus('已连接 · 在线 ' + event.online + ' 人', 'online')
+      setStatus(onlineStatus(event.online), 'online')
       // 连上了是重连连上的话，补一次历史，把断线期间漏掉的消息找回来。
       if (pendingCatchUp) {
         pendingCatchUp = false
@@ -1582,8 +1682,13 @@
       return
     }
     if (event.type === 'presence') {
-      setStatus('已连接 · 在线 ' + event.online + ' 人', 'online')
-      // 有人进/出，名单里那两组的归属要跟着变
+      setStatus(onlineStatus(event.online), 'online')
+      // 有人进/出，名单里那两组的归属要跟着变。
+      //
+      // 注意这条事件**只**负责人数和名单刷新 —— 「XX 加入了房间」那句提示
+      // 是作为一条独立的系统 `message` 事件来的（服务端要落库，见 room.ts
+      // 的 notifyPresence）。别把两件事合并到这一条上：那样提示会因为
+      // 「人数没变」（比如同一个人开第二个标签页）而漏掉。
       scheduleMembersRefresh()
       return
     }
@@ -1703,7 +1808,24 @@
     if (mode === 'password') setMode('login')
     if (el.exportButton !== null) el.exportButton.hidden = true
     if (el.purgeButton !== null) el.purgeButton.hidden = true
+    // 回到未登录：上传提示也退回那个不含数字的默认值（模板里本来就是这句）。
+    // 留着上一个角色的数字，登出后鼠标划过去会看到「100 MB 以内」这种假信息。
+    if (el.upload !== null) el.upload.title = '上传图片或文件'
     setStatus('未登录')
+  }
+
+  /**
+   * 把「+」按钮的悬停提示补成带数字的那句。
+   *
+   * 为什么不在模板里写死：上限按角色分档（普通用户 16 MB、管理员 100 MB），
+   * 而模板在构建时不知道访客是谁。数字只能等 `/api/me` 回来之后才补。
+   *
+   * 只改 `title`（鼠标悬停的提示）不动 `aria-label`：读屏软件要的是
+   * 「这个按钮干什么用」，把容量念一遍只是噪音。
+   */
+  function syncUploadHint() {
+    if (el.upload === null) return
+    el.upload.title = '上传图片或文件（' + uploadLimitMB() + ' MB 以内）'
   }
 
   function enterRoom() {
@@ -1724,6 +1846,8 @@
     var isAdmin = me.role === 'admin'
     if (el.exportButton !== null) el.exportButton.hidden = !isAdmin
     if (el.purgeButton !== null) el.purgeButton.hidden = !isAdmin
+    // 上传上限按角色分档，提示要跟着变（数字是角色决定的，模板里写不了）
+    syncUploadHint()
 
     // 每次进房间都把成员面板收回收起态（默认折叠），要用再点开
     setMembersExpanded(false)
