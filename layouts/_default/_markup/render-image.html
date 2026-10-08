@@ -1,0 +1,67 @@
+{{- /*
+  图片渲染钩子：接管 markdown 的 `![alt](src "title")`。
+
+  ── 为什么需要它 ──
+  PaperMod 会原样输出 <img>，于是图片既点不开，也拿不到「原始宽高」。
+  而宽高是这套东西的地基，两条链都靠它：
+    · 写进 <img> 的 width/height 属性 → 浏览器据此算 aspect-ratio，
+      图还没加载完也先占好位，不会跳版；
+    · 同一个宽高顺手给灯箱（data-width / data-height）→ GLightbox 打开时
+      直接用真实比例，不会先撑成它默认的 900×506 再抽一下。
+
+  ── 前提：图片必须是「文章资源」──
+  也就是和 index.md 放在同一个目录里：
+
+      content/posts/2026-10-大理/index.md
+      content/posts/2026-10-大理/img/01.jpg
+
+  只有这样 Hugo 才能读出宽高。写成外链、或放在 static/ 下的图会走 else 分支：
+  **照样能点开、照样进灯箱**，只是没有宽高，灯箱打开时会闪一下，页面加载时也会跳版。
+
+  ── 两个必须守住的坑 ──
+  1. 这里**不能**输出块级元素（<figure>、<div> 之类）。
+     渲染钩子的结果仍然待在 Goldmark 生成的 <p> 里面，塞块级元素会让浏览器
+     提前闭合 <p>，页面里多出一堆空段落、版式全乱。所以只用行内的 <a> + <img>，
+     图注交给灯箱的标题（data-title）。
+  2. .Destination 里的空格是被编码过的（goldmark 会写成 %20），
+     直接拿它去找资源会找不到 → 必须解一遍再试。
+     文件名里**别用空格**，那不是 Hugo 的问题，是 URL 的问题。
+*/ -}}
+
+{{- $dest := .Destination -}}
+{{- $alt := .Text -}}
+{{- $title := .Title | default .Text -}}
+
+{{- /* 找资源：原样 → 解 %20 → 退到按文件名找 */ -}}
+{{- $res := .Page.Resources.GetMatch $dest -}}
+{{- if not $res -}}
+  {{- $res = .Page.Resources.GetMatch (strings.Replace $dest "%20" " ") -}}
+{{- end -}}
+{{- if not $res -}}
+  {{- $res = .Page.Resources.GetMatch (path.Base (strings.Replace $dest "%20" " ")) -}}
+{{- end -}}
+
+{{- $src := $dest -}}
+{{- $w := 0 -}}
+{{- $h := 0 -}}
+{{- with $res -}}
+  {{- $src = .RelPermalink -}}
+  {{- /* 只对 Hugo 能解码的格式读宽高。
+         调 .Width 去问一个解不出来的文件（比如 HEIC）会直接让构建失败，
+         所以先用扩展名挡一道。 */ -}}
+  {{- $ext := lower (path.Ext .RelPermalink) -}}
+  {{- if and (eq .ResourceType "image") (in (slice ".jpg" ".jpeg" ".png" ".gif" ".webp" ".bmp" ".tif" ".tiff") $ext) -}}
+    {{- $w = .Width -}}
+    {{- $h = .Height -}}
+  {{- end -}}
+{{- end -}}
+
+<a class="glightbox" href="{{ $src | safeURL }}"
+   data-gallery="{{ .Page.RelPermalink }}"
+   {{- with $title }} data-title="{{ . }}"{{ end }}
+   {{- if $w }} data-width="{{ $w }}" data-height="{{ $h }}"{{ end }}>
+  <img src="{{ $src | safeURL }}" alt="{{ $alt }}"
+       {{- with $title }} title="{{ . }}"{{ end }}
+       {{- if $w }} width="{{ $w }}" height="{{ $h }}"{{ end }}
+       loading="lazy" decoding="async">
+</a>

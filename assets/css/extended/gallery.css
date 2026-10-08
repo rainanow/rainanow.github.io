@@ -1,0 +1,104 @@
+/* 正文图片：自动排版 + 点击放大（灯箱用 GLightbox，见 assets/js/gallery.js）。
+   HTML 侧由两处产出，都会是 <a class="glightbox"> 包一张 <img>：
+     · layouts/_default/_markup/render-image.html  → 旅游文章的 markdown 图片
+     · layouts/shortcodes/score.html               → 乐谱短代码
+
+   ⚠️ 这个文件在 assets/css/extended/ 下，会被主题的 head.html 用
+   `resources.Match "css/extended/*.css"` 自动收进全局样式包，
+   所以新加文件不用改主题、也不用改 head。 */
+
+/* ── 1. 可点区域 ───────────────────────────────────────────── */
+
+.post-content a.glightbox {
+    /* 默认 inline-block：正文里夹在句子中间的图不能被弄成块级，否则会断行 */
+    display: inline-block;
+    max-width: 100%;
+    cursor: zoom-in;
+    /* 主题给 .post-content a 加了 `box-shadow: 0 1px 0`（当假下划线使）。
+       图片链接不是文字链接，这一笔会变成图下方多出来的一条 1px 横线 → 清掉。 */
+    box-shadow: none;
+    text-decoration: none;
+}
+
+.post-content a.glightbox > img {
+    /* ⚠️⚠️ height:auto 这一条绝对不能省，和 scores.css 里是同一个坑：
+       <img> 上的 width/height 属性在浏览器里会变成 presentational hint，
+       等价于 `width:1600px; height:1000px`；而主题只给了 `img { max-width:100% }`
+       （reset.css）——于是宽度被容器压窄、高度却还锁在属性那一千像素上，
+       图片被拉长压扁，一行里的图高矮也全对不上、更谈不上「缩小」。
+       写了 height:auto 之后，高度改由属性推出的 aspect-ratio 计算：
+       既严格等比缩放，又能在图还没下载完时预留正确高度的占位（不跳版）。 */
+    height: auto;
+    /* 主题原本是 margin: 1rem 0，这里换成 auto —— 垂直间距不变，
+       但比正文窄的图会被居中，而不是尴尬地贴左边 */
+    margin: 1rem auto;
+    border-radius: 4px;
+    transition: opacity .2s;
+}
+
+.post-content a.glightbox:hover > img {
+    opacity: .88;
+}
+
+/* 独占一行的单图：Goldmark 会把它包进 <p>，且那个 <p> 里只有这一个链接 */
+.post-content p > a.glightbox:only-child {
+    display: block;
+}
+
+/* 短代码直接输出的 <a>（没被 <p> 包住的情况，比如乐谱） */
+.post-content > a.glightbox {
+    display: block;
+}
+
+/* ── 2. 自动排版：连续的图并成一行 ─────────────────────────── */
+
+.post-content .gallery {
+    /* 基准宽度的「开关系数」，决定一行大概放几张（见下面 flex-basis 的说明）。
+       用百分比而不是固定 px，是为了让一行的张数跟着正文栏宽走 ——
+       写死 160px 的话，宽屏一行能塞 5 张、窄屏只剩 1 张，两头都不对。
+
+       标定：flex-basis ∝ 宽高比，所以一行会一直塞到「总宽高比 ≈ 100/20 = 5」才换行。
+         · 4:3 的图（ar 1.33）→ 一张 26.7% → 一行 3 张（80% + 缝隙）
+         · 3:2 的图（ar 1.50）→ 一张 30%   → 一行 3 张（90% + 缝隙）
+         · 方图  （ar 1.00）→ 一张 20%   → 一行 4 张
+       调大 = 一行更少、单张更大。 */
+    --gallery-base: 20%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 6px;
+    margin: 1.5rem 0;
+}
+
+.post-content .gallery > a.glightbox {
+    display: block;
+    /* 关键：flex-basis 和 flex-grow **都**正比于宽高比 --ar。
+       只有两个都跟着比例走，一行里的图才是「等高 + 等比 + 不裁切 + 不留缝」：
+         basis ∝ ar  → 每张占的初始宽度本就按比例分配
+         grow  ∝ ar  → 剩余空间也按比例分
+       于是 w_i = ar_i × 常数，高度 h_i = w_i / ar_i 全都相等。
+       （若 basis 写成固定值，w_i = 固定值 + 比例份额，高度就不再相等了。）
+       --ar 由 gallery.js 从 data-width/data-height 写进来。
+       兜底值 1.5 是「未知比例」时最不容易翻车的假设 —— 它只会让首帧
+       的宽度分配略有偏差，脚本一跑就被真实比例覆盖。 */
+    flex-grow: var(--ar, 1.5);
+    flex-shrink: 1;
+    flex-basis: calc(var(--gallery-base) * var(--ar, 1.5));
+    min-width: 0;
+}
+
+.post-content .gallery > a.glightbox > img {
+    /* 图填满外框的宽 —— 高度由上面的 height:auto 顺着比例算，
+       于是外框高度 = 宽度 / ar，一行内必然一致。 */
+    width: 100%;
+    margin: 0;
+    border-radius: 4px;
+}
+
+/* 窄屏把系数放大：一行 2 张（每张约 40% 宽）比 3 张（约 27%）看得清得多 */
+@media (max-width: 640px) {
+    .post-content .gallery {
+        --gallery-base: 26%;
+        gap: 4px;
+    }
+}

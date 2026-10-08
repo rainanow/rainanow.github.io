@@ -86,14 +86,25 @@
 </script>
 {{- end -}}
 
-<img class="score"
-     data-src="{{ .Get "src" | safeURL }}"
-     alt="{{ .Get "title" }}"
-     title="{{ .Get "title" }}"
-     width="{{ .Get "w" }}"
-     height="{{ .Get "h" }}"
-     decoding="async">
-<noscript>
-  <img class="score" src="{{ .Get "src" | safeURL }}" alt="{{ .Get "title" }}"
-       title="{{ .Get "title" }}" width="{{ .Get "w" }}" height="{{ .Get "h" }}">
-</noscript>
+{{/* 外面这层 <a> 是给灯箱（GLightbox）用的：
+     · class="glightbox" 是它认的选择器；
+     · href 指向同一张图 —— 点开时如果图已经由上面的懒加载拉过了，
+       大概率直接吃浏览器缓存，不会再打一次 img.yulo.top（那上面有 40 次/秒的限流）；
+     · data-gallery 让这一页的 167 张归成一组，于是灯箱里能左右滑/按 ←→ 翻页；
+     · data-width/height 直接给真实像素，灯箱不用等图加载完才知道比例。 */}}
+<a class="glightbox" href="{{ .Get "src" | safeURL }}"
+   data-gallery="{{ .Page.RelPermalink }}"
+   data-title="{{ .Get "title" }}"
+   data-width="{{ .Get "w" }}" data-height="{{ .Get "h" }}">
+  <img class="score"
+       data-src="{{ .Get "src" | safeURL }}"
+       alt="{{ .Get "title" }}"
+       title="{{ .Get "title" }}"
+       width="{{ .Get "w" }}"
+       height="{{ .Get "h" }}"
+       decoding="async">
+  <noscript>
+    <img class="score" src="{{ .Get "src" | safeURL }}" alt="{{ .Get "title" }}"
+         title="{{ .Get "title" }}" width="{{ .Get "w" }}" height="{{ .Get "h" }}">
+  </noscript>
+</a>
