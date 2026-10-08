@@ -11,3 +11,24 @@
   （表现是「页面骨架在、状态永远停在正在加载、注册按钮点不动」），
   这个注释就是提醒下一个来改 footer 的人。
 */ -}}
+
+{{- /* ── 图片画廊：点击放大 + 自动排版 ──────────────────────────────
+
+   这两行是**与当前页面无关**的静态引用（路径来自 fingerprint，全站一致），
+   所以放在这个被 partialCached 的 partial 里是安全的。
+   **别在这里加 {{ if .IsPage }} 之类的分支** —— 一加就串页。
+
+   为什么不做成「只在有图的页面加载」：列表页的摘要里也会有图
+   （同样由 render-image.html 输出）。如果只按「本页正文有没有图」来判断，
+   列表页那些图就会变成「点了直接跳去原图」，比不加载更难看。
+   代价是每个页面多一个 gzip 后约 15KB 的脚本；页面上没有 .glightbox 时
+   它什么都不做。
+
+   不加 integrity 是有意的：同源脚本本来就防不了什么，而 SRI 一旦对不上，
+   浏览器是**静默拒绝执行** —— 页面看着正常、点图没反应，极难排查。
+
+   顺序不能反：gallery.js 依赖 GLightbox 已经存在。 */ -}}
+{{- $glightboxJS := resources.Get "js/vendor/glightbox.min.js" | fingerprint -}}
+{{- $galleryJS := resources.Get "js/gallery.js" | fingerprint -}}
+<script src="{{ $glightboxJS.RelPermalink }}"></script>
+<script src="{{ $galleryJS.RelPermalink }}"></script>
