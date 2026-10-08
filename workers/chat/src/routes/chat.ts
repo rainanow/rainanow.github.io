@@ -11,6 +11,7 @@ import {
   HISTORY_PAGE_SIZE,
   MAX_MESSAGE_LENGTH,
   MEMBER_LIST_LIMIT,
+  MESSAGE_ALLOWED_PER_WINDOW,
   MESSAGE_WINDOW_SECONDS,
   REFRESH_TOKEN_COOKIE,
 } from '../config'
@@ -385,12 +386,13 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       return c.json({ error: parsed.error.issues[0]?.message ?? '输入不合法' }, 400)
     }
 
-    // limit 传 2 而不是 1：`consumeRateLimit` 是「先记账再判断」，
-    // 窗口里的第一条（hits = 1）必须放行，所以要拦第 2 条就得把阈值设成 2。
+    // `+1` 的由来：`consumeRateLimit` 是「先记账再判断」，传 N 表示窗口里的
+    // 第 N 次被拦 —— 想放行 10 次就得传 11。常量的名字已经是「允许的次数」，
+    // 所以这里一定能看见 `+ 1`，不要让调用点直接写数字。
     const attempt = await consumeRateLimit(
       c.env.DB,
       `message:${sub}`,
-      effectiveLimit(c.env, 2),
+      effectiveLimit(c.env, MESSAGE_ALLOWED_PER_WINDOW + 1),
       MESSAGE_WINDOW_SECONDS,
     )
     if (attempt.blocked) {
@@ -443,7 +445,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
     //    就是无限次「读一行 + 404」，这一层保护等于没有——而这条路由原先连这个都没有。
     //  - 代价是「本来就删不掉」的请求（消息已被别人删掉、id 不存在）也会占额度。
     //    这在真实使用里可以忽略：前端一个消息只渲染一个撤回按钮，点两下、第二下拿到 404
-    //    就到头了，而额度是 20 次/分钟。
+    //    就到头了，而额度是 30 次/分钟。
     //  - 用 `delete:<userId>` 而不是复用发言那个 key，否则「连撤几条旧消息」会把人
     //    接下来的发言一起锁掉。原因写在 config.ts 那个常量上。
     const attempt = await consumeRateLimit(
@@ -590,17 +592,19 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
   const R2_DELETE_BATCH = 1000
 
   /**
-   * 改密码限额：同一账号 10 分钟内最多 5 次。
+   * 改密码限额：同一账号 1 分钟内最多 30 次。
    *
-   * 比其它几条限流严得多，因为**每一次都要跑一次 scrypt 验签 + 一次 scrypt 哈希**
-   * （验旧密码 + 存新密码）。scrypt 的设计目标本来就是「慢到爆破不划算」，
-   * 单次开销是登录的数倍，放开跑就能拿它当 CPU 放大器。
+   * 说它是「限额」有点勉强 —— 30 次/分钟明显不是给人用的量级，正常账号
+   * 一辈子也就改几次。这里**真正在乎的是「有人拿着别人的 access token 刷」**，
+   * 因为每一次都要跑一次 scrypt 验旧密码 + 一次 scrypt 哈希新密码：
+   * scrypt 的设计目标就是「慢到爆破不划算」，单次开销是登录的数倍，
+   * 不限流就等于给了一个 CPU 放大器（免费套餐只有 10 ms CPU/请求）。
    *
-   * 5 次/10 分钟对正常人绰绰有余（改密码通常一辈子就改几次），
-   * 而它把「拿着别人的 access token 来烧 CPU」压到了可忽略的量级。
+   * 所以这个数字是「用起来绝不会碰到、同时把放大倍数按死」的折中，
+   * 和别的路由统一成 30 次/分钟，不再单独收窄。
    */
-  const PASSWORD_CHANGE_LIMIT = 5
-  const PASSWORD_CHANGE_WINDOW_SECONDS = 10 * 60
+  const PASSWORD_CHANGE_LIMIT = 30
+  const PASSWORD_CHANGE_WINDOW_SECONDS = 60
 
   const passwordSchema = z.object({
     currentPassword: z.string().min(1, '请输入当前密码').max(128, '密码最多 128 位'),
@@ -644,8 +648,10 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       )
       if (attempt.blocked) {
         c.header('Retry-After', String(attempt.retryAfterSeconds))
+        // 窗口是 1 分钟，所以按秒说就够了 —— 按分钟算会一律显示「1 分钟」，
+        // 反而比秒数更糊。
         return c.json(
-          { error: `改密码太频繁了，${Math.ceil(attempt.retryAfterSeconds / 60)} 分钟后再试` },
+          { error: `改密码太频繁了，${attempt.retryAfterSeconds} 秒后再试` },
           429,
         )
       }

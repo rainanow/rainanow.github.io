@@ -12,6 +12,7 @@ import {
 } from './config'
 import type { AppEnv, ChatContext } from './context'
 import type { Env } from './env'
+import { globalRequestLimit } from './global-limit'
 import { scryptHasher } from './hasher'
 import { messageFields, messageTableName } from './models/message'
 import { roomPurgeFields, roomPurgeTableName } from './models/room-purge'
@@ -87,6 +88,16 @@ export function buildChatApp(env: Env): ChatContext {
       maxAge: 86400,
     }),
   )
+
+  /*
+   * 全站每日请求数熔断，**必须挂在 CORS 之后**。
+   *
+   * 挂在前面的话，被熔断时的 429 响应不带 CORS 头，浏览器会把它显示成一个
+   * 跨域错误 —— 前端拿不到那句「今天到上限了」的中文说明，用户看到的是
+   * 「加载失败」。这和限流那次的教训是一样的：**任何会被用户看到的错误响应，
+   * 都得先经过 CORS**。
+   */
+  app.use('*', globalRequestLimit)
 
   app.onError((error, c) => {
     if (error instanceof HTTPException) {

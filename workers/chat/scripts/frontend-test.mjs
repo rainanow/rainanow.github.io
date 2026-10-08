@@ -238,7 +238,9 @@ try {
   // --- XSS ---
   section('XSS 防护')
   const payload = '<img src=x onerror="window.__pwned=1">'
-  await sleep(2200) // 绕开发言限流（窗口 2 秒）
+  // 发言限流是「10 秒 10 次」，这一节发不了几条，不会撞上；
+  // 留着这点间隔只是让上一条的广播、渲染先落地。
+  await sleep(2200)
   $('[data-chat-input]').value = payload
   submitForm('[data-chat-composer]')
 
@@ -262,7 +264,7 @@ try {
   section('行内 markdown')
   const mdStamp = String(Date.now())
   const md = '**粗体** 与 `代码` 与 [链接](https://example.com) ' + mdStamp
-  await sleep(2200) // 绕开发言限流（窗口 2 秒）
+  await sleep(2200)
   $('[data-chat-input]').value = md
   submitForm('[data-chat-composer]')
 
@@ -925,8 +927,8 @@ try {
   /*
    * refresh 被限流（429）不该把人登出 —— 回归测试。
    *
-   * 背景：本地跑测试时把 refresh 限流桶打满（29 次），浏览器一进页面
-   * 就看到「登录已过期」—— 而密码对、会话也好，只是刷新太勤被限流。
+   * 背景：本地跑测试时把 refresh 限流桶打满（三十几次，超过 30 次/分钟的额度），
+   * 浏览器一进页面就看到「登录已过期」—— 而密码对、会话也好，只是刷新太勤被限流。
    * 修法：refreshSession 的结果从布尔改成三态（ok / expired / retry），
    * 429 归入 'retry'；三个调用方（api / 重连 / boot）看到 'retry' 都不登出。
    *

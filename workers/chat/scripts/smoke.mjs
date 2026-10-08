@@ -68,16 +68,28 @@ function resetLocalRateLimits() {
 }
 
 /**
- * 直接把「上传配额」塞满，用来验证熔断。
+ * 直接把「全站上传额度」塞满，用来验证熔断。
  *
- * 不真传 30 个文件是因为那太慢，而且会把本地 R2 撑起来。
+ * 不真传 100 个文件是因为那太慢，而且会把本地 R2 撑起来。
  * 反正验的是「额度用完之后接口的态度」，账本怎么来的不重要。
+ *
+ * ⚠️ **键名必须和 `src/quota.ts` 里那四个构造函数保持一致**。写错了不会报错，
+ * 只会让这一节变成空转 —— 现象是「额度明明塞满了却还能传」，
+ * 而不是「找不到表」。所以 `npm run verify-build` 里有一条专门核对键名。
  */
-function forceUploadQuota(day) {
+function forceGlobalBytesQuota() {
   withLocalDb((db) => {
     db.exec('DELETE FROM upload_usage')
-    const insert = db.prepare('INSERT INTO upload_usage (id, bytes, count) VALUES (?, ?, ?)')
-    insert.run(`global:${day}`, 8 * 1024 * 1024 * 1024, 99999)
+    db.prepare('INSERT INTO upload_usage (id, bytes, count) VALUES (?, ?, ?)')
+      .run('total:global', 8 * 1024 * 1024 * 1024, 0)
+  })
+}
+
+function forceGlobalCountQuota(day) {
+  withLocalDb((db) => {
+    db.exec('DELETE FROM upload_usage')
+    db.prepare('INSERT INTO upload_usage (id, bytes, count) VALUES (?, ?, ?)')
+      .run(`daily:global:${day}`, 0, 99999)
   })
 }
 
@@ -517,7 +529,9 @@ section('上传与媒体')
 
   // 换一个会被当成纯文本的 HTML：必须拒掉，
   // 否则下载下来双击就能在浏览器里执行
-  await sleep(3400) // 绕开上传间隔限流
+  //
+  // 这里原先睡 3.4 秒「绕开上传间隔限流」—— 那个「3 秒 1 个」的最小间隔已经改成
+  // 「10 秒 10 次」，而本节一共只传三次，不需要再等了。
   const htmlUpload = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'text/html',
@@ -526,7 +540,6 @@ section('上传与媒体')
   })
   check('HTML / SVG 这类标记文本被拒', htmlUpload.status === 415, `实际 ${htmlUpload.status}`)
 
-  await sleep(3400)
   const svgUpload = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/svg+xml',
@@ -536,7 +549,7 @@ section('上传与媒体')
   check('SVG 被拒（它能在浏览器里执行脚本）', svgUpload.status === 415, `实际 ${svgUpload.status}`)
 
   // 撤回要连带删掉媒体对象
-  await sleep(2200) // 绕开发言间隔限流
+  // （发言限流是「10 秒 10 次」，本节只有这一条，不用再等了）
   const withMedia = await request('/api/messages', {
     method: 'POST',
     jar,
@@ -562,11 +575,10 @@ section('上传与媒体')
 section('上传配额')
 {
   const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
-  // 配额的日界是北京时间
+  // 文件数那把尺子按北京时间切日
   const day = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
 
   clearUploadQuota()
-  await sleep(3400) // 绕开上传间隔限流
   const before = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/png',
@@ -575,29 +587,47 @@ section('上传配额')
   })
   check('额度充足时能正常上传', before.status === 201, `实际 ${before.status}`)
 
-  // 把全站今天的额度填满，模拟被人拿一群小号刷爆
-  forceUploadQuota(day)
-  await sleep(3400)
-  const blocked = await uploadRequest('/api/uploads', {
+  /*
+   * ① 全站**累计字节**到顶。这是新口径（原先按天算），也是这一节最该守住的东西：
+   *    存储满了的解决办法是删文件，不是等到明天 —— 所以文案里必须是「存储空间」，
+   *    不能是「今天」。文案写错不会让接口挂掉，只会把人误导到错的方向。
+   */
+  forceGlobalBytesQuota()
+  const bytesBlocked = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/png',
     filename: 'quota-b.png',
     bytes: pngBytes,
   })
-  check('全站额度用完后上传被挡（429）', blocked.status === 429, `实际 ${blocked.status}`)
-  const blockedBody = await blocked.json()
+  check('全站累计存储到顶后上传被挡（429）', bytesBlocked.status === 429, `实际 ${bytesBlocked.status}`)
+  const bytesBody = await bytesBlocked.json()
   check(
-    '回了一句能看懂的原因',
-    typeof blockedBody.error === 'string' && blockedBody.error.length > 0,
-    `实际 ${JSON.stringify(blockedBody)}`,
+    '理由说的是存储空间，不是「今天」',
+    typeof bytesBody.error === 'string' && bytesBody.error.includes('存储空间'),
+    `实际 ${JSON.stringify(bytesBody)}`,
   )
 
-  clearUploadQuota()
-  await sleep(3400)
-  const after = await uploadRequest('/api/uploads', {
+  // ② 全站**当日文件数**到顶：另一把尺子，切日口径是北京时间
+  forceGlobalCountQuota(day)
+  const countBlocked = await uploadRequest('/api/uploads', {
     jar,
     contentType: 'image/png',
     filename: 'quota-c.png',
+    bytes: pngBytes,
+  })
+  check('全站当日文件数到顶后上传被挡（429）', countBlocked.status === 429, `实际 ${countBlocked.status}`)
+  const countBody = await countBlocked.json()
+  check(
+    '理由是「今天…明天再来」这一侧',
+    typeof countBody.error === 'string' && countBody.error.includes('今天'),
+    `实际 ${JSON.stringify(countBody)}`,
+  )
+
+  clearUploadQuota()
+  const after = await uploadRequest('/api/uploads', {
+    jar,
+    contentType: 'image/png',
+    filename: 'quota-d.png',
     bytes: pngBytes,
   })
   check('额度恢复后能继续上传', after.status === 201, `实际 ${after.status}`)
@@ -705,7 +735,7 @@ section('审计：谁删的、什么时候删的')
     console.log('  （目标不是本机，跳过：审计字段要直接读本地 D1）')
   } else {
     // 本节的删除用的是主账号，而前面「撤回限流」那一节刚把它的撤回额度打满
-    // （20 次/60 秒）。不清的话这里会拿到 429，测试失败跟审计逻辑本身没关系。
+    // （30 次/60 秒）。不清的话这里会拿到 429，测试失败跟审计逻辑本身没关系。
     //
     // 选择在这里清桶、而不是靠「把本节挪到限流测试之前」，是因为顺序耦合太脆弱 ——
     // 将来谁调整一下章节顺序就会莫名其妙变红。让它自己备好前置条件更稳。

@@ -5,7 +5,8 @@
 - **运行时**：Cloudflare Workers
 - **路由 / 校验**：Hono + [`@nanokajs/core`](https://www.npmjs.com/package/@nanokajs/core)（模型 → Drizzle schema / Zod 校验器）
 - **认证**：[`@nanokajs/auth`](https://www.npmjs.com/package/@nanokajs/auth)（登录、JWT、refresh 轮换）
-- **数据库**：D1（账号、消息、令牌吊销名单、限流计数）
+- **数据库**：D1（账号、消息、令牌吊销名单、限流计数、上传配额、全站请求计数）
+- **对象存储**：R2（上传的图片 / 音视频 / 文档，直连对外，不走 Worker）
 - **实时推送**：Durable Objects + WebSocket Hibernation
 - **前端**：博客仓库里的 `assets/js/chat.js`，页面在 `content/chat.md` → `/chat/`
 
@@ -19,11 +20,14 @@
    │  ① 登录 / 注册 / 历史 / 发消息   —— 跨域 fetch，带 HttpOnly Cookie
    ▼
 api.yulo.top  ──  Worker（Hono + nanoka）
+   │                ├── 全站请求计数 + 熔断（每 10 秒落一次 D1，见「免费额度核算」）
    │                ├── /auth/*  注册、登录、刷新、登出
-   │                ├── /api/*   当前用户、消息历史、发消息、撤回
+   │                ├── /api/*   当前用户、消息历史、发消息、撤回、上传
    │                └── /api/ws  WebSocket 入口（纯转发）
    │
-   ├──► D1 ── users / messages / auth_blacklist / rate_limits
+   ├──► D1 ── users / messages / auth_blacklist / rate_limits / upload_usage
+   │
+   ├──► R2 ── 上传的文件（线上由 R2 直连对外，不经过 Worker）
    │
    └──► ChatRoom Durable Object（一个房间一个实例）
             └── 用 Hibernation API 持有所有 WebSocket，
@@ -64,16 +68,19 @@ workers/chat/
 │   ├── hasher.ts            # scrypt 密码哈希（为什么不用自带的 PBKDF2，见文件注释）
 │   ├── blacklist.ts         # D1 版 refresh 令牌吊销名单
 │   ├── rate-limit.ts        # D1 固定窗口限流
+│   ├── global-limit.ts      # 全站每日请求数熔断（内存累加 + 每 10 秒落库，见「免费额度核算」）
+│   ├── quota.ts             # 上传配额：文件数按天、字节数按累计总量（见第 23 条）
 │   ├── middleware.ts        # Cookie → Authorization 桥接、取客户端 IP
 │   ├── origins.ts           # 来源白名单、Cookie/令牌读取
 │   ├── config.ts            # 常量集中处
 │   ├── models/              # 表定义（nanoka 字段 DSL）
-│   └── routes/              # auth.ts / chat.ts
+│   └── routes/              # auth.ts / chat.ts / media.ts
 └── scripts/
-    ├── smoke.mjs            # 后端端到端冒烟测试（108 项）
-    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（59 项）
+    ├── smoke.mjs            # 后端端到端冒烟测试（128 项）
+    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（153 项）
     ├── purge-test.mjs       # 清空房间的去重与批量切分（17 项，纯逻辑）
-    ├── verify-build.mjs     # 构建产物归属检查（8 项，CI 里也跑）
+    ├── verify-build.mjs     # 构建产物 + 后端源码不变量（24 项，CI 里也跑）
+    ├── rate-limit-test.mjs  # 真实限流阈值（22 项，自带 STRICT_RATE_LIMIT 的 server）
     ├── probe-production.mjs # 探线上健康
     └── inspect-d1.mjs       # 直接读本地 D1 的 SQLite，排查用
 ```
@@ -95,10 +102,11 @@ npm run dev                  # http://127.0.0.1:8787
 
 ```bash
 npm run typecheck            # TypeScript 全量检查
-npm run smoke                # 后端 108 项
-npm run frontend-test        # 前端 59 项（需要先 hugo 构建出 public/chat/index.html）
-npm run verify-build         # 构建产物归属 8 项（不需要 dev server，hugo 构建完就能跑）
+npm run smoke                # 后端 128 项
+npm run frontend-test        # 前端 153 项（需要先 hugo 构建出 public/chat/index.html）
+npm run verify-build         # 构建产物 + 后端源码不变量 24 项（不需要 dev server，hugo 构建完就能跑）
 npm run purge-test           # 清空房间的去重与批量切分 17 项（纯逻辑，不需要任何服务）
+npm run rate-limit-test      # 真实阈值 22 项（自己起一个 STRICT_RATE_LIMIT 的 dev server）
 npm run inspect-d1           # 打印本地 D1 里的表结构、账号、限流、吊销名单
 npm run probe-production     # 探线上 api.yulo.top + /chat/ 页面是否健康
 ```
@@ -272,15 +280,72 @@ jobs:
 
 | 资源 | 免费额度 | 这个应用的消耗 |
 | --- | --- | --- |
-| Workers 请求 | 100,000 / 天 | 每次 HTTP 调用 1 次；WebSocket 握手 1 次（连接期间不再计） |
+| Workers 请求 | 100,000 / 天 | 每次 HTTP 调用 1 次；WebSocket 握手 1 次（连接期间不再计）。**超了是 1027 错误页**，所以自己另设了一道同值熔断，见下 |
 | Workers CPU | **10 ms / 请求** | 见下方「最要紧的一条」——密码哈希刻意避开了这个坑 |
 | D1 读取 | 5,000,000 行 / 天 | 登录查 1 行；历史一页 50 行（有索引）；发消息约 2 行 |
-| D1 写入 | 100,000 行 / 天 | 发消息 1 行；登录失败 1 行；refresh 1 行 |
+| D1 写入 | 100,000 行 / 天 | 发消息 1 行；登录失败 1 行；refresh 1 行。**超了是拒绝执行查询**，不是计费 |
 | DO 请求 | 100,000 / 天 | 握手 1 次 + 每条消息广播 1 次；心跳由运行时直接应答，不唤醒对象 |
 | DO compute | 13,000 GB-s / 天 | 只在真正处理消息时计；空闲连接被 Hibernation 换出后不计 |
 | D1 存储 | **单库 500 MB**（账号级 5 GB） | 一条消息不到 1 KB，单库够放几十万条 |
+| R2 存储 | 10 GB-month | 上传配额卡在全站累计 8 GB（见下）。**超了是开始计费**，不是拒绝 |
 
 按这个量级，几十人同时在线、每天几千条消息都还有很大余量。
+
+### 所有阈值一览（改限流先看这张表）
+
+| 触发点 | 桶键 | 允许次数 | 窗口 | 备注 |
+| --- | --- | --- | --- | --- |
+| 登录失败 | `login:<ip>:<用户名>` | 10 | 1 小时 | `peekRateLimit` 只读预检，**失败才记账**（成功登录不写） |
+| 注册 | `register:<ip>` | 5 | 1 小时 | ⚠️ **实际只放行 4 次**，见下 |
+| 刷新令牌 | `refresh-ip:<ip>`，认得出账号时换成 `refresh:<sub>` | 30 | 1 分钟 | 解不出 `sub` 就退回按 IP（不能放行） |
+| 登出 | `logout-ip:<ip>`，认得出账号时换成 `logout:<sub>` | 30 | 1 分钟 | 被限流也照样清 Cookie（第 22 条） |
+| 发言 | `message:<sub>` | 10 | 10 秒 | 连发几句不会被误伤 |
+| 上传 | `upload:<sub>` | 10 | 10 秒 | 改阈值时**别只在调用点改数字**，读常量 |
+| 撤回 | `delete:<sub>` | 30 | 1 分钟 | 独立计数器，见第 15 条 |
+| 改密码 | `password:<sub>` | 30 | 1 分钟 | 限流排在「验旧密码」之前，先挡住再烧 scrypt |
+| 管理员操作（禁言 / 注销） | `moderation:<sub>` | 30 | 1 分钟 | 防误点和脚本刷管理员令牌 |
+| **全站请求**（熔断） | `requests:<UTC 日期>` | 100,000 | 1 天 | fail-open，见下 |
+| 全站上传文件数 | `daily:global:<日>` | 300 | 1 天 | 硬拒（429） |
+| 单人上传文件数 | `daily:user:<id>:<日>` | 100 | 1 天 | 硬拒；撤回时退回**上传那天** |
+| 单人累计上传字节 | `total:user:<id>` | 5 GiB | **永不** | 只有撤回才退，见第 23 条 |
+| 全站累计上传字节 | `total:global` | 8 GiB | **永不** | 只有撤回才退 |
+
+**完全没有限流的**：所有 `GET`（历史、成员名单、`/api/me`）走的是「登录 + 索引」那套，
+没有计数；`DELETE /api/rooms/:room`（清空房间）只查管理员角色 —— 它是刻意留给管理员的
+大批量清理出口，不能顺手给它加额度，否则清理一座刷屏房会先把自己卡住。
+
+> ⚠️ **表里是「允许次数」，代码里要写「+1」。** `consumeRateLimit` 是「先记账、再判断」
+> （`hits < limit` 才放行），传 N 表示第 N 次就被拦 —— 想放行 30 次必须传 31。
+> 所以 `config.ts` 里所有常量都叫 `*_ALLOWED_PER_WINDOW`，调用点一定能看见 `+ 1`。
+> 唯一的例外是注册：它传的是 `REGISTER_LIMIT` 本身、没 `+1`，
+> 于是**声明 5 次、实际放行 4 次**。这是历史遗留，`rate-limit-test` 里把 4 写死在断言上，
+> 改的时候两边要一起动。
+
+### 全站请求熔断：把平台的硬边界翻译成人话
+
+Workers 免费版一天 10 万请求，超了 Cloudflare 直接返回 **1027 错误页**（免费额度按
+**UTC 午夜**重置）—— 那是「整站突然打不开」，连一句能看懂的话都没有。
+
+所以 `src/global-limit.ts` 自己记一笔账，到顶就回 429 + 中文原因 + `Retry-After`。
+`GLOBAL_DAILY_REQUEST_LIMIT = 100_000` 和平台额度**同值**：目的不是把额度压小，
+而是在撞上平台硬墙之前**先自己拦住**，把 1027 换成一句人话。
+
+它是**成本护栏，不是安全边界**，所以有两处刻意的「不精确」：
+
+| 决定 | 理由 |
+| --- | --- |
+| 计数走 isolate 内存，**每 10 秒**才批量落一次 D1 | 每请求写一次 = 每天 10 万行写，正好等于 D1 免费额度的**全部**写入量（而且 D1 超了是拒绝查询）。改成每 10 秒落一次后，写入量降到约 8,640 行/天 |
+| 同步失败只记日志、**照常放行**（fail-open） | 护栏自身坏掉不该让网站打不开。这与按账号限流的 fail-closed **方向相反**，改的时候别照搬那边 |
+
+判断用的是「库里的总数 + 本 isolate 还没落库的 `pending`」。每个 isolate 各有一份 pending，
+所以计数只会**偏保守地早拦**（最坏早拦 10 秒的量），不会漏放很久。
+
+> 复用 `rate_limits` 那张表（`id` / `hits` / `windowStart` 形状正好够），所以**不需要新迁移**。
+> 每次同步都会刷新 `windowStart` —— 否则 `rate-limit.ts` 那套「超过 24 小时就删」的清理
+> 会把这行当成过期数据清掉，而它其实还在用。
+>
+> 中间件挂在**CORS 之后**（见 `app.ts`）。挂前面的话 429 响应没有 CORS 头，
+> 前端拿到的是一个不透明的网络错误，而不是那句中文提示。
 
 ### 和 CPU 10 ms 同性质、本地测不出上线才炸的另外三个上限
 
@@ -293,21 +358,28 @@ jobs:
 | 子请求 → Cloudflare 内部服务 / 每次调用 | **1,000** | 10,000 | R2 的 head/get/put/delete、D1 都算 |
 | 子请求 → 外部网络 / 每次调用 | **50** | 10,000 | 这个才是大多数人口中的「subrequest 上限」 |
 
-**D1 的 50 次最容易被忽略。** 现有路径逐条数过（2026-10-02 核）：
+**D1 的 50 次最容易被忽略。** 现有路径逐条数过（2026-10-08 核）：
 
 | 路由 | D1 查询数 |
 | --- | --- |
 | `POST /auth/login` 成功 | 2 |
 | `POST /auth/refresh` | 3（限流 1 + 黑名单读 1 + 写 1；handler 不查 users 表） |
 | `POST /api/messages` | 4 |
-| `POST /api/uploads` | 约 7（配额检查两条并发 + `markUpload` 两条 batch） |
-| `DELETE /api/messages/:id` 带 3 个媒体 | 约 13（含限流那 1 次 + 退配额的 batch） |
+| `POST /api/uploads` | 约 10（限流 1 + 用户 1 + 配额预检四条并发 + `markUpload` 四条 batch） |
+| `DELETE /api/messages/:id` 带 3 个媒体 | 约 15（含限流那 1 次 + 退配额的 4 条 batch） |
 | `GET /api/members`（`scope=all`） | 2（但一次读 500 行，**按行数计费**） |
 | `GET /api/members?scope=online` | 1（只查自己那一行；users 表**一行都不读**） |
 | `DELETE /api/rooms/:room`（清空） | 约 4（读 body 1 + 删消息 1 + 审计流水 1 + 限流/清理） |
 
-最宽的是撤回那条，约 13 次，离 50 还差得远。
+最宽的是撤回那条，约 15 次，离 50 还差得远。
 但**加一次限流就是加一次查询**，改动前先回来数一遍。
+
+> 表里那两个「约」指两件事：`rate-limit.ts` 每 32 次写入会顺带清一次过期行
+> （踩上那一拍就多一条 `DELETE`），以及配额那四把尺子每次都是**四条语句一起发**。
+> 所以别按整数去卡，加逻辑前把上表那一行重新加一遍。
+>
+> 全站请求熔断**不在这个表里**：它每 10 秒才写一次 D1，摊到单条请求约等于 0 ——
+> 这正是它不按「每请求一行」记的原因（那样一天就是 10 万行，吃掉 D1 的全部写入额度）。
 
 > `scope=online` 那一行的价值不在「少一次查询」，而在「少读 **500 行**」——
 > D1 是按读取行数计费的，成员名单原本每次有人进出都要刷全表。
@@ -507,7 +579,8 @@ Cloudflare 内部服务的子请求上限是 **1000 次 / 调用**（对外部�
 
 撤回原先**完全没有限流**，是整个后端唯一一条「无限制、每条都写库」的路由。
 它比发言更值得限，因为一次请求撬动的资源多得多：D1 读 2 行 + 写 1 行 + 一次 DO 广播，
-带媒体时还有 R2 head × N、R2 delete × N、退配额的 D1 batch（2 条语句）。
+带媒体时还有 R2 head × N、R2 delete × N、退配额的 D1 batch（4 条语句 ——
+文件数和累计字节各两把尺子，见第 23 条）。
 
 两个必须记住的点：
 
@@ -518,15 +591,15 @@ Cloudflare 内部服务的子请求上限是 **1000 次 / 调用**（对外部�
 **② 限流放在 `Message.findOne` 之前**（刻意的 fail-closed）。
 放到后面的话，攻击者拿随机 id 打过来就是无限次「读一行 + 404」，这层保护等于没有。
 代价是「本来就删不掉」的请求也占额度，但前端一条消息只渲染一个撤回按钮，
-点两下第二下拿到 404 就到头了，20 次/分钟的额度足够。
+点两下第二下拿到 404 就到头了，30 次/分钟的额度足够。
 
 **③ off-by-one：传 N 只放行 N-1 次。** `consumeRateLimit` 是「先记账、再判断」，
-窗口里的第 1 条（`hits = 1`）必须放行，所以传 21 才恰好放行 20 次。
+窗口里的第 1 条（`hits = 1`）必须放行，所以传 31 才恰好放行 30 次。
 **这个坑踩过两次了**（发消息那次、撤回这次），所以这次在 `config.ts` 里
-用 `DELETE_ALLOWED_PER_WINDOW = 20` 命名意图、在调用处写 `+ 1`，
-并实测验证过：全新用户连打 31 次，前 20 次 404、第 21 次起 429。
+用 `DELETE_ALLOWED_PER_WINDOW = 30` 命名意图、在调用处写 `+ 1`，
+并实测验证过：全新用户连打 34 次，前 30 次 404、第 31 次起 429。
 
-阈值是 20 次/60 秒，理由写在 `config.ts` 那个常量上。
+阈值是 30 次/60 秒，理由写在 `config.ts` 那个常量上。
 管理员的大批量清理**不要**走这个接口 —— 那是「清空房间」的活，
 走 `DELETE /api/rooms/:room`（R2 批量删，不受这条限制）。
 
@@ -575,7 +648,7 @@ rotation 开着意味着**每一次成功 refresh 都会往 `auth_blacklist` 写
 
 **② 解不出 `sub` 时退回按 IP 记账，不能放行。** 令牌无效/过期时 `verify()` 会抛，
 这时如果直接 `next()` 跳过限流，「拿一堆废 token 反复打」就成了免费的 D1 写路径。
-实测验证过这个分支：废 token 前 20 次正常返回 401、第 21 次起 429，
+实测验证过这个分支：废 token 前 30 次正常返回 401、第 31 次起 429，
 额度和有效 token 完全一致。
 
 > 写这条的测试时要注意：本地请求的 `clientIp()` 一律落到 `unknown`，
@@ -769,20 +842,60 @@ ORDER BY createdAt DESC, id DESC LIMIT 51;
 
 ---
 
+### 23. 上传配额：文件数按天、字节数按累计总量，四个键共用一张表
+
+配额有**四把尺子**（原先两把），分成两类 —— 这个划分不是随口定的：
+
+| 键 | 量的是 | 重置 | 挡什么 |
+| --- | --- | --- | --- |
+| `daily:user:<id>:<YYYY-MM-DD>` | 文件数 100/天 | 每天 | 一个人短时间刷一堆小文件 |
+| `daily:global:<YYYY-MM-DD>` | 文件数 300/天 | 每天 | 注册一堆小号一起刷 |
+| `total:user:<id>` | 累计字节 5 GB | **永不** | 一个人把聊天室当网盘 |
+| `total:global` | 累计字节 8 GB | **永不** | 所有人加起来占满 R2 |
+
+**字节为什么必须累计、不能按天。** 按天重置挡不住网盘用法：每天传满一点，
+存储只增不减，而 R2 的免费额度是按**存储量**算的（10 GB-month），
+跟「每天传多少」无关。所以字节那把尺子永不清零 —— 只有撤回才退。
+
+**数额是倒推出来的**：R2 免费 10 GB-month，超了是**开始计费**而不是拒绝执行，
+所以全站卡在 8 GB、留 2 GB 余量；单账户 5 GB 的含义是「一个人最多占一半」。
+单位一律 1024 进制，和仓库里别处一致。
+
+**为什么要四个键而不是两个。** 只按人不挡「注册一堆号」—— 而注册是开放的
+（第 10 条）；只按全站不挡「某一个人」，而且一个人刷满会连累所有人。两层各一把。
+
+**半笔账必须退回去。** `markUpload` 四条语句一次 `db.batch`，逐条看 `meta.changes`；
+任何一条没更新到（说明额度在那次**纯读**的预检之后被别人抢走了）就把已经记上的
+**全部退掉**，让状态回到「这次上传没发生过」。调用方拿到 `false` 就去删刚传的对象并回 429。
+预检负责把提示说清楚（「今天已经传了 100 个文件」vs「存储满了，删掉一些」），
+带条件的写负责保证计数**永远不越界**，两者分工不同、缺一不可。
+
+**这次改动没有迁移。** `upload_usage` 表本来就有 `id` / `bytes` / `count` 三列，
+四个键只是把两个维度分开记（每行只有一个有值）。
+代价是**旧数据没有回填**：改之前已经躺在 R2 里的文件不计入累计字节，
+也就是 8 GB 这条线是从 0 开始算的 —— 要精确的话得扫一遍 bucket 反推，
+按当前体量不值得。
+
+回归测试：`npm run smoke` 的「上传配额」一节，分别验累计字节和按天文件数**两条**拒绝路径，
+外加「清空额度后能继续传」。键名和塞账本的方式是否一致，由 `npm run verify-build` 守着。
+
+---
+
 ## 测试覆盖
 
-一共 **313 项**，分四个脚本。（项数会随测试增加变化，`2026-10-04` 实测值如下。）
+一共 **322 项**（四个进 CI 的脚本；另有 `rate-limit-test` 22 项，不在 CI 里）。
+（项数会随测试增加变化，`2026-10-08` 实测值如下。）
 
 ```bash
 npm run typecheck      # tsc --noEmit，CI 里也跑
-npm run verify-build   # 17 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
+npm run verify-build   # 24 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
 npm run purge-test     # 17 项，纯逻辑，不需要任何服务
-npm run smoke          # 126 项，需要 wrangler dev
+npm run smoke          # 128 项，需要 wrangler dev
 npm run frontend-test  # 153 项，需要 wrangler dev + 构建出的 public/chat/
-npm run rate-limit-test # 19 项，自己起一个 STRICT_RATE_LIMIT 的 dev server
+npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev server
 ```
 
-`npm run smoke`（126 项，后端）：
+`npm run smoke`（128 项，后端）：
 
 - 健康检查、CORS 预检（含非白名单来源拿不到允许头）
 - 注册 / 大小写不同的重名被拒 / 非法输入
@@ -790,11 +903,12 @@ npm run rate-limit-test # 19 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
 - 未登录访问 `/api/me`、历史、WebSocket 一律被拒
 - 非白名单 Origin 的 WebSocket 握手被拒（跨站劫持防护）
 - 实时收发：`ready` / `message` / 在线人数
-- 发言间隔限流、超长消息、历史游标分页与顺序
+- 发言频率限流（10 秒 10 次，连发几句不会被误伤）、超长消息、历史游标分页与顺序
 - 撤回本人消息 + 广播 + 历史消失；撤回连带删掉媒体对象并退上传额度
 - **撤回限流**：打满后 429、带 `Retry-After`、在此之前正常走到业务逻辑，
   且**不影响发言**（两个计数器分开，见第 15 条）
-- 上传配额：单人层、全站熔断、额度恢复后能继续上传
+- 上传配额：**两条拒绝路径各验一遍**（累计字节触顶、当日文件数触顶），
+  外加额度恢复后能继续上传（见第 23 条）
 - 管理员导出与清空：非管理员被拒、导出是原始数据、清空只影响目标房间
 - **成员名单**：`scope=online` 只回在线的人、带用户名、未登录仍 401
 - refresh 轮换、旧令牌重放被拒、登出后 refresh 被拒
@@ -822,7 +936,7 @@ npm run rate-limit-test # 19 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
   见第 18 条 —— 这几条是冲着那个「改密码点了没反应」来的，
   而且**不需要 admin、也不需要真的改掉测试账号的密码**。
 
-`npm run verify-build`（17 项，只检查 Hugo 构建产物，不需要 dev server）：
+`npm run verify-build`（24 项，只检查 Hugo 构建产物，不需要 dev server）：
 
 - `/chat/` 存在、加载了 `chat.js`、有聊天室骨架
 - **其它任何页面都没有** `chat.js`、也没有聊天室骨架
@@ -832,10 +946,16 @@ npm run rate-limit-test # 19 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
   这一项是后来加的 —— 那个数字原先在后端两处、前端一处各写一遍，
   而常量本身没人 import（是个死常量）。现在两边各有单一来源，
   「它们相等」这件事由这条检查钉住。
-- **后端源码不变量**（9 项，见第 19/20/22 条）：refresh 的会话校验排在限流**之后**、
+- **后端源码不变量**（16 项，见第 19/20/22/23 条）：refresh 的会话校验排在限流**之后**、
   `/auth/logout` 挂着限流、`broadcast` 里的 `stub.fetch` 包在 `try` 里、
   `SocketAttachment` 带 `exp`、握手查 `user_sessions`、广播前踢过期连接、
-  禁言区分「字段缺失」与 `null`。
+  禁言区分「字段缺失」与 `null`；以及配额那四个键的构造函数在 `quota.ts` 里存在、
+  `smoke.mjs` 塞账本用的键与之一致、`app.ts` 挂了全站请求熔断**且挂在 CORS 之后**。
+
+  > 最后那几条（「键名一致」「挂载顺序」）是**跨文件**的断言，专治「改了 A 忘了改 B」——
+  > 这次改配额时，`smoke.mjs` 里塞账本的键和 `quota.ts` 里的构造函数就是必须同步的两处。
+  > `media.ts` 里那个写死的上传限流值是后来靠读代码才发现的，现在由
+  > `rate-limit-test` 的「上传限流」一节兜住。
 
   > 这一类只能做**静态**断言（比位置、比包含关系），因为要证明它们得让 DO
   > 在测试中途挂掉、或者把限流打满一个窗口 —— 而本地限流是放宽的，
@@ -867,12 +987,17 @@ npm run rate-limit-test # 19 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
 2. **`markUpload()` 返回 `false` 那个分支**（额度在预检之后被抢走）。
    预检和守卫用的是**同一组条件**，所以单线程下两者永远一致；
    要让它分歧必须有真正的并发。而并发的上传会先撞上「上传限流」
-   （2 次 / 3 秒），两个 429 混在一起就分不清是谁挡的。
-   现在被覆盖到的是它的**成功路径**（每次上传都会走这条带条件的 UPSERT，
-   写错了所有上传都会 429），**拒绝路径没有**。
+   （10 秒 10 次），两个 429 混在一起就分不清是谁挡的。
+   现在被覆盖到的是它的**成功路径**（每次上传都会走这四条带条件的 UPSERT，
+   写错了所有上传都会 429），**拒绝路径没有** —— 但「拒绝路径的账没记错」
+   由 `smoke` 的配额一节从**外侧**验了一遍（塞满账本 → 429 → 清空 → 又能传）。
 
-另外，`npm run rate-limit-test` 这一套自己起 `STRICT_RATE_LIMIT` 的 dev server，
-**不在 CI 里跑**（CI 起 dev server 成本太高）。改限流相关代码时要手动跑一次。
+另外，`npm run rate-limit-test`（22 项）这一套自己起 `STRICT_RATE_LIMIT` 的 dev server，
+**不在 CI 里跑**（CI 起 dev server 成本太高）。改限流相关代码时要手动跑一次 ——
+它是唯一能验出「阈值到底放行多少次」的地方（smoke 跑在放宽模式，429 断言在那边永远绿）。
+它目前覆盖：注册 / 登录 / 撤回 / 发言 / 上传 / refresh 六条路径，
+**新增一条限流就顺手在这里加一节**：断言方向是「前 N 次必须成功、第 N+1 次才 429」，
+写成「第二次就被拦」会把正常的连发行为测成 bug。
 
 `npm run purge-test`（17 项，纯逻辑，不需要 dev server）：
 
