@@ -388,12 +388,17 @@ try {
   /*
    * --- 消息区 / 输入框的面板色 ---
    *
-   * 需求原话是「消息区和输入框都用 #f5f5f5」。这里断言的重点**不是**「等于 #f5f5f5」，
-   * 而是「必须走变量」：那个灰在浅色主题下等于 --code-bg，深色主题下必须换成深色。
+   * 需求：浅色下消息区和输入框都是 #f5f5f5；**深色下不做区分**，和页面背景同色。
+   *
+   * 断言的重点不是「等于 #f5f5f5」，而是「必须走变量」：
    * 谁要是为了「就想要这个灰」把 background 写成硬编码 #f5f5f5，
    * 浅色下一点异常都没有，深色下是浅底浅字、整块看不见 —— 属于最难发现的那类。
+   * 深色那条覆盖同理：它必须存在，否则深色会继承浅色那块浅灰。
    */
   section('消息区与输入框的面板色')
+  // 取**第一处** `<selector> {…}`。深色那条 `:root[data-theme="dark"] .chat {` 里也含
+  // `.chat {` 这个子串，但它在文件更后面，所以 `.chat` 取到的仍是浅色块；
+  // 万一有人把两条调换了顺序，下面的断言会**红**而不是静默放过。
   const cssRule = (selector) => {
     const start = chatCss.indexOf(`${selector} {`)
     return start === -1 ? '' : chatCss.slice(start, chatCss.indexOf('}', start))
@@ -404,8 +409,12 @@ try {
     /background:\s*var\(--chat-panel/.test(cssRule('.chat__composer textarea')),
   )
   check(
-    '面板色跟着主题变量走（--chat-panel 基于 --code-bg，没有写死）',
+    '浅色面板色走变量（--chat-panel 基于 --code-bg），没有写死十六进制',
     /--chat-panel:\s*var\(--code-bg/.test(cssRule('.chat')),
+  )
+  check(
+    '深色主题把面板色覆盖成 transparent（和背景同色、不做区分）',
+    /\[data-theme="dark"\] \.chat \{[^}]*--chat-panel:\s*transparent/.test(chatCss),
   )
 
   // --- 撤回按钮 ---
