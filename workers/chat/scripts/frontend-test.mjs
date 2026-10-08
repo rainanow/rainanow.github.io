@@ -385,6 +385,29 @@ try {
     systemRenderer.includes('textContent') && !systemRenderer.includes('innerHTML'),
   )
 
+  /*
+   * --- 消息区 / 输入框的面板色 ---
+   *
+   * 需求原话是「消息区和输入框都用 #f5f5f5」。这里断言的重点**不是**「等于 #f5f5f5」，
+   * 而是「必须走变量」：那个灰在浅色主题下等于 --code-bg，深色主题下必须换成深色。
+   * 谁要是为了「就想要这个灰」把 background 写成硬编码 #f5f5f5，
+   * 浅色下一点异常都没有，深色下是浅底浅字、整块看不见 —— 属于最难发现的那类。
+   */
+  section('消息区与输入框的面板色')
+  const cssRule = (selector) => {
+    const start = chatCss.indexOf(`${selector} {`)
+    return start === -1 ? '' : chatCss.slice(start, chatCss.indexOf('}', start))
+  }
+  check('消息区有底色', /background:\s*var\(--chat-panel/.test(cssRule('.chat__messages')))
+  check(
+    '输入框和消息区用同一块面板色',
+    /background:\s*var\(--chat-panel/.test(cssRule('.chat__composer textarea')),
+  )
+  check(
+    '面板色跟着主题变量走（--chat-panel 基于 --code-bg，没有写死）',
+    /--chat-panel:\s*var\(--code-bg/.test(cssRule('.chat')),
+  )
+
   // --- 撤回按钮 ---
   section('撤回按钮')
   // 只看**用户消息**：系统提示（进出房间 / 撤回提示）刻意没有撤回按钮，

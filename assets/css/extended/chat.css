@@ -43,6 +43,18 @@
   /* 自己发的气泡、以及输入框：比别人的再深一档，一眼能分出「我说的」和「我在打字」 */
   --chat-surface-strong: var(--code-bg, #f5f5f5);
   --chat-surface-strong: color-mix(in srgb, var(--theme) 85%, var(--primary) 15%);
+
+  /*
+   * ── 消息区 / 输入框的「面板色」──
+   *
+   * 指定值是 #f5f5f5。它在浅色主题下**正好等于** --code-bg（rgb(245, 245, 245)），
+   * 所以这里写 `var(--code-bg, #f5f5f5)` 而不是写死十六进制：
+   * 浅色主题拿到手就是 #f5f5f5，深色主题自动变成 rgb(55, 56, 62)。
+   *
+   * ⚠️ 绝不能写死 #f5f5f5。深色主题的文字是浅色的，一块浅底会让正文彻底看不见 ——
+   * 颜色是明暗共用同一份 CSS 的，写死就等于只对浅色负责。
+   */
+  --chat-panel: var(--code-bg, #f5f5f5);
 }
 
 /*
@@ -270,12 +282,13 @@
   flex-direction: column;
   /* 消息之间的距离再收一半（0.6 → 0.3 → 0.15rem），聊天记录看着更连贯 */
   gap: 0.15rem;
-  /* 消息区不画成一张卡片：没有边框、没有底色、没有圆角，
-     消息直接落在博客正文的背景上，和文章排版连成一片。
-     只留上下两条淡线，标出这块能滚动的区域到哪儿为止。 */
-  padding: 0.6rem 0.25rem;
-  border-top: 1px solid var(--border, #eee);
-  border-bottom: 1px solid var(--border, #eee);
+  /* 一整块面板：底色 + 圆角，把「消息区」和博客正文明确分开。
+     原先是「无底色 + 上下两条淡线」—— 那两条线是**没有底色时**用来标出
+     可滚动范围的替代品；现在有底色了，它们就成了多余的第二道边界，一起去掉。
+     左右内边距跟着从 0.25rem 加到 0.75rem：有底色之后气泡再贴着边就难看了。 */
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius, 6px);
+  background: var(--chat-panel, #f5f5f5);
 }
 
 /*
@@ -868,7 +881,9 @@
   min-height: 2.6rem;
   max-height: 9rem;
   color: var(--primary, #111827);
-  background: var(--chat-surface-strong, #e2e2e2);
+  /* 和消息区同一块面板色（浅色 = #f5f5f5）。两边同色之后，输入框靠这圈 border
+     跟人区分边界 —— 它和消息区之间还隔着 .chat__room 的 gap，不会糊成一整块。 */
+  background: var(--chat-panel, #f5f5f5);
   border: 1px solid var(--border, #e5e7eb);
   border-radius: var(--radius, 6px);
   /* 左边留一截给「+」，文字整体避开它 */
@@ -914,7 +929,7 @@
 @media (max-width: 600px) {
   .chat__messages {
     height: 60vh;
-    padding: 0.55rem;
+    padding: 0.55rem 0.7rem;
   }
 }
 
