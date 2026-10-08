@@ -41,21 +41,25 @@ function section(title) {
 // --- 一个最小的 Cookie 罐：jsdom 不管这个，chat.js 又假定浏览器会自动带 Cookie ---
 const jar = {}
 
-function jarHeader() {
-  return Object.entries(jar)
+function jarHeader(target = jar) {
+  return Object.entries(target)
     .map(([key, value]) => `${key}=${value}`)
     .join('; ')
 }
 
-function harvest(response) {
+/*
+ * `target` 是给「第二个账号」用的：下面要造一条**真的别人的消息**，
+ * 它必须用自己的 cookie 罐，不能把页面这个登录态覆盖掉。
+ */
+function harvest(response, target = jar) {
   for (const line of response.headers.getSetCookie?.() ?? []) {
     const pair = line.split(';')[0] ?? ''
     const index = pair.indexOf('=')
     if (index === -1) continue
     const name = pair.slice(0, index).trim()
     const value = pair.slice(index + 1).trim()
-    if (value === '') delete jar[name]
-    else jar[name] = value
+    if (value === '') delete target[name]
+    else target[name] = value
   }
 }
 
@@ -434,6 +438,56 @@ try {
     /\[data-theme="dark"\]\) \.chat \{[^}]*--chat-bubble:\s*var\(--theme/.test(chatCss),
   )
 
+  // --- 造一条「别人的消息」 ---
+  /*
+   * 「别人的消息按钮存在但置灰」从前写的是 `others.every(...)`：**others 为空时恒真**，
+   * 等于这条断言实际上从来没跑过 —— 本地库里恰好有没有别人的历史全看运气
+   * （旧注释里也承认「不硬造数据」）。这里把它堵上。
+   *
+   * 做法：注册第二个账号，用**它自己的 cookie 罐**在同一个房间发一条。
+   * 消息经 WebSocket 广播回页面上这份 jsdom，页面就会多出一条非 is-mine 的消息。
+   *
+   * 为什么是「另一个账号 + HTTP 直发」，而不是「翻本地库里的旧数据」：
+   * 前者每次跑都成立；后者等于把断言交给运气。
+   * 也刻意不给它开 WebSocket —— 它只是「发过言的别人」，不该出现在在线名单里
+   * （上面「在线人数」那一节的断言会因此飘）。
+   *
+   * 这一步**不设单独的 check**：setup 失败会以「等待超时」的形式立刻炸掉整个脚本，
+   * 不会退化成一条静默跳过的断言 —— 这正是上面刚删掉那类「符号存在」守卫的教训。
+   */
+  const pageRoom = document.querySelector('.chat')?.dataset.room || 'general'
+  const otherName = `别人${Date.now().toString(36).slice(-5)}`
+  const otherJar = {}
+  const otherRequest = async (path, init = {}) => {
+    const headers = { Origin: SITE_ORIGIN, ...(init.headers ?? {}) }
+    const cookie = jarHeader(otherJar)
+    if (cookie !== '') headers.Cookie = cookie
+    const body = init.body === undefined ? undefined : JSON.stringify(init.body)
+    if (body !== undefined) headers['Content-Type'] = 'application/json'
+    const response = await fetch(WORKER + path, { ...init, headers, body })
+    harvest(response, otherJar)
+    return response
+  }
+  await otherRequest('/auth/register', {
+    method: 'POST',
+    body: { username: otherName, password: 'other-frontend-password' },
+  })
+  await otherRequest('/auth/login', {
+    method: 'POST',
+    body: { username: otherName, password: 'other-frontend-password' },
+  })
+  const otherText = `别人的消息 ${Date.now().toString(36)}`
+  await otherRequest('/api/messages', {
+    method: 'POST',
+    body: { body: otherText, room: pageRoom },
+  })
+  await waitFor(
+    '别人的消息经广播渲染到页面上',
+    () =>
+      [...document.querySelectorAll('.chat__body')].some((node) => node.textContent === otherText),
+    12000,
+  )
+
   // --- 撤回按钮 ---
   section('撤回按钮')
   // 只看**用户消息**：系统提示（进出房间 / 撤回提示）刻意没有撤回按钮，
@@ -452,15 +506,20 @@ try {
     mine.length > 0 && mine.every((node) => node.querySelector('.chat__delete')?.disabled === false),
   )
 
-  // 本地库里有历史遗留的他人消息时顺便验一下置灰；
-  // 一条都没有的话 every 返回 true，等于跳过（不硬造数据）。
+  /*
+   * `others.length > 0 &&` 是**必需**的，不是修饰：
+   * 上面刚造了一条真的别人的消息，所以这个前提恒成立；一旦哪天造消息那一步悄悄失效，
+   * 这条会**红**而不是像原来那样恒真地绿下去。（同上面两条的写法保持一致。）
+   */
   const others = articles.filter((node) => !node.classList.contains('is-mine'))
   check(
     '别人的消息按钮存在但置灰',
-    others.every((node) => {
-      const button = node.querySelector('.chat__delete')
-      return button !== null && button.disabled === true
-    }),
+    others.length > 0 &&
+      others.every((node) => {
+        const button = node.querySelector('.chat__delete')
+        return button !== null && button.disabled === true
+      }),
+    `别人的消息 ${others.length} 条`,
   )
 
   // --- 图片与文件 ---
