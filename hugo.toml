@@ -75,18 +75,24 @@ hasCJKLanguage = true
     enable = true
 
   # --- Giscus 评论（基于仓库的 GitHub Discussions）---
-  # repoId 取自 https://api.github.com/repos/rainanow/rainanow.github.io 的 node_id
-  # categoryId 对应仓库 Discussions 里的 "General" 分类，如需换分类可在
-  #   GitHub 仓库 → Discussions → 分类右侧编辑，或访问 https://giscus.app 自动生成配置
+  # 下面这组值**必须整组从 https://giscus.app 复制**，不要手抄、不要凭记忆改。
+  # categoryId 是「讨论分类」的 node id，分类被改名 / 删掉重建之后它就会变。
+  # 2026-10-08 踩过一次：旧的 categoryId 失效，症状是
+  # 「评论框能正常显示、GitHub 登录也成功，但点发送就报错」—— 因为失败发生在
+  # giscus 去创建 discussion 那一步，而 categoryId 只在这一步被用到。
+  # （giscus 自己的 /api/discussions 端点不校验它，所以肉眼和接口都查不出来。）
+  # 以后换分类，就去 giscus.app 重新生成一次，只替换下面这两行即可。
   [params.giscus]
     enable = true
     repo = "rainanow/rainanow.github.io"
     repoId = "R_kgDOUU9-cg"
-    category = "General"
-    categoryId = "DIC_kwDOUU9-cs4Cw2w5"
+    # 公告（Announcements）是 giscus 官方推荐的分类类型：只有仓库维护者和
+    # giscus 自己（App 有写权限）能新建 discussion，别人只能回复。
+    category = "Announcements"
+    categoryId = "DIC_kwDOUU9-cs4DFa5h"
     mapping = "pathname"                  # 用页面路径关联评论
     reactionsEnabled = "1"                # 允许表情回应
-    inputPosition = "bottom"              # 评论框放在评论列表下方
+    inputPosition = "top"                 # 评论框放在评论列表上方
     theme = "preferred_color_scheme"      # 跟随系统明暗模式
 
   # --- 聊天室（后端在 workers/chat，见那里的 README）---
