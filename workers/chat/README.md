@@ -77,9 +77,9 @@ workers/chat/
 │   ├── models/              # 表定义（nanoka 字段 DSL）
 │   └── routes/              # auth.ts / chat.ts / media.ts
 └── scripts/
-    ├── smoke.mjs            # 后端端到端冒烟测试（156 项）
-    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（165 项）
-    ├── purge-test.mjs       # 清空房间的去重与批量切分（17 项，纯逻辑）
+    ├── smoke.mjs            # 后端端到端冒烟测试（155 项）
+    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（158 项）
+    ├── purge-test.mjs       # 清空房间的去重与批量切分（15 项，纯逻辑）
     ├── verify-build.mjs     # 构建产物 + 后端源码不变量（32 项，CI 里也跑）
     ├── rate-limit-test.mjs  # 真实限流阈值（22 项，自带 STRICT_RATE_LIMIT 的 server）
     ├── probe-production.mjs # 探线上健康
@@ -103,10 +103,10 @@ npm run dev                  # http://127.0.0.1:8787
 
 ```bash
 npm run typecheck            # TypeScript 全量检查
-npm run smoke                # 后端 156 项
-npm run frontend-test        # 前端 165 项（需要先 hugo 构建出 public/chat/index.html）
+npm run smoke                # 后端 155 项
+npm run frontend-test        # 前端 158 项（需要先 hugo 构建出 public/chat/index.html）
 npm run verify-build         # 构建产物 + 后端源码不变量 32 项（不需要 dev server，hugo 构建完就能跑）
-npm run purge-test           # 清空房间的去重与批量切分 17 项（纯逻辑，不需要任何服务）
+npm run purge-test           # 清空房间的去重与批量切分 15 项（纯逻辑，不需要任何服务）
 npm run rate-limit-test      # 真实阈值 22 项（自己起一个 STRICT_RATE_LIMIT 的 dev server）
 npm run inspect-d1           # 打印本地 D1 里的表结构、账号、限流、吊销名单
 npm run probe-production     # 探线上 api.yulo.top + /chat/ 页面是否健康
@@ -579,7 +579,7 @@ Cloudflare 内部服务的子请求上限是 **1000 次 / 调用**（对外部�
 一间房全部读进来的内存占用在这个量级下完全可接受，所以保持「一条 SQL 查完」。
 加了个字段或换个房间名就想翻页的直觉在这里是错的。
 
-`npm run purge-test`（17 项，纯逻辑）把这段批次逻辑的边界钉住了，
+`npm run purge-test`（15 项，纯逻辑）把这段批次逻辑的边界钉住了，
 其中 1001 那个 case 就是这条坑的回归测试。
 
 ### 15. 撤回限流：必须独立计数器，且 `consumeRateLimit` 有个 off-by-one
@@ -978,7 +978,6 @@ Worker 里始终没有整份文件。
 ### 26. 「面板色」不能写死十六进制 —— 这是一个只会在深色主题炸的坑
 
 消息区（`.chat__messages`）和输入框（`.chat__composer textarea`）共用同一个变量
-消息区（`.chat__messages`）和输入框（`.chat__composer textarea`）共用同一个变量
 `--chat-panel`：
 
 | 主题 | `--chat-panel` | 效果 |
@@ -1004,7 +1003,7 @@ Worker 里始终没有整份文件。
 两处 `background` 都用 `var(--chat-panel)`、浅色那条基于 `var(--code-bg)`、
 深色那条覆盖成 `transparent` —— **不是**「等于 `#f5f5f5`」。
 同一个理由，`.chat` 里那两条 `--chat-surface*` 也是 `color-mix` 算出来的，
-而不是两个写死的灰。
+而不是两个写死的灰。（同一节里还有气泡那两条，见第 27 条。）
 
 浅色加了底色之后连带改了两处版式，都是**必然**的：
 
@@ -1016,21 +1015,55 @@ Worker 里始终没有整份文件。
 
 ---
 
+### 27. 气泡改白：顺手改 `--chat-surface` 会把「hover 有反馈」这个修复退回去
+
+需求是「气泡改成白色」。浅色下气泡原来是 `color-mix(--theme 92%, --primary 8%)` ≈ `#ececec`，
+落在后来的 #f5f5f5 面板上只差 9 级灰，糊在一起。
+
+做法是**新加一对变量**，而不是改 `--chat-surface` / `--chat-surface-strong`：
+
+| 主题 | `--chat-bubble`（别人的气泡） | `--chat-bubble-mine`（自己的气泡） |
+|---|---|---|
+| 浅色 | `var(--theme)` → 纯白 | 同左（**和别人的一个颜色**） |
+| 深色 | 不覆盖，沿用 `--chat-surface`（比页面底色亮一档） | 不覆盖，沿用 `--chat-surface-strong` |
+
+- 深色**必须**保持浮层色：那边的 `--theme` 就是页面底色，纯白气泡配浅色正文＝看不见。
+  覆盖因此写在 `:root:not([data-theme="dark"]) .chat` 里 —— 方向和 `--chat-panel` 那条**正好相反**
+  （面板是「深色覆盖成 transparent」，气泡是「浅色覆盖成纯白」）。
+- **不能**直接改 `--chat-surface`：它还挂在 `.chat__room-link:hover` 和
+  `.chat__room-link.is-current` 上，而那两个是落在**白色正文页**上的浮层。
+  跟着气泡一起变白，就等于把「鼠标划过去没有任何反馈、当前房间也看不出来」
+  这个已经修过的 bug 原样放回去 —— 而且它同样只在浅色下看着正常，切到深色才暴露。
+  一句话：**同一个 `--chat-surface`，气泡要它变白，房间列表要它比白色更暗。**
+- 气泡那两个用途**共享一个变量名是有意的**：`--chat-bubble` / `--chat-bubble-mine`
+  在浅色下取到同一个值，在深色下才分叉 —— 结构不变，只是浅色那份被覆盖了。
+
+**已知取舍**：浅色下自己的气泡和别人的同为纯白，两者只剩作者名颜色一条区别
+（`.chat__message.is-mine .chat__author`，这也正是那条规则的注释在强调的）。
+这是「气泡改白」的直接结果。想找回来，把 `--chat-bubble-mine` 在浅色那份覆盖里
+改成 `color-mix(in srgb, var(--theme) 88%, var(--primary) 12%)` 即可，不要动别人的。
+
+`frontend-test` 的「消息区与输入框的面板色」一节顺带钉住两件事：`--chat-bubble`
+必须有定义且基于 `var(--chat-surface)`（不是写死的颜色）、浅色那份必须覆盖成 `var(--theme)`。
+
+---
+
 ## 测试覆盖
 
-一共 **370 项**（四个进 CI 的脚本；另有 `rate-limit-test` 22 项，不在 CI 里）。
+一共 **360 项**（`verify-build` 32 + `purge-test` 15 + `smoke` 155 + `frontend-test` 158；
+另外 `rate-limit-test` 22 项要单独起 server，全加是 382 项）。
 （项数会随测试增加变化，`2026-10-08` 实测值如下。）
 
 ```bash
 npm run typecheck      # tsc --noEmit，CI 里也跑
 npm run verify-build   # 32 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
-npm run purge-test     # 17 项，纯逻辑，不需要任何服务
-npm run smoke          # 156 项，需要 wrangler dev
-npm run frontend-test  # 164 项，需要 wrangler dev + 构建出的 public/chat/
+npm run purge-test     # 15 项，纯逻辑，不需要任何服务
+npm run smoke          # 155 项，需要 wrangler dev
+npm run frontend-test  # 158 项，需要 wrangler dev + 构建出的 public/chat/
 npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev server
 ```
 
-`npm run smoke`（156 项，后端）：
+`npm run smoke`（155 项，后端）：
 
 - 健康检查、CORS 预检（含非白名单来源拿不到允许头）
 - 注册 / 大小写不同的重名被拒 / 非法输入
@@ -1063,7 +1096,7 @@ npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
   累计账本按真实大小记；普通用户同样的大小 → 413（理由里写 16 MB）；
   缺 `Content-Length` → 411；全站存储到顶 → 429。见第 24 条
 
-`npm run frontend-test`（165 项，真实 `chat.js` + jsdom + 真实 Worker）：
+`npm run frontend-test`（158 项，真实 `chat.js` + jsdom + 真实 Worker）：
 
 - `chat.js` 引用的 18 个 `data-chat-*` 钩子在真实页面里都存在
 - 未登录 → 注册 → 自动登录 → 加载历史 → WebSocket 连上
@@ -1080,6 +1113,8 @@ npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
 - **消息区与输入框的面板色**：两处 `background` 都用 `var(--chat-panel)`、浅色的
   `--chat-panel` 基于 `var(--code-bg)`、深色的那个覆盖成 `transparent`。断言的**不是**
   「等于 `#f5f5f5`」—— 写死那个灰在浅色下完全正常、只有深色下整块看不见。见第 26 条。
+- **气泡色**：`--chat-bubble` 必须基于 `var(--chat-surface)` 而不是写死的颜色、
+  浅色那份必须覆盖成 `var(--theme)`（深色**不**覆盖）。见第 27 条。
 
 `npm run verify-build`（32 项，只检查 Hugo 构建产物，不需要 dev server）：
 
@@ -1144,7 +1179,7 @@ npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
 **新增一条限流就顺手在这里加一节**：断言方向是「前 N 次必须成功、第 N+1 次才 429」，
 写成「第二次就被拦」会把正常的连发行为测成 bug。
 
-`npm run purge-test`（17 项，纯逻辑，不需要 dev server）：
+`npm run purge-test`（15 项，纯逻辑，不需要 dev server）：
 
 - 清空房间时**跨消息去重**：同一个文件被多条消息引用，只删一次、只计一次
 - 批量切分正确：999 → 1 批、**1000 → 1 批（不越界）**、

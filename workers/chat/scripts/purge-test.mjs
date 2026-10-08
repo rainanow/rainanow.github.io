@@ -76,7 +76,9 @@ console.log('\n批量切分')
   const keys = Array.from({ length: 999 }, (_, i) => `2026-09/${String(i).padStart(8, '0')}.png`)
   const plan = planDeletes(keys)
   check('999 个文件切成 1 批', plan.batches.length === 1, `实际 ${plan.batches.length}`)
-  check('999 个文件一个不少', plan.total === 999)
+  // 原来还有一条 `999 个文件一个不少`（plan.total === 999）—— 已删：
+  // 「个数不被吞掉」这个不变量由下面 2500 那条「总数不重不漏」负责，
+  // 单独为 999 再验一遍只是重复。
 }
 {
   // 1000 是临界点：正好一批
@@ -96,10 +98,9 @@ console.log('\n批量切分')
   const keys = Array.from({ length: 2500 }, (_, i) => `2026-09/${String(i).padStart(8, '0')}.png`)
   const plan = planDeletes(keys)
   check('2500 个文件切成 3 批', plan.batches.length === 3, `实际 ${plan.batches.length}`)
-  check(
-    '每批都不超过 1000',
-    plan.batches.every((batch) => batch.length <= R2_DELETE_BATCH),
-  )
+  // 原来还有一条 `每批都不超过 1000`（every batch.length <= R2_DELETE_BATCH）—— 已删：
+  // 「一批最多 1000」这个上界由上面 1001 那条（第一批 1000、第二批 1）钉死，
+  // 这里再断言一遍是同义反复。
   check('总数不重不漏', plan.batches.flat().length === 2500)
   check('批次里的 key 互不重复', new Set(plan.batches.flat()).size === 2500)
 }

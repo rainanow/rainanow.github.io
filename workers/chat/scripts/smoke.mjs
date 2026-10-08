@@ -459,7 +459,9 @@ section('实时收发')
   await client.opened
   const ready = await client.next((event) => event.type === 'ready')
   check('收到 ready 事件', ready.type === 'ready')
-  check('在线人数至少 1', ready.online >= 1, `实际 ${ready.online}`)
+  // 原来这里还有一条 `在线人数至少 1`（ready.online >= 1）—— 已删：
+  // 它同时弱于「名单里有自己」和「scope=online 里能找到自己」——
+  // 那两条在 WebSocket 断掉时会红，而 `>= 1` 只要 DO 还在线就绿。
 
   const posted = await request('/api/messages', {
     method: 'POST',

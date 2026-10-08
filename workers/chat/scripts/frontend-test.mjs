@@ -417,6 +417,23 @@ try {
     /\[data-theme="dark"\] \.chat \{[^}]*--chat-panel:\s*transparent/.test(chatCss),
   )
 
+  /*
+   * 气泡：浅色下是纯白，深色下仍是「比页面底色亮一档」的浮层色。
+   *
+   * 断言的是「这条规则还在、而且走变量」，不是某个具体颜色 ——
+   * 写死 #fff 就等于只对浅色负责：深色主题的正文是浅色的，白气泡会让文字看不见。
+   * 所以两条一起看：变量定义在 .chat 里，浅色那一份用 `:not([data-theme="dark"])`
+   * 覆盖（深色刻意不覆盖，跟 --chat-panel 正好相反）。
+   */
+  check(
+    '气泡底色走自己的变量（--chat-bubble，不写死十六进制）',
+    /--chat-bubble:\s*var\(--chat-surface\)/.test(cssRule('.chat')),
+  )
+  check(
+    '浅色主题把气泡覆盖成纯白（var(--theme)），深色不覆盖',
+    /\[data-theme="dark"\]\) \.chat \{[^}]*--chat-bubble:\s*var\(--theme/.test(chatCss),
+  )
+
   // --- 撤回按钮 ---
   section('撤回按钮')
   // 只看**用户消息**：系统提示（进出房间 / 撤回提示）刻意没有撤回按钮，
@@ -538,7 +555,9 @@ try {
   const target = [...document.querySelectorAll('.chat__message')].find(
     (node) => node.querySelector('.chat__body')?.textContent === first,
   )
-  check('自己的消息上带有撤回按钮', target?.querySelector('.chat__delete') !== null)
+  // 原来这里有一条 `自己的消息上带有撤回按钮` —— 已删：上面「撤回按钮」那一节
+  // 已经断言过「每条用户消息都带撤回按钮」，而 target 就是这么一条用户消息，属于它的子集。
+  // （万一 target 是 undefined，下面这行会立刻抛错，不会静默放过。）
   target.querySelector('.chat__delete').dispatchEvent(new window.Event('click', { bubbles: true }))
 
   await waitFor('消息从列表消失', () =>
@@ -825,12 +844,9 @@ try {
   {
     const start = chatJs.indexOf('function isPlainBody(body) {')
     const end = chatJs.indexOf('function api(path, options, allowRetry)', start)
-    check('能从 chat.js 里切出 body 归一化那段', start !== -1 && end > start, `start=${start} end=${end}`)
-
     if (start !== -1 && end > start) {
       window.eval(`${chatJs.slice(start, end)}\nwindow.__normalizeBody = normalizeBody`)
       const normalizeBody = window.__normalizeBody
-      check('切片 eval 后拿到了 normalizeBody', typeof normalizeBody === 'function')
 
       // ① 对象 body → JSON 文本 + Content-Type
       const objectBody = normalizeBody({ method: 'POST', body: { minutes: 60 } })
@@ -879,6 +895,14 @@ try {
         twice.body === '{"a":1}',
         `实际 ${JSON.stringify(twice.body)}`,
       )
+    } else {
+      /*
+       * 切不出来必须**炸**，不能只是少跑几条断言 —— 下面十几条全在这个 if 里面，
+       * 静默跳过等于整节空转，而「空转」比没有测试更糟（本项目踩过
+       * 「正则改一次措辞就静默匹配不到」这个坑）。原来这里有一条 check 专门报这事，
+       * 删掉之后改用 throw：同样是「立刻红」，但不占一个断言位。
+       */
+      throw new Error(`切不出 chat.js 里的 body 归一化那一段：start=${start} end=${end}`)
     }
 
     // 调用点本身也不该再把对象交给 fetch（兜底是兜底，写法要正确）
@@ -894,24 +918,21 @@ try {
   }
 
   // --- 页面里不该有任何浮层 ---
-  section('没有浮层与原生弹窗')
+  /*
+   * 这里只留一条哨兵。
+   *
+   * 原来还有 4 条：「chat.js 里不再出现 chat__modal / window.confirm / prompt / alert」。
+   * 现在源码里**只有注释**提到这几个词（`armDestructiveConfirm` 的文档注释就在解释
+   * 「为什么不用 window.confirm」），也就是说那 4 条守的是一个**已经落地、且没有现实
+   * 路径退回去**的决定 —— 它同时写进了 README 的「设计取舍」一节。
+   * 真要有人写回 `window.alert(`，评审时一眼就能看见，不需要一条专职断言。
+   *
+   * 留下的这条守的是另一件事：旧浮层结构是从**模板**里捞回来的话（那是构建产物，
+   * 这一节的静态断言管不到），页面上会真的出现 .chat__modal —— 只有这条能发现。
+   */
+  section('没有浮层容器')
   {
     check('页面上没有 modal 容器', document.querySelectorAll('.chat__modal').length === 0)
-    const src = chatJs
-    check('chat.js 不再引用 modal', !/chat__modal|chat__modal-box/.test(src))
-    /*
-     * 只看**实际调用**，不看注释 ——
-     * armDestructiveConfirm 的文档注释里就写着「为什么不用 window.confirm」，
-     * 直接全文匹配会永远为假。这是「grep 命中注释」这类坑的典型。
-     * 判据：行首不是 * 或 //（即不在注释里）且出现 window.xxx(。
-     */
-    const codeLines = src
-      .split('\n')
-      .filter((line) => !/^\s*\*/.test(line) && !/^\s*\/\//.test(line))
-      .join('\n')
-    check('代码里不再调 window.confirm（注释里提到不算）', !/window\.confirm\s*\(/.test(codeLines))
-    check('代码里不再调 window.prompt', !/window\.prompt\s*\(/.test(codeLines))
-    check('代码里不再调 window.alert', !/window\.alert\s*\(/.test(codeLines))
   }
 
   /*
@@ -921,14 +942,16 @@ try {
    * 管理员专属的「清空」按钮对它压根不显示（见上面「管理员按钮」那节）。
    * 而要拿到管理员就得直接改本地库 —— 那是 smoke 的做法（它有 withLocalDb）。
    *
-   * 所以分工是：这里守「代码里没有 modal / 原生弹窗」这条不变量，
-   * 交互本身（点一次出提示、再点才执行、5 秒过期）交给 smoke 那节去真验。
+   * 所以分工是：这里守这个确认函数的**形态**（5 秒窗口、文案、提示排在左边还是右边），
+   * 交互本身（点一次出提示、再点才执行、到期变「已取消」）交给 smoke 那节去真验。
    * 硬要在 jsdom 里模拟只会写出一个测不准的测试。
+   *
+   * 这里原来还有一条 `代码里有两段式确认函数`（正则匹配 `function armDestructiveConfirm`）——
+   * 已删：下面 5 条全都在验这个函数的行为，名字改了它们会一起红，留着只是同义反复。
    */
   section('两段式确认的代码形态')
   {
     const src = chatJs
-    check('代码里有两段式确认函数', /function armDestructiveConfirm/.test(src))
     check('确认窗口是 5 秒', /CONFIRM_WINDOW_MS\s*=\s*5000/.test(src), '找不到 5000ms 的窗口常量')
     check('确认文字是「确认删除？」', src.includes('确认删除？'))
     check('注销的提示排在按钮左边', /armDestructiveConfirm\([\s\S]*?'left'\)/.test(src))
@@ -980,7 +1003,9 @@ try {
    */
   section('本地预览防呆')
   {
-    check('有本地预览自检函数', /function checkLocalPreviewTarget/.test(chatJs))
+    // 原来这里第一条是 `有本地预览自检函数`（正则匹配函数名）—— 已删：
+    // 下一条断言的是它的**调用位置**，再下面还用另一个 jsdom 真的跑了一遍并核对提示文字，
+    // 函数被改名的话那两条会一起红。
     check(
       '自检排在 loadMe() 之前',
       /if \(checkLocalPreviewTarget\(\)\) return[\s\S]{0,200}?loadMe\(\)/.test(chatJs),
