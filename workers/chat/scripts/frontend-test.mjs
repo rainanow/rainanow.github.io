@@ -338,10 +338,62 @@ try {
 
   // --- 撤回按钮 ---
   // 要求：每条消息都渲染出 ×（不管是不是自己的），但只有有权限的能点。
-  section('撤回按钮')
-  const articles = [...document.querySelectorAll('.chat__message')]
+  // --- 系统提示（谁进了房间 / 谁撤回了一条） ---
+  section('系统提示')
+  const systemRows = [...document.querySelectorAll('.chat__message--system')]
+  check('进房间时渲染出了系统提示', systemRows.length > 0, `实际 ${systemRows.length} 条`)
   check(
-    '每条消息都带撤回按钮',
+    '文案是「XX 加入了房间」（原样来自服务端）',
+    systemRows.some(
+      (node) => node.querySelector('.chat__system-text')?.textContent === `${username} 加入了房间`,
+    ),
+    systemRows.map((node) => node.textContent).join(' / '),
+  )
+  check(
+    '系统提示里没有撤回按钮',
+    systemRows.every((node) => node.querySelector('.chat__delete') === null),
+  )
+  check(
+    '系统提示不套气泡（没有 .chat__body）',
+    systemRows.every((node) => node.querySelector('.chat__body') === null),
+  )
+  check(
+    '系统提示不参与「是不是我发的」判断',
+    systemRows.every((node) => !node.classList.contains('is-mine')),
+  )
+  /*
+   * 「窄」和「居中」只能从 CSS 上看，所以去样式表里核对那两条声明。
+   * 这一条守的是需求里那句「宽度应该窄、不影响对话的连贯性」——
+   * 文案对不对是上面的断言管的，**长得和对话像不像**是这里管的。
+   */
+  const systemRule = chatCss.match(/\.chat__message--system \{([^}]*)\}/)?.[1] ?? ''
+  check('系统提示的样式里有 align-self: center（居中、宽度贴合内容）', /align-self:\s*center/.test(systemRule))
+  const systemFontSize = Number(systemRule.match(/font-size:\s*([\d.]+)rem/)?.[1] ?? '99')
+  check(
+    '系统提示的字号比正文小（0.75rem < 0.92rem）',
+    systemFontSize > 0 && systemFontSize < 0.92,
+    `实际 ${systemFontSize}rem`,
+  )
+  /*
+   * 文案里含用户名，而用户名是用户可控的 —— 所以只能进 textContent。
+   * 这里直接从源码里取函数体来核对，因为服务端的用户名规则不允许出现 `<`，
+   * 造不出一条真能注入的用例（造不出来正是好事，但不能因此不检查）。
+   */
+  const systemRenderer = chatJs.match(/function renderSystemMessage[\s\S]*?\n  \}/)?.[0] ?? ''
+  check(
+    '系统提示用 textContent 写入（不碰 innerHTML）',
+    systemRenderer.includes('textContent') && !systemRenderer.includes('innerHTML'),
+  )
+
+  // --- 撤回按钮 ---
+  section('撤回按钮')
+  // 只看**用户消息**：系统提示（进出房间 / 撤回提示）刻意没有撤回按钮，
+  // 后端也会挡（kind !== 'user' → 403），把它一起数进来就成了假失败。
+  const articles = [...document.querySelectorAll('.chat__message')].filter(
+    (node) => !node.classList.contains('chat__message--system'),
+  )
+  check(
+    '每条用户消息都带撤回按钮',
     articles.length > 0 && articles.every((node) => node.querySelector('.chat__delete') !== null),
   )
 

@@ -15,6 +15,34 @@
   flex-direction: column;
   gap: 0.75rem;
   margin: 1.25rem 0 2rem;
+
+  /*
+   * ── 气泡 / 输入框的底色 ──
+   *
+   * ## 为什么不能继续用 --entry / --theme
+   *
+   * 浅色主题里 `--entry` 和 `--theme` 是**同一个值**（都是纯白），所以气泡落在
+   * 正文的白色背景上完全看不出边界，输入框用的是 `--theme`、同样贴在一起。
+   * 深色那边 `--entry` 比 `--theme` 略亮，气泡还看得见，但输入框照样是页面底色。
+   * 也就是说：这两个变量**都不是**「比背景深一档的浮层色」。
+   *
+   * ## 为什么用 color-mix 而不是写死两个灰
+   *
+   * 写死 `#ededed` 就得再为深色写一份，而且主题配色一改就脱节。
+   * `color-mix(in srgb, var(--theme) X%, var(--primary) Y%)` 一句在两边都成立，
+   * 而且方向是自动对的：
+   *   浅色 = 白 + 8% 深灰 → 淡灰（比正文背景**深**一点）
+   *   深色 = 深灰 + 8% 浅灰 → 比页面底色**亮**一点
+   * 方向相反，效果一致：都是从背景里浮出来一层。
+   *
+   * 万一浏览器不支持 color-mix，紧挨着的前一句 `var(--code-bg)` 兜住 ——
+   * 那是主题里现成的「浮层色」（浅色 #f5f5f5 / 深色 rgb(55,56,62)），明暗都合适。
+   */
+  --chat-surface: var(--code-bg, #f5f5f5);
+  --chat-surface: color-mix(in srgb, var(--theme) 92%, var(--primary) 8%);
+  /* 自己发的气泡、以及输入框：比别人的再深一档，一眼能分出「我说的」和「我在打字」 */
+  --chat-surface-strong: var(--code-bg, #f5f5f5);
+  --chat-surface-strong: color-mix(in srgb, var(--theme) 85%, var(--primary) 15%);
 }
 
 /*
@@ -169,7 +197,8 @@
   font: inherit;
   font-size: 0.9rem;
   color: var(--primary, #111827);
-  background: var(--theme, #fff);
+  /* 和发消息那个输入框同一档浮层色：登录框落在白色正文上也要看得出边界 */
+  background: var(--chat-surface-strong, #e2e2e2);
   border: 1px solid var(--border, #e5e7eb);
   border-radius: var(--radius, 6px);
   padding: 0.45rem 0.6rem;
@@ -349,7 +378,8 @@
   margin: 0;
   padding: 0.4rem 0.65rem;
   border-radius: var(--radius, 6px);
-  background: var(--entry, #f9fafb);
+  /* 浮层色，比页面背景深一档 —— 变量怎么来的见 .chat 里那一段 */
+  background: var(--chat-surface, #f2f2f2);
   /* 字体不指定，直接继承博客正文——这是「和博客一致」最省事也最准的做法 */
   font-size: 0.92rem;
   line-height: 1.6;
@@ -358,9 +388,9 @@
   color: var(--content, #374151);
 }
 
-/* 自己发的换个底色区分 */
+/* 自己发的换个底色区分（比别人的气泡再深一档） */
 .chat__message.is-mine .chat__body {
-  background: var(--code-bg, #f5f5f5);
+  background: var(--chat-surface-strong, #e2e2e2);
 }
 
 /*
@@ -372,6 +402,52 @@
 .chat__message.is-mine .chat__body.is-media {
   padding: 0;
   background: none;
+}
+
+/* --- 系统提示：谁进了房间 / 谁撤回了一条 --- */
+
+/*
+ * 一条**居中的窄条**，和普通消息在视觉上完全分开。
+ *
+ * 设计要求来自「不影响对话的连贯性」，拆开就是三条：
+ *   - 不是气泡：气泡意味着「有人说了什么」，而它只是一行注记。
+ *     套上作者行 + 撤回按钮之后，视觉上会和真实发言混在一起。
+ *   - 居中 + 宽度贴合内容（`align-self: center` 让它不再撑满一行）：
+ *     读者的视线可以整条跳过去，不会被右侧的空白拽住。
+ *   - 高度压到最小：小字、无内边距的上下留白、圆角胶囊。
+ *     一串人进出之后，真正在聊的内容仍然连成一片 —— 这是这一条的全部意义。
+ *
+ * 底色用最浅的那一档（--chat-surface），因为它比自己的气泡还次要。
+ */
+.chat__message--system {
+  /* 普通消息是「作者行 + 气泡」两行，这里改成一行 */
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  /* 居中之后宽度贴合文字，不再像气泡那样从左端铺开 */
+  align-self: center;
+  max-width: min(100%, 30rem);
+  /* 上下各留一点：完全贴住会把相邻两条消息粘在一起，反而不好读 */
+  margin: 0.15rem 0;
+  padding: 0.05rem 0.6rem;
+  border-radius: 999px;
+  background: var(--chat-surface, #f2f2f2);
+  color: var(--secondary, #6b7280);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+/* 用户名可以很长（20 个字），窄条不能因此把行宽撑破 */
+.chat__message--system .chat__system-text {
+  overflow-wrap: anywhere;
+}
+
+/* 时间比正文再淡一档：它的作用是「需要时能查到」，不是随时要读 */
+.chat__message--system .chat__time {
+  opacity: 0.7;
+  white-space: nowrap;
 }
 
 /* --- 行内 markdown 会渲染出的那几种元素 --- */
@@ -630,15 +706,22 @@
   text-decoration: none;
 }
 
+/*
+ * 悬停 / 当前房间的高亮。
+ *
+ * 原来这两处用的都是 `--theme`，而浅色主题里 `--theme` 就是纯白 ——
+ * 和面板背景一模一样，于是「鼠标划过去没有任何反馈、当前房间也看不出来」。
+ * 换成浮层色之后，明暗两边都能看见。
+ */
 .chat__room-link:hover {
-  background: var(--theme, #fff);
+  background: var(--chat-surface, #f2f2f2);
   color: var(--primary, #111827);
 }
 
 .chat__room-link.is-current {
   font-weight: 600;
   color: var(--primary, #111827);
-  background: var(--theme, #fff);
+  background: var(--chat-surface-strong, #e2e2e2);
 }
 
 /* 房间名（URL 里用的那个 slug），用小字附在旁边 */
@@ -785,7 +868,7 @@
   min-height: 2.6rem;
   max-height: 9rem;
   color: var(--primary, #111827);
-  background: var(--theme, #fff);
+  background: var(--chat-surface-strong, #e2e2e2);
   border: 1px solid var(--border, #e5e7eb);
   border-radius: var(--radius, 6px);
   /* 左边留一截给「+」，文字整体避开它 */

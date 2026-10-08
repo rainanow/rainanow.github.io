@@ -6,6 +6,13 @@ export interface ChatMessage {
   userId: string
   username: string
   body: string
+  /**
+   * `'user'` 或 `'system'`。系统消息（加入/离开房间、撤回提示）走的是**同一条通路**：
+   * 同样的 `message` 事件、同样的 `insertMessage()` 排序去重，只有渲染不同。
+   *
+   * 前端按 `kind === 'system'` 判断，所以缺字段（老客户端）自然落回普通消息那一档。
+   */
+  kind: string
   /** epoch 毫秒。跨语言解析最省事，前端 `new Date(ms)` 直接用。 */
   createdAt: number
 }
@@ -14,9 +21,13 @@ export interface ChatMessage {
 export type ChatServerEvent =
   /** 握手成功，附带当前在线人数 */
   | { type: 'ready'; online: number; room: string }
-  /** 有新消息 */
+  /** 有新消息（普通消息和系统消息都走这里） */
   | { type: 'message'; message: ChatMessage }
-  /** 有人进/出 */
+  /**
+   * 有人进/出。**只负责「在线人数」和「成员名单要不要刷」**，
+   * 进出本身的那条提示是作为一条系统 `message` 单独广播的 ——
+   * 两条通路的职责不同：presence 是状态，message 是内容。
+   */
   | { type: 'presence'; online: number; event: 'join' | 'leave'; username: string }
   /** 某条消息被作者本人或管理员撤回 */
   | { type: 'deleted'; room: string; id: string }
@@ -27,6 +38,17 @@ export type ChatServerEvent =
 export interface SocketAttachment {
   userId: string
   username: string
+  /**
+   * 这条连接属于哪个房间。
+   *
+   * 为什么要存在连接上、而不是当成 DO 的一个字段：DO 的实例名是
+   * `idFromName(room)`，实例自己**问不出**它叫哪个房间（没有那样的 API）。
+   * 靠「第一次握手时记下来」能work，但那是个内存字段 —— DO 被驱逐后
+   * 就退回默认值了，而驱逐之后那条连接断开时触发的 `webSocketClose`
+   * 恰恰要靠它写「谁离开了房间」的提示。多房间时那会写成**错误的房间**。
+   * attachment 是跟着连接持久化的，休眠唤醒后照样读得到，不受驱逐影响。
+   */
+  room: string
   /**
    * 建起这条连接的那张 access token 的到期时间（epoch **秒**，和 JWT 的 `exp` 同口径）。
    *

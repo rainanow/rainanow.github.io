@@ -9,6 +9,7 @@ import {
   DELETE_WINDOW_SECONDS,
   EXPORT_LIMIT,
   HISTORY_PAGE_SIZE,
+  KIND_USER,
   MAX_MESSAGE_LENGTH,
   MEMBER_LIST_LIMIT,
   MESSAGE_ALLOWED_PER_WINDOW,
@@ -23,6 +24,7 @@ import { refundUpload } from '../quota'
 import { isMuted, mutedRemaining } from '../moderation'
 import { consumeRateLimit, effectiveLimit } from '../rate-limit'
 import { revokeAllSessions } from '../sessions'
+import { insertSystemMessage, systemMessage, withdrawNotice } from '../system-message'
 import type { AppEnv, ChatContext } from '../context'
 import type { Env } from '../env'
 import { cookieAuthBridge } from '../middleware'
@@ -48,6 +50,13 @@ interface HistoryRow {
   userId: string
   username: string
   body: string
+  /**
+   * `'user'` 或 `'system'`。
+   *
+   * 系统消息（谁进了房间、谁撤回了一条）和普通消息**同表**，翻页时天然按时间交错 ——
+   * 这个字段是唯一的区分依据，前后端都靠它决定「渲染成一条气泡」还是「渲染成一条窄提示」。
+   */
+  kind: string
   createdAt: Date
 }
 
@@ -352,6 +361,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
         userId: Message.table.userId,
         username: Message.table.username,
         body: Message.table.body,
+        kind: Message.table.kind,
         createdAt: Message.table.createdAt,
       })
       .from(Message.table)
@@ -372,6 +382,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
           userId: row.userId,
           username: row.username,
           body: row.body,
+          kind: row.kind,
           createdAt: row.createdAt.getTime(),
         }),
       ),
@@ -427,6 +438,9 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       userId: created.userId,
       username: created.username,
       body: created.body,
+      // 从库里的返回值读，而不是把 `'user'` 写死在这儿：
+      // 默认值定义在表结构上（models/message.ts），这里写死就等于同一件事有两个出处。
+      kind: created.kind,
       createdAt: created.createdAt.getTime(),
     }
 
@@ -462,6 +476,21 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
     const target = await Message.findOne(id)
     if (target === null || target.deleted) {
       return c.json({ error: '消息不存在' }, 404)
+    }
+
+    /*
+     * 系统提示不能被撤回。
+     *
+     * 它不是谁「说」出来的话，撤回它没有语义；更实际的问题是**撤回本身会产生
+     * 一条新的系统提示** —— 允许撤回等于用一个提示去删另一个提示，越删越乱。
+     * 想清理就清空房间（硬删，那条路不会写提示）。
+     *
+     * 前端的渲染层根本不会给系统提示加撤回按钮，所以这一条主要是挡住
+     * 手拼的请求（以及将来某个忘了判断 `kind` 的调用方）。
+     * 放在归属判断**之前**：它跟「你是谁」无关，能省掉那次查库。
+     */
+    if (target.kind !== KIND_USER) {
+      return c.json({ error: '系统提示不能被撤回' }, 403)
     }
 
     const me = await User.findOne(sub)
@@ -532,7 +561,38 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       }
     }
 
+    /*
+     * 撤回要在聊天记录里留下痕迹，而不是让那条消息「凭空消失」。
+     *
+     * 只发 `{type:'deleted'}` 的话，正在看的人只看到气泡不见了 —— 而他可能
+     * 刚读到一半；刷新之后更是彻底无迹可寻。补一条系统提示回答「这里发生了什么」。
+     *
+     * 文案区分**自己撤**和**管理员撤别人的**（见 `withdrawNotice`）：
+     * 后者是管理动作，必须一眼看得出来，这也是 `deletedBy` 那个审计字段存在的理由。
+     *
+     * ⚠️ 用 `me.username`（操作者）和 `target.username`（作者）拼，
+     * 不能两个都用 me —— 那样管理员撤回别人消息时会写成「管理员 撤回了一条消息」，
+     * 读的人根本不知道被撤的是谁说的。
+     *
+     * 写失败只记日志：撤回本身**已经生效**（`deleted = true` 已经落库、媒体也删了），
+     * 为了补不上一条提示就把整个请求报成 500，会让前端显示「撤回失败」——
+     * 而用户再点一次只会拿到 404。宁可少一条提示，也不能谎报失败。
+     */
+    let notice: ChatMessage | null = null
+    try {
+      const row = systemMessage(target.room, withdrawNotice(me.username, target.username))
+      await insertSystemMessage(c.env.DB, row)
+      notice = row
+    } catch (error) {
+      console.error('写撤回提示失败', { room: target.room, id, error })
+    }
+
+    // 顺序：先「这条消息没了」，再「这里发生过什么」。
+    // 反过来的话，正在看的人会先看到一句「撤回了一条消息」，然后气泡才消失。
     await broadcast(c.env, target.room, { type: 'deleted', room: target.room, id })
+    if (notice !== null) {
+      await broadcast(c.env, target.room, { type: 'message', message: notice })
+    }
     return c.json({ ok: true })
   })
 
@@ -565,6 +625,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
         userId: Message.table.userId,
         username: Message.table.username,
         body: Message.table.body,
+        kind: Message.table.kind,
         createdAt: Message.table.createdAt,
       })
       .from(Message.table)
@@ -583,6 +644,10 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
         id: row.id,
         username: row.username,
         body: row.body,
+        // 导出也要带上 kind，否则系统提示在导出文件里会显示成
+        // 「系统: 雨落 加入了房间」—— 像是一个叫「系统」的人在说话，
+        // 而它其实只是一条提示。前端据此把它排成一行引用（`> …`）。
+        kind: row.kind,
         createdAt: row.createdAt.getTime(),
       })),
     })

@@ -17,6 +17,12 @@ import { verify } from '@nanokajs/auth'
 import { ACCESS_TOKEN_COOKIE, ACCESS_TOKEN_TTL_SECONDS, DEFAULT_ROOM } from './config'
 import type { Env } from './env'
 import { readAccessToken } from './origins'
+import {
+  insertSystemMessage,
+  joinNotice,
+  leaveNotice,
+  systemMessage,
+} from './system-message'
 import type { BroadcastRequest, ChatServerEvent, SocketAttachment } from './types'
 
 const BROADCAST_PATH = '/broadcast'
@@ -154,7 +160,32 @@ export class ChatRoom implements DurableObject {
     if (row === null) return unauthorized('Unknown user')
     if (row.live !== 1) return unauthorized('Session revoked')
 
-    const attachment: SocketAttachment = { userId: payload.sub, username: row.username, exp }
+    /*
+     * 房间名从握手 URL 的查询参数上取。
+     *
+     * DO 的实例名是外部用 `idFromName(room)` 算出来的，而实例**没有任何 API
+     * 能问出自己叫哪个房间**（没有 `this.name` 这种东西）。所以唯一知道房间名的
+     * 时刻就是握手这一下 —— 取到之后立刻记进 attachment，让房间名跟着连接走。
+     * 这样即便 DO 中途被驱逐（内存全丢），断开时触发的离场提示仍然写得对房间。
+     */
+    const room = new URL(request.url).searchParams.get('room') ?? DEFAULT_ROOM
+
+    const attachment: SocketAttachment = {
+      userId: payload.sub,
+      username: row.username,
+      exp,
+      room,
+    }
+
+    /*
+     * 「这个人已经在线了吗」必须在 acceptWebSocket **之前**问 —— 之后就分不清
+     * 列表里那条连接是新来的还是本来就有的了。
+     *
+     * 为什么要问：进出提示是按**人**算的，不是按连接算的。一个人开三个标签页
+     * 是三条 WebSocket，但「雨落 加入了房间」在一份聊天记录里出现三次是荒谬的。
+     * 同理离线那边（见 handleDeparture）。
+     */
+    const alreadyOnline = this.hasConnectionFor(payload.sub)
 
     const pair = new WebSocketPair()
     const server = pair[1]
@@ -162,11 +193,21 @@ export class ChatRoom implements DurableObject {
     // 休眠会把内存里的东西全丢掉，只有 attachment 会被持久化下来。
     server.serializeAttachment(attachment)
 
-    const room = new URL(request.url).searchParams.get('room') ?? DEFAULT_ROOM
     server.send(
       JSON.stringify({ type: 'ready', online: this.onlineCount(), room } satisfies ChatServerEvent),
     )
+
+    /*
+     * 这里有两种播报，去重只落在后面那一种上：
+     *   - publishPresence：广播「在线人数变成了 N」。**每次**连接增减都该发，
+     *     和「是不是同一个人」无关 —— 它是状态。
+     *   - notifyPresence：往聊天记录里插一条「XX 加入了房间」。它是**内容**，
+     *     会持久化，所以必须按人算 —— 第二、第三个标签页不该再插一条。
+     */
     this.publishPresence('join', attachment.username)
+    if (!alreadyOnline) {
+      this.notifyPresence('join', attachment.username, room)
+    }
 
     return new Response(null, { status: 101, webSocket: pair[0] })
   }
@@ -219,6 +260,22 @@ export class ChatRoom implements DurableObject {
     if (attachment === null) return
     this.publishPresence('leave', attachment.username)
     this.markOffline(attachment.userId)
+
+    /*
+     * 「离开了房间」只在**这个人最后一条连接**断开时才写。
+     *
+     * 一个人开三个标签页、关掉其中一个是再正常不过的操作 ——
+     * 每关一个就往聊天记录里插一条「XX 离开了房间」，房间会被这种噪音淹没，
+     * 而且它是**持久化**的：刷出来之后就永远留在那儿，翻历史还能再看见一遍。
+     * 同一个理由在 `handleUpgrade` 那边反向成立（已经在线就不再播 join）。
+     *
+     * 判据是「除了这条连接，还有没有别的连接挂在同一个 userId 上」，
+     * 不是「连接数 == 0」——同一个人另外两个标签页还开着时连接数 ≥ 1，
+     * 但那些 ws 对象和这条不是同一个，所以要把自己排除掉再问。
+     */
+    if (!this.hasConnectionFor(attachment.userId, ws)) {
+      this.notifyPresence('leave', attachment.username, attachment.room)
+    }
   }
 
   /**
@@ -283,15 +340,15 @@ export class ChatRoom implements DurableObject {
   }
 
   /**
-   * 在线人数：按 userId 去重，而不是直接数连接。
+   * 当前在线的人，**带用户名**。
+   *
+   * ## 为什么按 userId 去重，而不是直接数连接
    *
    * 一个人开三个标签页是三条 WebSocket，但屏幕上显示「在线 3 人」是骗人的。
    * 代价是每次统计都要把挂在每个连接上的 attachment 读出来——
    * 房间就几十个人，这点开销可以忽略，而且这些调用本来就发生在 DO 已经被唤醒的时候。
-   */
-  /** 当前连着的用户 id，按人算不按连接算（同一个人开三个标签页只出现一次）。 */
-  /**
-   * 当前在线的人，**带用户名**。
+   *
+   * ## 为什么要带用户名
    *
    * 以前这里只返回 userId，Worker 拿到之后还得去 D1 的 users 表查一遍
    * 才能知道这些人叫什么 —— 而成员名单每次有人进出就要刷一次，
@@ -310,8 +367,29 @@ export class ChatRoom implements DurableObject {
     return [...seen].map(([userId, username]) => ({ userId, username }))
   }
 
+  /** 当前连着的用户 id，按人算不按连接算（同一个人开三个标签页只出现一次）。 */
   private onlineUserIds(): string[] {
     return this.onlineMembers().map((member) => member.userId)
+  }
+
+  /**
+   * 这个人现在还有连接挂着吗。
+   *
+   * `except` 用来排除「正在离开的那条连接」：在 `webSocketClose` 回调里，
+   * 刚断开的那条 ws **仍然**会被 `getWebSockets()` 返回（运行时还没来得及
+   * 把它从列表里摘掉）。不排除自己的话，「这是最后一条连接吗」永远问出 true ——
+   * 而这个判断存在的**全部意义**就是不重复播报离场（见 handleDeparture）。
+   *
+   * 遍历而不是用 Map 缓存：房间就几十个人、连接数更少，而这些调用本来就发生在
+   * DO 已经被唤醒的时候（握手 / 断开回调里），省下来的那次遍历换不来什么。
+   */
+  private hasConnectionFor(userId: string, except?: WebSocket): boolean {
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws === except) continue
+      const attachment = ws.deserializeAttachment() as SocketAttachment | null
+      if (attachment !== null && attachment.userId === userId) return true
+    }
+    return false
   }
 
   private onlineCount(): number {
@@ -346,5 +424,54 @@ export class ChatRoom implements DurableObject {
       event,
       username,
     })
+  }
+
+  /**
+   * 把「有人进/出房间」写成一条**系统消息**，落库之后再广播。
+   *
+   * ## 和 publishPresence 的分工
+   *
+   * `publishPresence` 发的是**状态**：「在线人数变成 N 了」，发完就没了。
+   * 这里发的是**内容**：一条真正进了聊天记录的话，刷新之后还在。
+   * 两个都要，但它们服务于不同的东西，别想着合并成一个事件 ——
+   * 合并之后要么人数刷新依赖一条要落库的消息（慢、还会因为 D1 抖动而丢），
+   * 要么那条提示因为「人数没变」而不发（一个人只是又开了个标签页时确实人数没变，
+   * 但离场提示该不该发是另一回事）。
+   *
+   * ## 为什么先落库、后广播
+   *
+   * 反过来的话，房间里其他人先看到提示，而**发提示的那个人自己**去翻历史
+   * 却翻不到 —— 因为那一刻它还没在库里。所以广播放在 `.then()` 里。
+   *
+   * ## 失败为什么只记日志、不往外抛
+   *
+   * 这条提示是**内容**而不是「业务实体」（对比 `routes/chat.ts` 里那段
+   * 「广播失败要吞掉」的理由）。这里更极端：它发生在**握手过程中**和
+   * **断开回调**里 —— 让一次 D1 抖动把整个 WebSocket 握手变成 500
+   * 是明显不成比例的，用户看到的是「进不去房间」，而实际原因只是少了一条提示。
+   * 写不进去的代价仅仅是「聊天记录里少一条进出提示」。
+   *
+   * 用 `waitUntil` 而不是 `await`：握手响应不该被一次 D1 往返拖慢；
+   * 同时 `waitUntil` 会保证这次写入在 DO 被换出内存之前跑完，不会丢。
+   */
+  private notifyPresence(kind: 'join' | 'leave', username: string, room: string): void {
+    // 文案在服务端定（见 system-message.ts）：这条 body 是要落库的，
+    // 刷新之后从历史里读出来的那份必须和现在广播出去的**一模一样**。
+    const message = systemMessage(
+      room,
+      kind === 'join' ? joinNotice(username) : leaveNotice(username),
+    )
+
+    this.ctx.waitUntil(
+      insertSystemMessage(this.env.DB, message)
+        // SystemMessageRow 是 ChatMessage 的结构超集（多的 `room` 字段前端会忽略），
+        // 所以直接当 ChatMessage 发出去，不为省几个字段再造一个对象。
+        .then(() => {
+          this.publish({ type: 'message', message })
+        })
+        .catch((error: unknown) => {
+          console.error('写进出房间提示失败', { room, kind, username, error })
+        }),
+    )
   }
 }

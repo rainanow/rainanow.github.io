@@ -56,7 +56,7 @@
 
     {{- /*
       成员名单的折叠箭头，紧贴在「在线 N 人」右边，读起来就是一整句：
-      「已连接 · 在线 3 人 ▾」。点一下在下面展开名单，箭头翻成朝上。
+      「在线 3 人 ▾」。点一下在下面展开名单，箭头翻成朝上。
       按钮本身只有一个三角，所以 aria-label 是必需的（读屏用户看不到这个图形）。
     */ -}}
     <button type="button" class="chat__members-toggle" data-chat-members-toggle
@@ -73,7 +73,13 @@
     */ -}}
     <button type="button" class="chat__rooms-toggle" data-chat-rooms-toggle
             aria-expanded="false" aria-controls="chat-rooms-panel">
-      房间 <span class="chat__members-caret" aria-hidden="true"></span>
+      {{- /*
+        「房间」和那个三角之间**不放空格字符**：模板里源码换行会变成一个真实的
+        空格节点，顶栏本来就挤，多这一个空格就是白占宽度（而且它和 CSS 的
+        gap 叠在一起，比设计值宽）。间距一律交给 CSS 的 gap —— 见 chat.css
+        里 .chat__rooms-toggle 的规则。
+      */ -}}
+      房间<span class="chat__members-caret" aria-hidden="true"></span>
     </button>
 
     {{- /*
@@ -247,8 +253,15 @@
           <textarea data-chat-input rows="2"
                     maxlength="{{ site.Params.chat.maxMessageLength | default 500 }}" required
                     placeholder="说点什么…（Enter 发送，Shift + Enter 换行）"></textarea>
+          {{- /*
+            title / aria-label 里**不写具体大小**：上限按角色分档
+            （普通用户 16 MB、管理员 100 MB），而模板在构建时不知道访客是谁。
+            登录之后由 chat.js 按 role 把这张提示补全 —— 见 enterRoom() 里
+            设置 el.upload.title 的那几行。这里留一个不含数字的默认值，
+            免得未登录/未启用 JS 时露出一个错的数字。
+          */ -}}
           <button type="button" class="chat__upload" data-chat-upload
-                  title="上传图片或文件（16 MB 以内）" aria-label="上传图片或文件">+</button>
+                  title="上传图片或文件" aria-label="上传图片或文件">+</button>
         </div>
 
         {{- /* 真正干活的是这个藏起来的 file input，点 + 只是去戳它 */ -}}

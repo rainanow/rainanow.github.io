@@ -37,6 +37,7 @@ export const messages = sqliteTable('messages', {
   userId: text('userId').notNull(),
   username: text('username').notNull(),
   body: text('body').notNull(),
+  kind: text('kind').notNull().default("user"),
   deleted: integer('deleted', { mode: 'boolean' }).notNull().default(false),
   deletedBy: text('deletedBy'),
   deletedAt: integer('deletedAt', { mode: 'timestamp_ms' }),

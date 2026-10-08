@@ -70,16 +70,17 @@ workers/chat/
 │   ├── rate-limit.ts        # D1 固定窗口限流
 │   ├── global-limit.ts      # 全站每日请求数熔断（内存累加 + 每 10 秒落库，见「免费额度核算」）
 │   ├── quota.ts             # 上传配额：文件数按天、字节数按累计总量（见第 23 条）
+│   ├── system-message.ts    # 系统提示（进出房间 / 撤回）的文案与落库语句（见第 25 条）
 │   ├── middleware.ts        # Cookie → Authorization 桥接、取客户端 IP
 │   ├── origins.ts           # 来源白名单、Cookie/令牌读取
 │   ├── config.ts            # 常量集中处
 │   ├── models/              # 表定义（nanoka 字段 DSL）
 │   └── routes/              # auth.ts / chat.ts / media.ts
 └── scripts/
-    ├── smoke.mjs            # 后端端到端冒烟测试（128 项）
-    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（153 项）
+    ├── smoke.mjs            # 后端端到端冒烟测试（156 项）
+    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（161 项）
     ├── purge-test.mjs       # 清空房间的去重与批量切分（17 项，纯逻辑）
-    ├── verify-build.mjs     # 构建产物 + 后端源码不变量（24 项，CI 里也跑）
+    ├── verify-build.mjs     # 构建产物 + 后端源码不变量（32 项，CI 里也跑）
     ├── rate-limit-test.mjs  # 真实限流阈值（22 项，自带 STRICT_RATE_LIMIT 的 server）
     ├── probe-production.mjs # 探线上健康
     └── inspect-d1.mjs       # 直接读本地 D1 的 SQLite，排查用
@@ -309,6 +310,12 @@ jobs:
 | 单人上传文件数 | `daily:user:<id>:<日>` | 100 | 1 天 | 硬拒；撤回时退回**上传那天** |
 | 单人累计上传字节 | `total:user:<id>` | 5 GiB | **永不** | 只有撤回才退，见第 23 条 |
 | 全站累计上传字节 | `total:global` | 8 GiB | **永不** | 只有撤回才退 |
+
+> **单次上传的大小上限不在上面这张表里**（它不是频率，是单次请求的闸）：
+> 普通用户 **16 MB**、管理员 **100 MB**（`MAX_UPLOAD_BYTES` / `MAX_UPLOAD_BYTES_ADMIN`）。
+> 100 MB 是**平台**的请求体上限，再往上写没有意义；两个数字在前端也各有一份
+> （提前拦住 + 提示文案里的数字），前后端是否相等由 `verify-build` 钉住。
+> ⚠️ 上传**必须带 `Content-Length`**，否则 **411** —— 理由见第 24 条。
 
 **完全没有限流的**：所有 `GET`（历史、成员名单、`/api/me`）走的是「登录 + 索引」那套，
 没有计数；`DELETE /api/rooms/:room`（清空房间）只查管理员角色 —— 它是刻意留给管理员的
@@ -881,21 +888,108 @@ ORDER BY createdAt DESC, id DESC LIMIT 51;
 
 ---
 
+### 24. 管理员的大文件上传必须走流式，而且 R2 只收「长度已知」的流
+
+上限按角色分档：普通用户 16 MB，管理员 100 MB。100 MB 这个数字**不是选的，
+是平台的请求体上限本身** —— 再往上写也没有意义，请求根本到不了 Worker
+（超了是平台直接回 413）。真正的约束是另外两道墙：Worker 单实例内存 **128 MB**、
+CPU **10 ms / 请求**。
+
+所以超过 16 MB 那一档**不能**再 `arrayBuffer()`：把 100 MB 拷进内存这件事本身
+就贴着那两道墙。改成「只把开头几 KB 读进内存做魔数嗅探 → 剩下的字节原样转交 R2」，
+Worker 里始终没有整份文件。
+
+三个只有踩过才知道的细节：
+
+1. **R2 的 `put()` 只收长度已知的流。** 直接把一个 `ReadableStream` 丢给它，
+   会抛 `TypeError: Provided readable stream must have a known length
+   (request/response body or readable half of FixedLengthStream)`。
+   我们的流既不是 request body（头已经被嗅探读掉了）、也没有长度，
+   所以必须过一层 `FixedLengthStream(declared)`。它顺带还是个**长度校验器**：
+   实写字节数多于或少于声明值都会让流报错 —— 于是「声明 16 MB 实传 100 MB」
+   骗不过账本，那一档的记账因此是精确的。
+2. **泵不能 await 在 `put()` 前面。** `FixedLengthStream` 不囤数据：可读端没人消费时
+   `writer.write()` 会一直等，而消费它的正是那个**还没被调用**的 `put()`。
+   先 await 泵再 await put 就是死锁。正确写法是「先把泵挂起来跑，再把可读端交给 put，
+   最后 await 泵」——而且这个 promise 必须被 await 掉，否则日志里会多一个
+   unhandled rejection，把真正的错因（put 那条）淹没。
+3. **`Content-Length` 从「最好有」变成了「必须有」**（缺失 → **411**）。
+   以前缺这个头是允许的（读进来再量），但那条路有个洞：客户端用
+   `Transfer-Encoding: chunked` 不带长度，我们就会把整个请求体读进内存，
+   而平台允许 100 MB。浏览器 `fetch()` 传 Blob / File 一定带长度，所以这不妨碍真实前端。
+
+另外两处顺序上的讲究：**配额检查提到了读请求体之前**（`checkUploadQuota` 是纯读的，
+它不消耗额度，消耗额度的是后面的 `markUpload`；提前判能让一次被拒的 100 MB 上传
+不用先传完再收到 429）；**记账用 R2 回给我们的实际大小**而不是声明值。
+
+回归测试：`smoke` 的「管理员大文件上传」一节 —— 真的发 17 MB 并**读回来核对字节数**
+（流式上传最典型的失败方式是「接口回 201、R2 里只有一个零头」）、
+累计字节账本按真实大小记账、普通用户 413、缺 `Content-Length` 411、额度到顶 429。
+「大文件那一档必须用 `FixedLengthStream`」这条**本地测不出来**（开发机上不撞那两道墙），
+所以额外在 `verify-build` 里放了一条静态断言把实现方式钉住。
+
+---
+
+### 25. 系统提示（进出房间 / 撤回）和普通消息**同表**存
+
+「谁进了房间」「谁撤回了一条」现在是**真正的消息行**（`messages.kind = 'system'`），
+不再是前端拼的一句话。分表存会逼出「两路归并 + 跨表游标」，而历史、清空、导出
+三处都得跟着改；同表存之后它们天然按 `(createdAt, id)` 和时间交错，
+翻页一行都不用改。
+
+四个值得记下来的决定：
+
+1. **用哨兵作者，不是让 `userId` 可空。** `messages` 那几列都是 NOT NULL，
+   改成可空在 SQLite 上等于重建整张表。所以系统行填全零 uuid（RFC 4122 的 nil uuid，
+   `crypto.randomUUID()` 永远不会产出）与 `SYSTEM_USERNAME`，二分靠 `kind`，
+   **不靠「某个字段是不是空」**。
+2. **文案在服务端定。** 因为它要落库：同一条提示对所有人和所有时间都必须长得一样，
+   包括刷新之后从历史里读出来的那份。「管理员撤回了**别人**的消息」这句还需要同时知道
+   操作者和作者，那个信息只有服务端有。
+3. **按「人」而不是按「连接」播报。** 同一个人开三个标签页是三条 WebSocket，
+   关掉其中一个不该播「离开了房间」，已经有连接时再连也不该再播「加入了房间」。
+   判据是「除了这条连接，还有没有别的连接挂在同一个 userId 上」——
+   注意 `webSocketClose` 回调里那条刚断开的 ws **仍然**会被 `getWebSockets()` 返回
+   （运行时还没来得及摘掉它），不把自己排除掉的话这个判断永远为真。
+4. **房间名记在连接上（`SocketAttachment.room`）。** DO 的实例名是外部用
+   `idFromName(room)` 算出来的，实例**没有 API 能问出自己叫哪个房间**；靠「第一次握手时
+   记进内存」在 DO 被驱逐后会退回默认值，而驱逐后那条连接断开时恰恰要靠它写离场提示。
+   attachment 是跟着连接持久化的，不受驱逐影响。
+
+**写提示失败只记日志，不让请求失败**：撤回本身已经生效（`deleted = true` 已落库、
+媒体也删了），为补不上一条提示把请求报成 500，用户会看到「撤回失败」而再点一次只拿到 404；
+进出提示更是在**握手过程中**和**断开回调**里写的，让一次 D1 抖动把整个 WebSocket
+握手变 500 明显不成比例。
+
+**系统提示不能被撤回**（`kind !== 'user'` → 403）：它不是谁「说」的，而且撤回本身
+又会生成一条新提示。前端的渲染层根本不给系统提示加撤回按钮，所以这一条主要是挡手拼请求。
+
+前端那一半：`kind === 'system'` 走一条**居中的窄条**（小字、淡色、无气泡、无撤回按钮、
+宽度贴合内容），刻意和对话区分开 —— 渲染成气泡会让人以为有个叫「系统」的人在发言，
+渲染成完整一条会把对话截断。正文只能进 `textContent`（里面含**用户可控**的用户名）。
+
+回归测试：`smoke` 的「系统消息」一节（广播文案、进历史、开第二个标签页不重复播、
+关一个标签页不播离场、管理员也撤不掉、自己撤 / 管理员撤别人两种文案）；
+`frontend-test` 的「系统提示」一节（窄条那几条 CSS 声明、无气泡无撤回按钮、
+用 `textContent` 而不是 `innerHTML`）。
+
+---
+
 ## 测试覆盖
 
-一共 **322 项**（四个进 CI 的脚本；另有 `rate-limit-test` 22 项，不在 CI 里）。
+一共 **366 项**（四个进 CI 的脚本；另有 `rate-limit-test` 22 项，不在 CI 里）。
 （项数会随测试增加变化，`2026-10-08` 实测值如下。）
 
 ```bash
 npm run typecheck      # tsc --noEmit，CI 里也跑
-npm run verify-build   # 24 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
+npm run verify-build   # 32 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
 npm run purge-test     # 17 项，纯逻辑，不需要任何服务
-npm run smoke          # 128 项，需要 wrangler dev
-npm run frontend-test  # 153 项，需要 wrangler dev + 构建出的 public/chat/
+npm run smoke          # 156 项，需要 wrangler dev
+npm run frontend-test  # 161 项，需要 wrangler dev + 构建出的 public/chat/
 npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev server
 ```
 
-`npm run smoke`（128 项，后端）：
+`npm run smoke`（156 项，后端）：
 
 - 健康检查、CORS 预检（含非白名单来源拿不到允许头）
 - 注册 / 大小写不同的重名被拒 / 非法输入
@@ -920,8 +1014,15 @@ npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
   且被拒的请求**不会偷改禁言状态**（见第 19 条）
 - **会话吊销后 WebSocket 开不出来**：先证明吊销前连得上，改密码后再握手 → 401
   （见第 20 条。这是「改密码要真的把人踢下线」的服务端那一半）
+- **系统消息**：进房间时广播一条「XX 加入了房间」并落库、同一个人开第二个标签页
+  不重复播、关掉其中一个标签页不播离场、最后一条断开才播；管理员也**撤不掉**系统提示
+  （403，而不是 404/200）；自己撤写成「XX 撤回了一条消息」、管理员撤别人的写成
+  「XX（管理员）撤回了 YY 的一条消息」。见第 25 条
+- **管理员大文件上传**：真的发 17 MB → 201、**读回来核对字节数没被截断**、
+  累计账本按真实大小记；普通用户同样的大小 → 413（理由里写 16 MB）；
+  缺 `Content-Length` → 411；全站存储到顶 → 429。见第 24 条
 
-`npm run frontend-test`（153 项，真实 `chat.js` + jsdom + 真实 Worker）：
+`npm run frontend-test`（161 项，真实 `chat.js` + jsdom + 真实 Worker）：
 
 - `chat.js` 引用的 18 个 `data-chat-*` 钩子在真实页面里都存在
 - 未登录 → 注册 → 自动登录 → 加载历史 → WebSocket 连上
