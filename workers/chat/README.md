@@ -78,7 +78,7 @@ workers/chat/
 │   └── routes/              # auth.ts / chat.ts / media.ts
 └── scripts/
     ├── smoke.mjs            # 后端端到端冒烟测试（156 项）
-    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（161 项）
+    ├── frontend-test.mjs    # 用 jsdom 跑真实 chat.js + 真实 Worker（164 项）
     ├── purge-test.mjs       # 清空房间的去重与批量切分（17 项，纯逻辑）
     ├── verify-build.mjs     # 构建产物 + 后端源码不变量（32 项，CI 里也跑）
     ├── rate-limit-test.mjs  # 真实限流阈值（22 项，自带 STRICT_RATE_LIMIT 的 server）
@@ -103,9 +103,9 @@ npm run dev                  # http://127.0.0.1:8787
 
 ```bash
 npm run typecheck            # TypeScript 全量检查
-npm run smoke                # 后端 128 项
-npm run frontend-test        # 前端 153 项（需要先 hugo 构建出 public/chat/index.html）
-npm run verify-build         # 构建产物 + 后端源码不变量 24 项（不需要 dev server，hugo 构建完就能跑）
+npm run smoke                # 后端 156 项
+npm run frontend-test        # 前端 164 项（需要先 hugo 构建出 public/chat/index.html）
+npm run verify-build         # 构建产物 + 后端源码不变量 32 项（不需要 dev server，hugo 构建完就能跑）
 npm run purge-test           # 清空房间的去重与批量切分 17 项（纯逻辑，不需要任何服务）
 npm run rate-limit-test      # 真实阈值 22 项（自己起一个 STRICT_RATE_LIMIT 的 dev server）
 npm run inspect-d1           # 打印本地 D1 里的表结构、账号、限流、吊销名单
@@ -975,9 +975,36 @@ Worker 里始终没有整份文件。
 
 ---
 
+### 26. 「面板色」不能写死十六进制 —— 这是一个只会在深色主题炸的坑
+
+消息区（`.chat__messages`）和输入框（`.chat__composer textarea`）共用同一个变量
+`--chat-panel`。浅色主题下它等于 `#f5f5f5`（正好就是主题 `--code-bg` 的浅色值），
+深色主题下必须跟着变成 `rgb(55, 56, 62)`。
+
+所以它写成 `var(--code-bg, #f5f5f5)` 而不是 `#f5f5f5`：
+
+- 浅色主题文字是深色的 → 浅底 + 深字，正常；
+- 深色主题文字是**浅色**的 → 同样铺一块 `#f5f5f5`，就是浅底浅字，整块看不见。
+
+要害是这个失误**在浅色主题下一点异常都没有**，只有切到深色才暴露 ——
+写 CSS 的时候越是「就想要这个灰」，越容易写死。
+
+因此 `frontend-test` 的「消息区与输入框的面板色」一节，断言的不是「等于 `#f5f5f5`」，
+而是「用了 `var(--chat-panel)`，且 `--chat-panel` 基于 `var(--code-bg)`」。
+同一个理由，`.chat` 里那两条 `--chat-surface*` 也是 `color-mix` 算出来的，
+而不是两个写死的灰。
+
+有底色之后连带改了两处版式，都是**必然**的：
+
+- 消息区原来的 `border-top` / `border-bottom` 两条淡线去掉了 —— 那是「没有底色」时
+  用来标出可滚动范围的替代品，有底色之后它们就只是多余的第二道边界；
+- 左右内边距从 `0.25rem` 加到 `0.75rem`，否则气泡会贴着面板边缘。
+
+---
+
 ## 测试覆盖
 
-一共 **366 项**（四个进 CI 的脚本；另有 `rate-limit-test` 22 项，不在 CI 里）。
+一共 **369 项**（四个进 CI 的脚本；另有 `rate-limit-test` 22 项，不在 CI 里）。
 （项数会随测试增加变化，`2026-10-08` 实测值如下。）
 
 ```bash
@@ -985,7 +1012,7 @@ npm run typecheck      # tsc --noEmit，CI 里也跑
 npm run verify-build   # 32 项，只看 Hugo 产物 + 后端源码不变量，不需要任何服务
 npm run purge-test     # 17 项，纯逻辑，不需要任何服务
 npm run smoke          # 156 项，需要 wrangler dev
-npm run frontend-test  # 161 项，需要 wrangler dev + 构建出的 public/chat/
+npm run frontend-test  # 164 项，需要 wrangler dev + 构建出的 public/chat/
 npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev server
 ```
 
@@ -1022,7 +1049,7 @@ npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
   累计账本按真实大小记；普通用户同样的大小 → 413（理由里写 16 MB）；
   缺 `Content-Length` → 411；全站存储到顶 → 429。见第 24 条
 
-`npm run frontend-test`（161 项，真实 `chat.js` + jsdom + 真实 Worker）：
+`npm run frontend-test`（164 项，真实 `chat.js` + jsdom + 真实 Worker）：
 
 - `chat.js` 引用的 18 个 `data-chat-*` 钩子在真实页面里都存在
 - 未登录 → 注册 → 自动登录 → 加载历史 → WebSocket 连上
@@ -1036,8 +1063,11 @@ npm run rate-limit-test # 22 项，自己起一个 STRICT_RATE_LIMIT 的 dev ser
   原样放行、重复调用幂等），外加一条「代码里没有 `body: {` 这种写法」的静态断言。
   见第 18 条 —— 这几条是冲着那个「改密码点了没反应」来的，
   而且**不需要 admin、也不需要真的改掉测试账号的密码**。
+- **消息区与输入框的面板色**：两条规则都必须用 `var(--chat-panel)`，且 `--chat-panel`
+  必须基于 `var(--code-bg)`。断言的**不是**「等于 `#f5f5f5`」—— 写死那个灰在浅色下
+  完全正常、只有深色下整块看不见。见第 26 条。
 
-`npm run verify-build`（24 项，只检查 Hugo 构建产物，不需要 dev server）：
+`npm run verify-build`（32 项，只检查 Hugo 构建产物，不需要 dev server）：
 
 - `/chat/` 存在、加载了 `chat.js`、有聊天室骨架
 - **其它任何页面都没有** `chat.js`、也没有聊天室骨架
