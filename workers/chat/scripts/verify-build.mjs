@@ -249,6 +249,45 @@ console.log('\n后端源码不变量（顺序 / 包含关系这类没法用 HTTP
     /'minutes'\s+in\s+body/.test(moderationSource),
     "少了这条，一个残缺请求会被当成「解除禁言」并返回 200",
   )
+
+  /*
+   * ⑥ 配额键名：quota.ts 造键、smoke.mjs 直接往 D1 里塞账本，两边必须一致。
+   *
+   * 这是**唯一**能让这条测试静默失效的地方：键名对不上不会报错，
+   * smoke 只会表现成「额度明明塞满了却还能传」—— 一个看起来像 bug、
+   * 实际是测试自己写错的现象。和 MAX_MESSAGE_LENGTH 那条同一个性质：
+   * 跨文件共享的字符串常量，只能靠一条自动检查钉住。
+   */
+  const quotaSource = readSource('../src/quota.ts')
+  const smokeSource = readSource('./smoke.mjs')
+  const quotaKey = (pattern, label) => {
+    check(`${label}（quota.ts 里有构造函数）`, pattern.test(quotaSource), '找不到这个键的构造')
+  }
+  quotaKey(/`daily:user:\$\{userId\}:\$\{day\}`/, '每日·按用户')
+  quotaKey(/`daily:global:\$\{day\}`/, '每日·全站')
+  quotaKey(/`total:user:\$\{userId\}`/, '累计·按用户')
+  quotaKey(/'total:global'/, '累计·全站')
+  check(
+    'smoke.mjs 塞账本用的键与之一致',
+    smokeSource.includes("'total:global'") && /daily:global:\$\{day\}/.test(smokeSource),
+    'smoke 里塞的键和 quota.ts 不一致 —— 这条一旦漂移，配额测试会变成空转',
+  )
+
+  /*
+   * ⑦ 全站请求熔断必须挂在 CORS **之后**。
+   *
+   * 挂在前面的话，被熔断时的 429 不带 CORS 头，浏览器把它显示成跨域错误，
+   * 前端那句「今天到上限了」永远到不了用户眼前 —— 和登出限流那次是同一类坑。
+   */
+  const appSource = readSource('../src/app.ts')
+  const corsAnchor = appSource.indexOf('cors({')
+  const breakerAnchor = appSource.indexOf("app.use('*', globalRequestLimit)")
+  check('app.ts 里挂了全站请求熔断', breakerAnchor !== -1, `位置 ${breakerAnchor}`)
+  check(
+    '熔断挂在 CORS 之后（否则 429 响应没有 CORS 头）',
+    corsAnchor !== -1 && breakerAnchor !== -1 && breakerAnchor > corsAnchor,
+    `CORS 在 ${corsAnchor}，熔断在 ${breakerAnchor}`,
+  )
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)

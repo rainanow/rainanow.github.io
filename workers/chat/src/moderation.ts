@@ -22,8 +22,14 @@ import { cookieAuthBridge } from './middleware'
 import { consumeRateLimit, effectiveLimit } from './rate-limit'
 import { revokeAllSessions } from './sessions'
 
-/** 管理员操作限额：同一管理员 1 分钟内最多 10 次。 */
-const MODERATION_LIMIT = 10
+/**
+ * 管理员操作限额：同一管理员 1 分钟内最多 30 次。
+ *
+ * 这条限流防的不是外部攻击（能做管理操作的人本来就过了 role 门禁），
+ * 而是**手滑连点**和**脚本拿着管理员令牌刷**。禁言、注销这类操作误触一次
+ * 代价不小，UI 上的确认弹窗只能拦第一种，第二种得靠这里。
+ */
+const MODERATION_LIMIT = 30
 const MODERATION_WINDOW_SECONDS = 60
 
 /** 账号被注销后，历史消息里替代原用户名显示成什么。 */

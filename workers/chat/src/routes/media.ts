@@ -1,7 +1,7 @@
 import { HTTPException } from 'hono/http-exception'
 import type { Context } from 'hono'
 
-import { MAX_UPLOAD_BYTES, UPLOAD_WINDOW_SECONDS } from '../config'
+import { MAX_UPLOAD_BYTES, UPLOAD_ALLOWED_PER_WINDOW, UPLOAD_WINDOW_SECONDS } from '../config'
 import type { AppEnv, ChatContext } from '../context'
 import { buildMediaKey, detectMedia, isMediaKey, sanitizeFilename } from '../media'
 import { cookieAuthBridge } from '../middleware'
@@ -41,11 +41,12 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
     const user = await User.findOne(sub)
     if (user === null) throw new HTTPException(401, { message: '账号不存在' })
 
-    // limit 传 2 的理由同发言限流：记账在先，窗口里的第一条要放行
+    // `+1` 的理由同发言限流：`consumeRateLimit` 记账在先，传 N 表示窗口里的
+    // 第 N 次被拦 —— 想放行 10 次就得传 11。数字只能来自常量，不要在这里写死。
     const attempt = await consumeRateLimit(
       c.env.DB,
       `upload:${sub}`,
-      effectiveLimit(c.env, 2),
+      effectiveLimit(c.env, UPLOAD_ALLOWED_PER_WINDOW + 1),
       UPLOAD_WINDOW_SECONDS,
     )
     if (attempt.blocked) {
@@ -81,15 +82,19 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
 
     // 配额检查放在类型判定之后：前面那些关卡（没登录、太大、类型不对）本来就不该
     // 消耗额度，这里才是「确实要落库了」的位置。
+    // 注意配额有两把尺子：文件数按天、字节数按累计总量，所以兜底文案不能写成
+    // 「今天的额度用完了」——存储满了是删文件才能恢复，不是等到明天。
     const quota = await checkUploadQuota(c.env.DB, sub, buffer.byteLength)
     if (!quota.allowed) {
-      return c.json({ error: quota.reason ?? '今天的上传额度用完了' }, 429)
+      return c.json({ error: quota.reason ?? '上传额度用完了' }, 429)
     }
 
     const filename = sanitizeFilename(c.req.header('x-filename'))
     const key = buildMediaKey(detected.ext)
     const encodedName = encodeURIComponent(filename)
-    // 记下是哪天传的：撤回时要按**那一天**的账退还额度，不能退到今天
+    // 记下是哪天传的：文件数那把尺子是按天的，撤回时要退回**上传的那一天**，
+    // 不能退到今天（跨日撤回会把今天的额度凭空加满）。
+    // 字节数那把尺子是累计总量，不涉及日期。
     const day = quotaDay()
 
     await c.env.MEDIA.put(key, buffer, {
@@ -112,7 +117,8 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
        * 只按用户名比对会让他有权删掉前任的文件。userId 不复用，没这个问题。
        * `uploader` 保留是为了能读懂老对象、也方便人肉排查。
        *
-       * day 用来在撤回时把额度退回到**上传的那一天**，不能退到今天。
+       * day 用来在撤回时把**按天的文件数**退回到上传的那一天，不能退到今天。
+       * 累计字节那两个键没有日期，所以不受影响。
        */
       customMetadata: { filename, uploaderId: user.id, uploader: user.username, day },
     })
@@ -131,7 +137,7 @@ export function registerMediaRoutes({ app, User, auth }: ChatContext): void {
       await c.env.MEDIA.delete(key).catch((error: unknown) => {
         console.error('额度被抢占后删除对象失败', { key, error })
       })
-      return c.json({ error: '今天的上传额度刚刚被用完了，明天再来吧' }, 429)
+      return c.json({ error: '上传额度刚刚被用完了，请稍后再试' }, 429)
     }
 
     return c.json(

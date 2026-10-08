@@ -16,29 +16,29 @@ import { clientIp } from '../middleware'
 import { consumeRateLimit, effectiveLimit, peekRateLimit } from '../rate-limit'
 import { isSessionActive, registerSession } from '../sessions'
 
-/** 登录失败限额：同一 IP + 同一用户名，15 分钟内最多 10 次。 */
+/** 登录失败限额：同一 IP + 同一用户名，1 小时内最多 10 次。 */
 const LOGIN_FAILURE_LIMIT = 10
-const LOGIN_WINDOW_SECONDS = 15 * 60
+const LOGIN_WINDOW_SECONDS = 60 * 60
 
 /** 注册限额：同一 IP 每小时最多 5 次。 */
 const REGISTER_LIMIT = 5
 const REGISTER_WINDOW_SECONDS = 60 * 60
 
 /**
- * refresh 限额：同一账号 60 秒内最多 20 次。
+ * refresh 限额：同一账号 60 秒内最多 30 次。
  *
  * 为什么必须限：开了 `jwt.rotation` 之后，**每一次成功 refresh 都会往
  * `auth_blacklist` 写一行**（旧 jti 入名单）。不限流的话，任何人手里只要有一个
- * 有效的 refresh token，就能循环调这个接口稳定地烧 D1 写额度（免费 10 万行/天）。
+ * 有效的 refresh token，就能循环调这个接口稳定地烧 D1 写额度。
  *
- * 为什么是 20 而不是更紧：access token 30 分钟过期，一个人开着好几个标签页时，
- * 过期那一瞬间会有 N 个标签页同时 refresh。20 次/分钟对这个量级绰绰有余，
- * 而它把「脚本无限刷」从「按 Worker 吞吐」压到了 20 次/分钟。
+ * 为什么是 30 而不是更紧：access token 30 分钟过期，一个人开着好几个标签页时，
+ * 过期那一瞬间会有 N 个标签页同时 refresh。30 次/分钟对这个量级绰绰有余，
+ * 而它把「脚本无限刷」从「按 Worker 吞吐」压到了 30 次/分钟。
  *
  * 命名同 `DELETE_ALLOWED_PER_WINDOW`：这个数字是**允许的次数**，
  * 传给 `consumeRateLimit` 时要 `+1`（那个函数是先记账再判断）。
  */
-const REFRESH_ALLOWED_PER_WINDOW = 20
+const REFRESH_ALLOWED_PER_WINDOW = 30
 const REFRESH_WINDOW_SECONDS = 60
 
 const registerSchema = z.object({
@@ -169,7 +169,7 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
    * 是一条完全免费的可刷路径。而拿到这种 token 的门槛很低：
    * 改一次自己的密码就有了。
    *
-   * 先记账再判定之后，这类请求最多 20 次/分钟。
+   * 先记账再判定之后，这类请求最多 30 次/分钟。
    *
    * ## 代价（想清楚了才这么改）
    *
@@ -191,7 +191,7 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
 }
 
 /**
- * 登出限额：同一账号（或同一 IP）60 秒内最多 60 次。
+ * 登出限额：同一账号（或同一 IP）60 秒内最多 30 次。
  *
  * ## 为什么这条路由也要限
  *
@@ -200,18 +200,20 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
  * 也就是说这是一条「无门槛（认不出令牌也照跑）、每次必写库」的公开路径。
  * 这和当初给 `/auth/refresh` 限流是同一个理由，只是那条更早被注意到。
  *
- * ## 阈值为什么比 refresh 宽三倍
+ * ## 阈值为什么和 refresh 一样是 30（而不是更宽）
  *
- * 登出不像 refresh 那样会自动重复：它只在用户主动点「退出」时发一次。
- * 而人可能来回点几次、或者几个标签页各点一次，所以给到 60 次/分钟 ——
- * 正常使用永远碰不到，但对「拿一个 Cookie 循环打」已经压到了可忽略的量级。
+ * 登出确实不像 refresh 那样会自动重复：它只在用户主动点「退出」时发一次，
+ * 人手滑来回点几下也就三五次。原先给到 60 次/分钟，理由是「比 refresh 宽三倍」，
+ * 但既然 30 次/分钟对最坏的真实使用（几个标签页各点一次）都远远够用，
+ * 那就没有必要留一条更宽的口子 —— **宽出来的部分只对刷的人有意义**。
+ * 所以统一成 30 次/分钟。
  *
  * ## 桶键
  *
  * 优先按账号（能从令牌里认出 sub 就按账号），认不出就退回按 IP。
  * 和 refresh 同理：几百人共用出口 IP 的场合，只按 IP 会误伤整栋楼。
  */
-const LOGOUT_ALLOWED_PER_WINDOW = 60
+const LOGOUT_ALLOWED_PER_WINDOW = 30
 const LOGOUT_WINDOW_SECONDS = 60
 
 const logoutThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {

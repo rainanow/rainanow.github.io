@@ -5,7 +5,7 @@
  *
  * 本地开发为了调试方便，在 `.dev.vars` 里设了 `RELAX_LOCAL_LIMITS=true`，
  * 把限流阈值放大到 100 万（见 `rate-limit.ts` 的 `effectiveLimit`）。
- * 那个开关一开，smoke 里所有断言 429 的用例会集体变红 —— 实测 **12 条**。
+ * 那个开关一开，凡是指望限流生效的用例都会红一片（把它们搬出来时实测 12 条）。
  *
  * 而「12 条测试红了」这件事极具误导性：人会以为是代码坏了去查错方向，
  * 实际只是本地调试开关的正常后果。所以把它们拆到这个脚本里，
@@ -184,7 +184,7 @@ section('登录限流')
     })
     results.push(response.status)
   }
-  // 阈值 10 次/15 分钟：前 10 次 401，第 11 次起 429
+  // 阈值 10 次/1 小时：前 10 次 401，第 11 次起 429
   check('前 10 次是 401（凭据错误）', results.slice(0, 10).every((s) => s === 401), `实际 ${results.slice(0, 10).join(',')}`)
   check('第 11 次起返回 429', results.slice(10).every((s) => s === 429), `实际 ${results.slice(10).join(',')}`)
 }
@@ -205,13 +205,13 @@ section('撤回限流')
   // 这样不用先发消息、也不用等撤回的媒体清理，是最省时间的探针。
   const missing = '00000000-0000-4000-8000-000000000000'
   const results = []
-  for (let i = 0; i < 24; i += 1) {
+  for (let i = 0; i < 34; i += 1) {
     const response = await request(`/api/messages/${missing}`, { method: 'DELETE', jar })
     results.push(response.status)
   }
-  // 阈值 20 次/60 秒：前 20 次 404，第 21 次起 429
-  check('前 20 次走到业务逻辑（404）', results.slice(0, 20).every((s) => s === 404), `实际 ${results.slice(0, 20).join(',')}`)
-  check('第 21 次起返回 429', results.slice(20).every((s) => s === 429), `实际 ${results.slice(20).join(',')}`)
+  // 阈值 30 次/60 秒：前 30 次 404，第 31 次起 429
+  check('前 30 次走到业务逻辑（404）', results.slice(0, 30).every((s) => s === 404), `实际 ${results.slice(0, 30).join(',')}`)
+  check('第 31 次起返回 429', results.slice(30).every((s) => s === 429), `实际 ${results.slice(30).join(',')}`)
 
   const limited = await request(`/api/messages/${missing}`, { method: 'DELETE', jar })
   check('429 之后不会偶尔再放行一次', limited.status === 429, `实际 ${limited.status}`)
@@ -245,16 +245,30 @@ section('发言限流')
   })
   const jar = jarFrom(login)
 
-  const first = await request('/api/messages', {
-    method: 'POST', jar, body: { body: '第一条', room: 'rlprobe' },
-  })
-  check('第一条发得出去（201）', first.status === 201, `实际 ${first.status}`)
+  /*
+   * 阈值是「10 秒 10 次」，所以**前 10 条必须全部成功**，第 11 条才是 429。
+   *
+   * ⚠️ 这里不能用「连发两条、第二条被拦」来测 —— 那是旧的「最小间隔 1 条」语义。
+   * 额度制的意思正是「连发几句是允许的」（一口气补两句话是常见操作，不该失败），
+   * 断言方向写反会把正常行为测成 bug。
+   */
+  const results = []
+  for (let i = 0; i < 12; i += 1) {
+    const response = await request('/api/messages', {
+      method: 'POST', jar, body: { body: `连发第 ${i + 1} 条`, room: 'rlprobe' },
+    })
+    results.push(response.status)
+  }
+  check(
+    '前 10 条都发得出去（201）',
+    results.slice(0, 10).every((s) => s === 201),
+    `实际 ${results.slice(0, 10).join(',')}`,
+  )
+  check('第 11 条起被限流 429', results.slice(10).every((s) => s === 429), `实际 ${results.slice(10).join(',')}`)
 
-  // 紧跟着的第二条要撞窗口：阈值是「1.5 秒内只放 1 条」
   const tooFast = await request('/api/messages', {
-    method: 'POST', jar, body: { body: '抢跑', room: 'rlprobe' },
+    method: 'POST', jar, body: { body: '再来一条', room: 'rlprobe' },
   })
-  check('1.5 秒内的第二条被限流 429', tooFast.status === 429, `实际 ${tooFast.status}`)
   check('429 带 Retry-After', tooFast.headers.get('Retry-After') !== null, '缺 Retry-After 头')
 }
 
@@ -271,29 +285,66 @@ section('refresh 限流')
 
   // 有效 token 打满额度：每次成功都会轮换出新 token，所以要一路跟着换 cookie
   const valid = []
-  for (let i = 0; i < 24; i += 1) {
+  for (let i = 0; i < 34; i += 1) {
     const response = await request('/auth/refresh', { method: 'POST', jar })
     valid.push(response.status)
     // jarFrom 只会覆盖已有的 key；refresh 换了新 token 也要更新
     const next = jarFrom(response)
     for (const [k, v] of Object.entries(next)) jar[k] = v
   }
-  check('前 20 次 refresh 成功', valid.slice(0, 20).every((s) => s === 200), `实际 ${valid.slice(0, 20).join(',')}`)
-  check('第 21 次起返回 429', valid.slice(20).every((s) => s === 429), `实际 ${valid.slice(20).join(',')}`)
+  check('前 30 次 refresh 成功', valid.slice(0, 30).every((s) => s === 200), `实际 ${valid.slice(0, 30).join(',')}`)
+  check('第 31 次起返回 429', valid.slice(30).every((s) => s === 429), `实际 ${valid.slice(30).join(',')}`)
 
   // 废 token 也必须被限住 —— 否则「限流」就是个摆设，
   // 攻击者拿一堆无效 token 打 refresh 不受任何约束（它照样写 D1）
   resetBuckets('refresh%')
   const junk = []
-  for (let i = 0; i < 23; i += 1) {
+  for (let i = 0; i < 33; i += 1) {
     const response = await fetch(`${BASE}/auth/refresh`, {
       method: 'POST',
       headers: { Cookie: 'refresh_token=definitely-not-a-real-token' },
     })
     junk.push(response.status)
   }
-  check('废 token 先正常返回 401，不是上来就挡', junk.slice(0, 20).every((s) => s === 401), `实际 ${junk.slice(0, 20).join(',')}`)
-  check('废 token 打满后也被 429 限住（不是绕过限流的后门）', junk.slice(20).every((s) => s === 429), `实际 ${junk.slice(20).join(',')}`)
+  check('废 token 先正常返回 401，不是上来就挡', junk.slice(0, 30).every((s) => s === 401), `实际 ${junk.slice(0, 30).join(',')}`)
+  check('废 token 打满后也被 429 限住（不是绕过限流的后门）', junk.slice(30).every((s) => s === 429), `实际 ${junk.slice(30).join(',')}`)
+}
+
+section('上传限流')
+{
+  /*
+   * 上传是**唯一一条「限流值写死在调用点」的路由**：它原先传的是字面量 2，
+   * 改阈值时很容易漏掉（这次就漏过一次，是靠人肉读代码才发现的）。
+   * 所以这里补上覆盖 —— 断言方向同样是「前 10 个必须成功」，
+   * 不能用「第二个就被拦」去测（那是旧的「3 秒 1 个」语义）。
+   */
+  resetBuckets('register:%')
+  resetBuckets('%')
+  await request('/auth/register', { method: 'POST', body: { username: `${username}u`, password } })
+  const login = await request('/auth/login', {
+    method: 'POST',
+    body: { username: `${username}u`, password },
+  })
+  const jar = jarFrom(login)
+
+  // 最小 PNG：8 字节魔数 + 4 字节，足够让类型嗅探认出它是图片
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
+  const upload = () =>
+    fetch(`${BASE}/api/uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png', 'x-filename': 'rl.png', Cookie: cookieHeader(jar) },
+      body: png,
+    })
+
+  const results = []
+  for (let i = 0; i < 12; i += 1) {
+    results.push((await upload()).status)
+  }
+  check('前 10 个文件传得上去（201）', results.slice(0, 10).every((s) => s === 201), `实际 ${results.slice(0, 10).join(',')}`)
+  check('第 11 个起被限流 429', results.slice(10).every((s) => s === 429), `实际 ${results.slice(10).join(',')}`)
+
+  const limited = await upload()
+  check('429 带 Retry-After', limited.headers.get('Retry-After') !== null, '缺 Retry-After 头')
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`)
