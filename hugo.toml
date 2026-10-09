@@ -126,13 +126,22 @@ hasCJKLanguage = true
     url = "/posts/"
     weight = 20
   [[menu.main]]
-    name = "归档"
-    url = "/archives/"
+    name = "学英语"
+    url = "https://a4deea51c91c4a39d.app.workbuddy.host/"
     weight = 30
   [[menu.main]]
-    name = "标签"
-    url = "/tags/"
-    weight = 40
+    name = "学数学"
+    url = "https://ad2d574999e36c4f7.app.workbuddy.host"
+    weight = 30
+
+  # [[menu.main]]
+  #  name = "归档"
+  #  url = "/archives/"
+  #  weight = 30
+  # [[menu.main]]
+  #  name = "标签"
+  #  url = "/tags/"
+  #  weight = 40
   [[menu.main]]
     name = "聊天室"
     url = "/chat/"
