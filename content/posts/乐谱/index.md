@@ -2,10 +2,10 @@
 date = '2026-10-01T13:55:00+08:00'
 draft = false
 title = '乐谱'
-summary = '吉他谱存档，共 167 张，图片存在 R2 上。'
+summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 +++
 
-吉他谱存档，共 167 张。图片存在 Cloudflare R2（`img.yulo.top`），这里是直链。
+吉他谱存档，共 171 张。图片存在 Cloudflare R2（`img.yulo.top`），这里是直链。
 
 <!--more-->
 
@@ -129,6 +129,10 @@ summary = '吉他谱存档，共 167 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/Sacred%20Play%20Secret%20Place_%E7%99%BD%E5%BA%95.jpg" title="Sacred Play Secret Place" w="1920" h="13024" >}}
 
+# secret base ~君がくれたも（未闻花名）
+
+{{< score src="https://img.yulo.top/sky/secret%20base%20~%E5%90%9B%E3%81%8C%E3%81%8F%E3%82%8C%E3%81%9F%E3%82%82%EF%BC%88%E6%9C%AA%E9%97%BB%E8%8A%B1%E5%90%8D%EF%BC%89_%E7%99%BD%E5%BA%95.jpg" title="secret base ~君がくれたも（未闻花名）" w="1920" h="14626" >}}
+
 # Star Crossing Night
 
 {{< score src="https://img.yulo.top/sky/Star%20Crossing%20Night_%E7%99%BD%E5%BA%95.jpg" title="Star Crossing Night" w="1920" h="10087" >}}
@@ -188,6 +192,10 @@ summary = '吉他谱存档，共 167 张，图片存在 R2 上。'
 # 不说（旧版）
 
 {{< score src="https://img.yulo.top/sky/%E4%B8%8D%E8%AF%B4%EF%BC%88%E6%97%A7%E7%89%88%EF%BC%89_%E7%99%BD%E5%BA%95.jpg" title="不说（旧版）" w="1920" h="10354" >}}
+
+# 不遗憾
+
+{{< score src="https://img.yulo.top/sky/%E4%B8%8D%E9%81%97%E6%86%BE_%E7%99%BD%E5%BA%95.jpg" title="不遗憾" w="1920" h="13291" >}}
 
 # 茶汤
 
@@ -305,6 +313,10 @@ summary = '吉他谱存档，共 167 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/%E7%BB%9D%E5%AF%B9%E5%8D%A0%E6%9C%89%20%E7%9B%B8%E5%AF%B9%E8%87%AA%E7%94%B1_%E7%99%BD%E5%BA%95.jpg" title="绝对占有 相对自由" w="1920" h="12490" >}}
 
+# 刻在我心底的名字
+
+{{< score src="https://img.yulo.top/sky/%E5%88%BB%E5%9C%A8%E6%88%91%E5%BF%83%E5%BA%95%E7%9A%84%E5%90%8D%E5%AD%97_%E7%99%BD%E5%BA%95.jpg" title="刻在我心底的名字" w="1920" h="13291" >}}
+
 # 空空如也
 
 {{< score src="https://img.yulo.top/sky/%E7%A9%BA%E7%A9%BA%E5%A6%82%E4%B9%9F_%E7%99%BD%E5%BA%95.jpg" title="空空如也" w="1920" h="10888" >}}
@@ -368,6 +380,10 @@ summary = '吉他谱存档，共 167 张，图片存在 R2 上。'
 # 难生恨
 
 {{< score src="https://img.yulo.top/sky/%E9%9A%BE%E7%94%9F%E6%81%A8_%E7%99%BD%E5%BA%95.jpg" title="难生恨" w="1920" h="10354" >}}
+
+# 你的泪 我的雨季
+
+{{< score src="https://img.yulo.top/sky/%E4%BD%A0%E7%9A%84%E6%B3%AA%20%E6%88%91%E7%9A%84%E9%9B%A8%E5%AD%A3_%E7%99%BD%E5%BA%95.jpg" title="你的泪 我的雨季" w="1920" h="8218" >}}
 
 # 你瞒我瞒
 
