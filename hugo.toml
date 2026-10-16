@@ -39,9 +39,6 @@ hasCJKLanguage = true
   comments = true                       # 启用评论（具体渲染见 layouts/partials/comments.html）
   socialIcons = [
     { name = "github", url = "https://github.com/rainanow" },
-    #{ name = "bilibili", url = "https://space.bilibili.com/3546734554778324" },
-    #{ name = "email", url = "mailto:2418331674@qq.com" },
-    #{ name = "rss", url = "/index.xml" }
   ]
 
   # --- 结构化数据（SEO）---
@@ -118,22 +115,17 @@ hasCJKLanguage = true
 
 [menu]
   [[menu.main]]
-    name = "搜索"
-    url = "/search/"
-    weight = 10
-  [[menu.main]]
     name = "文章"
     url = "/posts/"
+    weight = 10
+  [[menu.main]]
+    name = "搜索"
+    url = "/search/"
     weight = 20
   [[menu.main]]
-    name = "学英语"
-    url = "https://a4deea51c91c4a39d.app.workbuddy.host/"
-    weight = 30
-  [[menu.main]]
-    name = "学数学"
-    url = "https://ad2d574999e36c4f7.app.workbuddy.host"
-    weight = 30
-
+    name = "刷题"
+    url = "https://study-c0h.pages.dev/"
+    weight = 40
   # [[menu.main]]
   #  name = "归档"
   #  url = "/archives/"
@@ -143,9 +135,9 @@ hasCJKLanguage = true
   #  url = "/tags/"
   #  weight = 40
   [[menu.main]]
-    name = "聊天室"
+    name = "聊天"
     url = "/chat/"
-    weight = 55
+    weight = 30
 
 # 代码高亮：noClasses = false 让 Hugo 输出 class 而不是内联样式，
 # 这样代码配色才会跟着明暗模式切换（默认的内联样式会把颜色写死成 Monokai 深色）。
