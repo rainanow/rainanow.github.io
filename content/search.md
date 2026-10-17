@@ -1,4 +1,5 @@
 +++
 title = '搜索'
-layout = 'search'
+layout = 'search-redirect'
+searchHidden = true
 +++

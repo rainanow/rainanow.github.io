@@ -1,0 +1,8 @@
+{{- /* A local slice avoids Scratch accumulating old entries across server rebuilds. */ -}}
+{{- $index := slice -}}
+{{- range site.RegularPages -}}
+  {{- if and (not .Params.searchHidden) (ne .Layout "archives") (ne .Layout "search") (ne .Layout "search-redirect") -}}
+    {{- $index = $index | append (dict "title" .Title "content" .Plain "permalink" .Permalink "summary" (.Summary | plainify | htmlUnescape)) -}}
+  {{- end -}}
+{{- end -}}
+{{- $index | jsonify -}}

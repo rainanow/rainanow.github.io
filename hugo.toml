@@ -70,6 +70,8 @@ hasCJKLanguage = true
 
   [params.vercount]
     enable = true
+    # Local previews read the canonical site's counts without incrementing them.
+    siteURL = "https://yulo.top/"
 
   # --- Giscus 评论（基于仓库的 GitHub Discussions）---
   # 下面这组值**必须整组从 https://giscus.app 复制**，不要手抄、不要凭记忆改。
@@ -118,10 +120,6 @@ hasCJKLanguage = true
     name = "文章"
     url = "/posts/"
     weight = 10
-  [[menu.main]]
-    name = "搜索"
-    url = "/search/"
-    weight = 20
   [[menu.main]]
     name = "刷题"
     url = "https://study-c0h.pages.dev/"

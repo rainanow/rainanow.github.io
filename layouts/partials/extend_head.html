@@ -1,3 +1,8 @@
 {{- if .Site.Params.vercount.enable -}}
-  <script defer src="https://events.vercount.one/js"></script>
+  {{- $views := resources.Get "js/page-views.js" | minify | fingerprint }}
+  <script defer src="{{ $views.RelPermalink }}" data-page-views
+    data-api="https://events.vercount.one/api/v2/log"
+    data-site-url="{{ .Site.Params.vercount.siteURL | default .Site.BaseURL }}"
+    data-current-path="{{ .RelPermalink }}"
+    data-record="{{ and hugo.IsProduction (not hugo.IsServer) }}"></script>
 {{- end -}}

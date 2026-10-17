@@ -1,0 +1,16 @@
+<article class="post-entry" data-post-url="{{ .RelPermalink }}">
+  {{- $isHidden := (.Param "cover.hiddenInList") | default (.Param "cover.hidden") | default false }}
+  {{- partial "cover.html" (dict "cxt" . "IsSingle" false "isHidden" $isHidden) }}
+  <header class="entry-header">
+    <h2 class="entry-hint-parent">{{ .Title }}{{ if .Draft }} <span class="entry-hint">草稿</span>{{ end }}</h2>
+  </header>
+  {{- if ne (.Param "hideSummary") true }}
+  <div class="entry-content">
+    <p>{{ .Summary | plainify | htmlUnescape }}{{ if .Truncated }}...{{ end }}</p>
+  </div>
+  {{- end }}
+  {{- if not (.Param "hideMeta") }}
+  <footer class="entry-footer">{{ partial "post_meta.html" . }}</footer>
+  {{- end }}
+  <a class="entry-link" aria-label="阅读 {{ .Title | plainify }}" href="{{ .RelPermalink }}"></a>
+</article>

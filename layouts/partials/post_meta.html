@@ -1,6 +1,6 @@
 {{- /*
   覆盖 PaperMod 原版 post_meta，在原有「日期 · 阅读时长 · 作者」之后
-  追加卜算子的「本文阅读量」。原版逻辑来自 themes/PaperMod/layouts/partials/post_meta.html
+  按文章路径展示 Vercount 阅读量，列表中不使用重复的全局 ID。
 */ -}}
 {{- $scratch := newScratch }}
 
@@ -23,7 +23,7 @@
 {{- end }}
 
 {{- if .Site.Params.vercount.enable -}}
-{{- $scratch.Add "meta" (slice (printf "<span id='vercount_container_page_pv'>本文阅读量 <span id='vercount_value_page_pv'>Loading</span> 次</span>")) }}
+{{- $scratch.Add "meta" (slice (printf "<span class='post-views' data-page-url='%s'>阅读量加载中…</span>" (.RelPermalink | htmlEscape))) }}
 {{- end }}
 
 {{- with ($scratch.Get "meta") }}
