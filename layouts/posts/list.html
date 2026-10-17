@@ -1,0 +1,45 @@
+{{- define "main" }}
+<h1 class="visually-hidden">{{ .Title }}</h1>
+<section class="posts-search" id="posts-search" aria-label="文章搜索">
+  <div role="search">
+    <label class="visually-hidden" for="posts-search-input">搜索文章</label>
+    <input id="posts-search-input" type="search" placeholder="搜索文章……" autocomplete="off"
+      maxlength="100" aria-controls="posts-search-results" aria-describedby="posts-search-status"
+      data-index-url="{{ "index.json" | relLangURL }}">
+  </div>
+  <p id="posts-search-status" class="posts-search-status" role="status" aria-live="polite" hidden></p>
+  <div id="posts-search-results" class="posts-search-results" hidden></div>
+</section>
+
+{{- $pages := .RegularPages }}
+{{- $paginator := .Paginate $pages }}
+<div id="posts-list">
+  {{- range $paginator.Pages }}
+  {{- partial "post_card.html" . }}
+  {{- end }}
+  {{- if gt $paginator.TotalPages 1 }}
+  <footer class="page-footer">
+    <nav class="pagination" aria-label="文章分页">
+      {{- if $paginator.HasPrev }}
+      <a class="prev" href="{{ $paginator.Prev.URL }}">« {{ i18n "prev_page" }}</a>
+      {{- end }}
+      {{- if $paginator.HasNext }}
+      <a class="next" href="{{ $paginator.Next.URL }}">{{ i18n "next_page" }} »</a>
+      {{- end }}
+    </nav>
+  </footer>
+  {{- end }}
+</div>
+
+{{- /* Inert templates reuse the exact card markup without loading hidden covers or counters. */}}
+<template id="posts-search-cards">
+  {{- range where $pages "Params.searchHidden" "ne" true }}
+  {{- partial "post_card.html" . }}
+  {{- end }}
+</template>
+<noscript><p>启用 JavaScript 后可以搜索文章；下方文章仍可正常浏览。</p></noscript>
+{{- $fuse := resources.Get "js/fuse.basic.min.js" }}
+{{- $search := resources.Get "js/posts-search.js" }}
+{{- $bundle := slice $fuse $search | resources.Concat "assets/js/posts-search.js" | minify | fingerprint }}
+<script defer src="{{ $bundle.RelPermalink }}"></script>
+{{- end }}
