@@ -246,22 +246,47 @@
                aria-label="对方视频" hidden></video>
         <video class="chat__call-feed" data-call-local autoplay muted playsinline disablepictureinpicture disableremoteplayback
                aria-label="本机预览" hidden></video>
+        <button class="chat__call-main" type="button" data-call-main aria-label="显示通话控制"
+                aria-controls="chat-call-controls" aria-expanded="false" hidden></button>
         <button class="chat__call-mini" type="button" data-call-mini
                 aria-label="拖动小窗，点击互换画面" title="拖动小窗，点击互换画面" hidden></button>
         <div class="chat__call-overlay" data-call-overlay aria-hidden="true"></div>
+        <p class="chat__call-play-hint" data-call-play-hint role="status" hidden>点按主画面播放通话</p>
       </div>
       <p class="chat__call-player-hint" data-call-player-hint role="status" hidden>在网页通话界面可以拖动小窗、互换双画面。</p>
-      <div class="chat__call-controls">
-        <button class="chat__button chat__button--primary" type="button" data-call-accept hidden>接听</button>
-        <button class="chat__button" type="button" data-call-reject hidden>拒绝</button>
-        <button class="chat__button" type="button" data-call-play hidden>播放通话</button>
-        <button class="chat__button" type="button" data-call-mic hidden>静音</button>
-        <button class="chat__button" type="button" data-call-camera hidden>关闭摄像头</button>
-        <button class="chat__button" type="button" data-call-switch hidden>切换摄像头</button>
-        <button class="chat__button" type="button" data-call-swap hidden>互换画面</button>
-        <button class="chat__button" type="button" data-call-expand hidden>放大</button>
-        <button class="chat__button" type="button" data-call-overlay-toggle aria-pressed="true" hidden>浮动消息</button>
-        <button class="chat__button chat__call-hangup" type="button" data-call-hangup hidden>挂断</button>
+      <div class="chat__call-controls" id="chat-call-controls" data-call-controls role="group" aria-label="通话控制">
+        <button class="chat__call-button chat__call-button--accept" type="button" data-call-accept aria-label="接听" title="接听" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M6 3h3l1.5 4.5-2 1.8a13 13 0 0 0 6.2 6.2l1.8-2L21 15v3a3 3 0 0 1-3.2 3A17 17 0 0 1 3 6.2 3 3 0 0 1 6 3Z"/>
+          </svg>
+        </button>
+        <button class="chat__call-button" type="button" data-call-mic aria-label="静音麦克风" aria-pressed="false" title="静音" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <g class="chat__call-icon-on">
+              <rect x="9" y="3" width="6" height="12" rx="3"/>
+              <path d="M5 11v1a7 7 0 0 0 14 0v-1m-7 8v3m-3 0h6"/>
+            </g>
+            <g class="chat__call-icon-off">
+              <path d="m3 3 18 18M9 9v3a3 3 0 0 0 5.1 2.1M9.4 4.5A3 3 0 0 1 15 6v3m4 2v1a7 7 0 0 1-.6 2.8M5 11v1a7 7 0 0 0 11.1 5.7M12 19v3m-3 0h6"/>
+            </g>
+          </svg>
+        </button>
+        <button class="chat__call-button chat__call-button--hangup" type="button" data-call-hangup aria-label="挂断" title="挂断" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M3.5 16H7a1 1 0 0 0 1-1v-2a12 12 0 0 1 8 0v2a1 1 0 0 0 1 1h3.5a1.5 1.5 0 0 0 1.5-1.5v-1a3 3 0 0 0-1.4-2.5 16 16 0 0 0-17.2 0A3 3 0 0 0 2 13.5v1A1.5 1.5 0 0 0 3.5 16Z"/>
+          </svg>
+        </button>
+        <button class="chat__call-button" type="button" data-call-camera aria-label="关闭摄像头" aria-pressed="false" title="关闭摄像头" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <g class="chat__call-icon-on">
+              <rect x="3" y="6" width="12" height="12" rx="2"/>
+              <path d="m15 10 6-3v10l-6-3"/>
+            </g>
+            <g class="chat__call-icon-off">
+              <path d="m3 3 18 18M3 9v7a2 2 0 0 0 2 2h8a2 2 0 0 0 1.5-.7M9 6h4a2 2 0 0 1 2 2v2l6-3v8"/>
+            </g>
+          </svg>
+        </button>
       </div>
     </section>
 

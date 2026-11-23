@@ -4,6 +4,7 @@
   const clamp = (value, limit) => Math.max(0, Math.min(limit, value))
   const edge = 8
   const dragThreshold = 6
+  const controlsIdleMs = 3000
 
   window.createYuloCallLayout = function (panel) {
     const room = panel.closest('[data-chat-room]')
@@ -11,27 +12,53 @@
     const stage = control('stage')
     const remote = control('remote')
     const local = control('local')
+    const mainTarget = control('main')
     const mini = control('mini')
-    const swap = control('swap')
-    const expand = control('expand')
+    const controls = control('controls')
     const overlay = control('overlay')
-    const overlayToggle = control('overlay-toggle')
     const playerHint = control('player-hint')
     const compact = window.matchMedia?.('(max-width: 640px), (max-width: 940px) and (max-height: 520px)')
     const viewport = window.visualViewport
     let preferredMain = remote
-    let fraction = { x: 1, y: 1 }
+    let fraction = null
     let thumbnail = null
     let bounds = null
     let drag = null
     let suppressClick = false
     let hasPeer = false
     let active = false
-    let expandedChoice = null
-    let showMessages = true
+    let controlsTimer
     let hintTimer
     const messages = new Map()
     const seen = new Set()
+
+    function controlsHaveKeyboardFocus() {
+      const focused = document.activeElement
+      return controls.contains(focused) && focused.matches(':focus-visible')
+    }
+
+    function showControls() {
+      controls.classList.remove('is-idle')
+      mainTarget.setAttribute('aria-expanded', 'true')
+      scheduleControlsHide()
+    }
+
+    function scheduleControlsHide() {
+      clearTimeout(controlsTimer)
+      if (!active) return
+      controlsTimer = setTimeout(() => {
+        if (controlsHaveKeyboardFocus()) return
+        controls.classList.add('is-idle')
+        mainTarget.setAttribute('aria-expanded', 'false')
+      }, controlsIdleMs)
+    }
+
+    mainTarget.addEventListener('click', showControls)
+    controls.addEventListener('click', showControls)
+    controls.addEventListener('focusin', () => {
+      if (controlsHaveKeyboardFocus()) showControls()
+    })
+    controls.addEventListener('focusout', scheduleControlsHide)
 
     function pixels(name, value) {
       stage.style.setProperty(name, value + 'px')
@@ -52,13 +79,14 @@
         ? thumbnail.videoWidth / thumbnail.videoHeight : 4 / 3
       const margin = Math.min(edge, width / 4, height / 4)
       const maxWidth = Math.min(width * 0.36, 184)
-      const maxHeight = Math.min(height - 2 * margin, Math.max(48, Math.min(160, height * 0.38)))
+      const heightLimit = compact?.matches ? 224 : 160
+      const maxHeight = Math.min(height - 2 * margin, Math.max(48, Math.min(heightLimit, height * 0.38)))
       const miniWidth = Math.min(maxWidth, maxHeight * aspect)
       const miniHeight = miniWidth / aspect
       const travelX = Math.max(0, width - 2 * margin - miniWidth)
       const travelY = Math.max(0, height - 2 * margin - miniHeight)
-      const x = margin + fraction.x * travelX
-      const y = margin + fraction.y * travelY
+      const x = margin + (fraction?.x ?? 1) * travelX
+      const y = margin + (fraction?.y ?? (compact?.matches ? 0 : 1)) * travelY
       bounds = { x, y, margin, travelX, travelY }
       pixels('--call-mini-x', x)
       pixels('--call-mini-y', y)
@@ -92,14 +120,8 @@
       stage.dataset.main = main === local ? 'local' : 'remote'
       local.classList.toggle('is-small', thumbnail === local)
       remote.classList.toggle('is-small', thumbnail === remote)
-      swap.hidden = !both
-      const expanded = hasPeer && (expandedChoice ?? compact?.matches ?? false)
-      room.classList.toggle('is-call-expanded', expanded)
-      expand.hidden = !hasPeer
-      expand.textContent = expanded ? '收起' : '放大'
-      expand.setAttribute('aria-pressed', String(expanded))
-      overlayToggle.hidden = !active
-      overlayToggle.setAttribute('aria-pressed', String(showMessages))
+      mainTarget.hidden = !hasPeer
+      room.classList.toggle('is-call-expanded', hasPeer && !!compact?.matches)
       fitViewport()
     }
 
@@ -132,8 +154,10 @@
       drag.moved = true
       mini.classList.add('is-dragging')
       const { margin, travelX, travelY } = bounds
-      if (travelX) fraction.x = clamp(drag.start.x + dx - margin, travelX) / travelX
-      if (travelY) fraction.y = clamp(drag.start.y + dy - margin, travelY) / travelY
+      fraction = {
+        x: travelX ? clamp(drag.start.x + dx - margin, travelX) / travelX : fraction?.x,
+        y: travelY ? clamp(drag.start.y + dy - margin, travelY) / travelY : fraction?.y,
+      }
       placeThumbnail()
     })
 
@@ -144,11 +168,6 @@
       const ignore = suppressClick && event.detail !== 0
       suppressClick = false
       if (!ignore) swapFeeds()
-    })
-    swap.addEventListener('click', swapFeeds)
-    expand.addEventListener('click', () => {
-      expandedChoice = !room.classList.contains('is-call-expanded')
-      sync()
     })
     compact?.addEventListener?.('change', sync)
     window.addEventListener('resize', fitViewport)
@@ -184,7 +203,7 @@
     }
 
     function addMessage({ id, username, body }) {
-      if (!active || !showMessages || seen.has(id)) return
+      if (!active || seen.has(id)) return
       const text = body.replace(/\s+/g, ' ').trim()
       if (!text) return
       if (seen.size >= 64) seen.delete(seen.values().next().value)
@@ -197,24 +216,20 @@
       messages.set(id, { line, timer: setTimeout(() => removeMessage(id), 5500) })
     }
 
-    overlayToggle.addEventListener('click', () => {
-      showMessages = !showMessages
-      if (!showMessages) clearMessages()
-      sync()
-    })
-
     return {
       update(peerPresent, callActive) {
+        const phaseChanged = hasPeer !== peerPresent || active !== callActive
         hasPeer = peerPresent
         active = callActive
+        if (phaseChanged) showControls()
         sync()
       },
       reset() {
         hasPeer = false
         active = false
-        expandedChoice = null
+        showControls()
         preferredMain = remote
-        fraction = { x: 1, y: 1 }
+        fraction = null
         if (drag) endDrag(drag.id)
         suppressClick = false
         seen.clear()

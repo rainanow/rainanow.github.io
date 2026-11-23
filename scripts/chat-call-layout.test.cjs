@@ -7,7 +7,7 @@ const { test } = require('node:test')
 const root = resolve(__dirname, '..')
 const { JSDOM } = require(require.resolve('jsdom', { paths: [join(root, 'workers/chat')] }))
 const build = process.env.CHAT_BUILD_DIR || join(root, 'public')
-const html = readFileSync(join(build, 'chat/tech/index.html'), 'utf8')
+const html = readFileSync(join(build, 'chat/index.html'), 'utf8')
 const source = readFileSync(join(root, 'assets/js/chat-call-layout.js'), 'utf8')
 
 function callPage(t) {
@@ -16,6 +16,8 @@ function callPage(t) {
   t.after(() => window.close())
   const room = window.document.querySelector('[data-chat-room]')
   const panel = room.querySelector('[data-chat-call]')
+  room.hidden = false
+  panel.hidden = false
   const control = (name) => panel.querySelector('[data-call-' + name + ']')
   const [stage, local, remote, mini] = ['stage', 'local', 'remote', 'mini'].map(control)
   for (const video of [local, remote]) {
@@ -70,7 +72,7 @@ function closeTo(actual, expected) {
 
 test('the same feeds swap, drag within the stage and resize with their camera ratio', (t) => {
   const page = callPage(t)
-  const { window, stage, local, remote, mini, control, layout, size, pointer, thumbnailRect } = page
+  const { window, stage, local, remote, mini, layout, size, pointer, thumbnailRect } = page
   const [localFeed, remoteFeed] = [local.srcObject, remote.srcObject]
   page.setVideoSize(local, 640, 480)
   page.setVideoSize(remote, 1280, 720)
@@ -79,6 +81,8 @@ test('the same feeds swap, drag within the stage and resize with their camera ra
   assert.ok(local.classList.contains('is-small'))
   const original = thumbnailRect()
   closeTo(original.width / original.height, 4 / 3)
+  closeTo(original.x + original.width, size.width - 8)
+  closeTo(original.y + original.height, size.height - 8)
 
   pointer('pointerdown', original.x + 10, original.y + 10)
   pointer('pointermove', -100, -100, 2)
@@ -91,7 +95,7 @@ test('the same feeds swap, drag within the stage and resize with their camera ra
   assert.equal(thumbnailRect().y, 8)
   assert.equal(stage.dataset.overlaySide, 'right')
 
-  control('swap').click()
+  mini.click()
   assert.equal(stage.dataset.main, 'local')
   assert.ok(remote.classList.contains('is-small'))
   const swapped = thumbnailRect()
@@ -114,8 +118,8 @@ test('the same feeds swap, drag within the stage and resize with their camera ra
   assert.equal(remote.srcObject, remoteFeed)
 })
 
-test('a compact call keeps the composer and shows recent text only while enabled', (t) => {
-  const { window, room, control, layout, mode, viewport, size } = callPage(t)
+test('a compact call starts with the thumbnail at the upper right and keeps the composer', (t) => {
+  const { window, room, control, layout, mode, viewport, size, thumbnailRect } = callPage(t)
   const overlay = control('overlay')
   const add = (id, body) => layout.addMessage({ id, username: 'Alice', body })
   add('pre-call', 'before connecting')
@@ -124,16 +128,19 @@ test('a compact call keeps the composer and shows recent text only while enabled
   layout.update(true, true)
   assert.ok(room.classList.contains('is-call-expanded'))
   assert.ok(room.querySelector('[data-chat-composer]'))
+  const thumbnail = thumbnailRect()
+  closeTo(thumbnail.x + thumbnail.width, size.width - 8)
+  closeTo(thumbnail.y, 8)
   Object.assign(viewport, { height: 430, offsetTop: 16 })
   viewport.dispatchEvent(new window.Event('resize'))
   assert.equal(room.style.getPropertyValue('--call-viewport-height'), '430px')
   assert.equal(room.style.getPropertyValue('--call-viewport-top'), '16px')
-  control('expand').click()
-  assert.equal(room.classList.contains('is-call-expanded'), false)
-  assert.equal(room.style.getPropertyValue('--call-viewport-height'), '')
+  mode.matches = false
   mode.dispatchEvent(new window.Event('change'))
   assert.equal(room.classList.contains('is-call-expanded'), false)
-  control('expand').click()
+  assert.equal(room.style.getPropertyValue('--call-viewport-height'), '')
+  mode.matches = true
+  mode.dispatchEvent(new window.Event('change'))
   assert.ok(room.classList.contains('is-call-expanded'))
 
   assert.equal(overlay.children.length, 0)
@@ -148,13 +155,56 @@ test('a compact call keeps the composer and shows recent text only while enabled
   assert.equal(overlay.querySelector('img'), null)
   layout.removeMessage('three')
   assert.equal(overlay.children.length, 2)
-  control('overlay-toggle').click()
-  add('five', 'hidden')
-  assert.equal(overlay.children.length, 0)
-  control('overlay-toggle').click()
-  add('six', 'visible')
-  assert.equal(overlay.children.length, 1)
   layout.reset()
   assert.equal(overlay.children.length, 0)
   assert.equal(room.classList.contains('is-call-expanded'), false)
+})
+
+test('controls hide after idle, reappear from the main video, and stay on screen with keyboard focus', (t) => {
+  const { window, control, layout } = callPage(t)
+  const controls = control('controls')
+  const main = control('main')
+  const hangup = control('hangup')
+  t.mock.method(hangup, 'matches', (selector) => selector === ':focus-visible' && window.document.activeElement === hangup)
+  const timers = new Map()
+  let sequence = 0
+  window.setTimeout = (callback, delay) => {
+    timers.set(++sequence, { callback, delay })
+    return sequence
+  }
+  window.clearTimeout = (id) => timers.delete(id)
+  function runIdleDelay() {
+    assert.equal(timers.size, 1)
+    const [[id, { callback, delay }]] = timers
+    assert.equal(delay, 3000)
+    timers.delete(id)
+    callback()
+  }
+
+  layout.update(true, false)
+  assert.equal(timers.size, 0)
+  layout.update(true, true)
+  assert.equal(main.getAttribute('aria-expanded'), 'true')
+  runIdleDelay()
+  assert.ok(controls.classList.contains('is-idle'))
+  assert.equal(main.getAttribute('aria-expanded'), 'false')
+  layout.update(true, true)
+  assert.equal(timers.size, 0)
+
+  main.click()
+  assert.equal(controls.classList.contains('is-idle'), false)
+  hangup.hidden = false
+  hangup.focus()
+  assert.equal(window.document.activeElement, hangup)
+  runIdleDelay()
+  assert.equal(controls.classList.contains('is-idle'), false)
+  main.focus()
+  runIdleDelay()
+  assert.ok(controls.classList.contains('is-idle'))
+
+  main.click()
+  assert.equal(timers.size, 1)
+  layout.reset()
+  assert.equal(timers.size, 0)
+  assert.equal(main.hidden, true)
 })

@@ -43,8 +43,8 @@
     const ui = {
       peer: control('peer'), status: control('status'), stage: control('stage'),
       local: control('local'), remote: control('remote'), accept: control('accept'),
-      reject: control('reject'), hangup: control('hangup'), mic: control('mic'),
-      camera: control('camera'), switchCamera: control('switch'), play: control('play'),
+      hangup: control('hangup'), mic: control('mic'), camera: control('camera'),
+      main: control('main'), playHint: control('play-hint'),
     }
     let available = false
     let call = null
@@ -69,6 +69,11 @@
       }
     }
 
+    function setPlaybackBlocked(blocked) {
+      ui.playHint.hidden = !blocked
+      ui.main.setAttribute('aria-label', blocked ? '播放通话并显示控制' : '显示通话控制')
+    }
+
     function render() {
       panel.hidden = call === null
       if (call === null) {
@@ -76,7 +81,7 @@
         ui.stage.hidden = true
         ui.local.hidden = true
         ui.remote.hidden = true
-        ui.play.hidden = true
+        setPlaybackBlocked(false)
         layout.reset()
         return
       }
@@ -101,17 +106,17 @@
       ui.local.hidden = !videoOn
       ui.remote.hidden = !inMedia
       ui.accept.hidden = call.phase !== 'incoming'
-      ui.reject.hidden = call.phase !== 'incoming'
-      ui.hangup.hidden = call.phase === 'incoming'
-      ui.hangup.textContent = inMedia || call.phase === 'active' ? '挂断' : '取消'
+      const hangupLabel = call.phase === 'incoming' ? '拒绝通话' : inMedia ? '挂断' : '取消呼叫'
+      ui.hangup.hidden = false
+      ui.hangup.title = hangupLabel
+      ui.hangup.setAttribute('aria-label', hangupLabel)
       ui.mic.hidden = !inMedia
-      ui.mic.textContent = audioOn ? '静音' : '取消静音'
+      ui.mic.title = audioOn ? '静音' : '取消静音'
       ui.mic.setAttribute('aria-pressed', String(!audioOn))
       ui.camera.hidden = !inMedia
       ui.camera.disabled = !!call.changingCamera
-      ui.camera.textContent = videoOn ? '关闭摄像头' : '开启摄像头'
-      ui.switchCamera.hidden = !inMedia || !call.canSwitchCamera
-      ui.switchCamera.disabled = !!call.changingCamera || !videoOn
+      ui.camera.title = videoOn ? '关闭摄像头' : '开启摄像头'
+      ui.camera.setAttribute('aria-pressed', String(!videoOn))
       layout.update(inMedia, call.phase === 'active')
     }
 
@@ -171,11 +176,6 @@
         current.facing = stream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user'
         ui.local.srcObject = stream
         render()
-        navigator.mediaDevices.enumerateDevices?.().then((devices) => {
-          if (call !== current) return
-          current.canSwitchCamera = devices.filter((device) => device.kind === 'videoinput').length > 1
-          render()
-        }).catch(() => {})
         return stream
       } catch (error) {
         current.captureError = captureError(error)
@@ -187,6 +187,7 @@
       if (!available) return
       if (call) return options.notice('请先结束当前通话')
       const current = state({ userId: member.id, username: member.username }, 'preparing')
+      options.notice('')
       call = current
       render()
       current.media = capture(current)
@@ -218,11 +219,11 @@
     }
 
     function playRemote(current) {
-      if (call !== current) return
+      if (!current?.pc || call !== current) return
       ui.remote.play().then(() => {
-        if (call === current) ui.play.hidden = true
+        if (call === current) setPlaybackBlocked(false)
       }).catch(() => {
-        if (call === current) ui.play.hidden = false
+        if (call === current) setPlaybackBlocked(true)
       })
     }
 
@@ -391,6 +392,7 @@
         // 同时拨号时以服务端已建立的来电为准。
         if (current?.id) return
         if (current) finish(current)
+        options.notice('')
         call = state(event.peer, 'incoming', event.callId)
         deadline(call, event.expiresAt, endText['no-answer'], 31_000)
         render()
@@ -450,22 +452,22 @@
       }
     }
 
-    async function camera(switching) {
+    async function toggleCamera() {
       const current = call
       if (!current?.videoSender || current.changingCamera) return
       current.changingCamera = true
+      ui.camera.disabled = true
+      const track = current.local.getVideoTracks()[0]
       let replacement = null
       try {
-        const track = current.local.getVideoTracks()[0]
         if (track) {
           current.local.removeTrack(track)
           track.stop()
           await current.videoSender.replaceTrack(null)
+          return
         }
-        if (call !== current || (track && !switching)) return
-        const facing = switching ? (current.facing === 'environment' ? 'user' : 'environment') : current.facing
         const stream = await navigator.mediaDevices.getUserMedia({
-          audio: false, video: { facingMode: switching ? { exact: facing } : { ideal: facing } },
+          audio: false, video: { facingMode: { ideal: current.facing } },
         })
         replacement = stream.getVideoTracks()[0]
         if (!replacement) return
@@ -473,11 +475,11 @@
         await current.videoSender.replaceTrack(replacement)
         if (call === current) {
           current.local.addTrack(replacement)
-          current.facing = replacement.getSettings().facingMode ?? facing
+          current.facing = replacement.getSettings().facingMode ?? current.facing
           replacement = null
         }
       } catch {
-        if (call === current) options.notice(switching ? '无法切换摄像头' : '无法开启摄像头', 'error')
+        if (call === current) options.notice(track ? '无法关闭摄像头' : '无法开启摄像头', 'error')
       } finally {
         replacement?.stop()
         current.changingCamera = false
@@ -486,18 +488,20 @@
     }
 
     ui.accept.addEventListener('click', accept)
-    ui.reject.addEventListener('click', () => endCurrent('已拒绝通话'))
     ui.hangup.addEventListener('click', () => {
-      endCurrent(call?.phase === 'active' || call?.pc ? '通话已结束' : '已取消呼叫')
+      if (!call) return
+      const message = call.phase === 'incoming' ? '已拒绝通话' : call.pc ? '通话已结束' : '已取消呼叫'
+      endCurrent(message)
     })
     ui.mic.addEventListener('click', () => {
       const tracks = call?.local?.getAudioTracks() || []
       tracks.forEach((track) => { track.enabled = !track.enabled })
       render()
     })
-    ui.camera.addEventListener('click', () => camera(false))
-    ui.switchCamera.addEventListener('click', () => camera(true))
-    ui.play.addEventListener('click', () => playRemote(call))
+    ui.camera.addEventListener('click', toggleCamera)
+    ui.main.addEventListener('click', () => {
+      if (!ui.playHint.hidden) playRemote(call)
+    })
 
     return {
       canInvite: () => available,
