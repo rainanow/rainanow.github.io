@@ -1,5 +1,6 @@
 ---
 title: "技术"
+layout: "chat"
 summary: "聊天室的一个房间。"
 date: 2026-09-30
 # room 进 front matter，页面 URL 也一起指到 /chat/ 下面 ——

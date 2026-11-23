@@ -72,6 +72,7 @@
     auth: root.querySelector('[data-chat-auth]'),
     room: root.querySelector('[data-chat-room]'),
     messages: root.querySelector('[data-chat-messages]'),
+    resize: root.querySelector('[data-chat-resize]'),
     more: root.querySelector('[data-chat-more]'),
     empty: root.querySelector('[data-chat-empty]'),
     form: root.querySelector('[data-chat-form]'),
@@ -124,6 +125,7 @@
   var heartbeatTimer = null
   var reconnectTimer = null
   var reconnectDelay = 1000
+  var abortVideoHandoff = null
   var refreshInFlight = null
   var mode = 'login'
   /**
@@ -149,6 +151,19 @@
    * 就得拿这份缓存当底子 —— 在线的人标 online，其余的都算离线。
    */
   var memberCache = []
+  var videoCalls = typeof window.createYuloCallController === 'function'
+    ? window.createYuloCallController(root, {
+        room: ROOM,
+        api: api,
+        notice: notice,
+        send: sendVideoFrame,
+        reconnect: reconnectVideoSocket,
+        renew: renewVideoSocket,
+        availabilityChanged: function () {
+          if (memberCache.length > 0) renderMembers(memberCache)
+        }
+      })
+    : null
 
   // --- 小工具 ---------------------------------------------------------------
 
@@ -567,7 +582,7 @@
 
     var author = document.createElement('span')
     author.className = 'chat__author'
-    // 尖括号由 CSS 的 ::before / ::after 拼，这里只放用户名本身
+    // Names remain plain text; message authors control their own usernames.
     author.textContent = message.username
 
     var time = timeElement(message.createdAt)
@@ -579,7 +594,7 @@
     var remove = document.createElement('button')
     remove.type = 'button'
     remove.className = 'chat__delete'
-    remove.textContent = '\u00d7'
+    remove.textContent = '×'
     remove.disabled = !canDelete
     remove.title = canDelete ? '撤回这条消息' : '只能撤回自己的消息'
     remove.setAttribute('aria-label', remove.title)
@@ -589,7 +604,7 @@
       })
     }
 
-    // 顺序决定视觉：用户名、时间靠左，撤回按钮靠 margin-left:auto 顶到最右
+    // CSS reserves a right-hand action column for both own and other messages.
     head.appendChild(author)
     head.appendChild(time)
     head.appendChild(remove)
@@ -1293,6 +1308,17 @@
       item.appendChild(tag)
     }
 
+    if (videoCalls !== null && videoCalls.canInvite() && me !== null &&
+        member.id !== me.id && member.online === true && muted === null) {
+      var callButton = document.createElement('button')
+      callButton.type = 'button'
+      callButton.className = 'chat__button chat__member-call'
+      callButton.textContent = '视频'
+      callButton.setAttribute('aria-label', '呼叫 ' + member.username)
+      callButton.addEventListener('click', function () { videoCalls.invite(member) })
+      item.appendChild(callButton)
+    }
+
     // 管理员操作按钮靠右（margin-left:auto），所以「不显示」时名字和
     // 次要信息自然贴左——不能给它留空占位，那样普通用户看着会莫名多一段空白。
     if (me !== null && me.role === 'admin' && member.id !== me.id) {
@@ -1488,6 +1514,7 @@
     if (el.roomsToggle !== null) {
       el.roomsToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
     }
+    if (expanded) positionPanel(el.roomsPanel, el.roomsToggle)
   }
 
   function setMembersExpanded(expanded) {
@@ -1501,12 +1528,30 @@
       el.membersToggle.title = label
     }
     if (expanded) {
-      // 两个面板占的是同一块位置，一次只留一个开着
+      // 一次只留一张浮动卡片，避免相互遮挡。
       setRoomsExpanded(false)
+      positionPanel(el.membersPanel, el.membersToggle)
       // 展开时拉**全量**（不带 onlineOnly）：这是建 memberCache 的地方，
       // 之后的 presence 刷新才能只拉 scope=online 靠这份缓存补离线名单。
       loadMembers(false)
     }
+  }
+
+  function positionPanel(panel, toggle) {
+    if (panel === null || toggle === null || panel.hidden) return
+    var bounds = root.getBoundingClientRect()
+    var anchor = toggle.getBoundingClientRect()
+    var width = panel.getBoundingClientRect().width
+    var minimum = Math.max(0, 12 - bounds.left)
+    var maximum = Math.max(minimum, Math.min(bounds.width - width, window.innerWidth - 12 - bounds.left - width))
+    panel.style.left = Math.max(minimum, Math.min(anchor.left - bounds.left, maximum)) + 'px'
+    panel.style.top = anchor.bottom - bounds.top + 8 + 'px'
+    panel.style.setProperty('--chat-popover-space', Math.max(80, window.innerHeight - anchor.bottom - 20) + 'px')
+  }
+
+  function positionOpenPanels() {
+    positionPanel(el.membersPanel, el.membersToggle)
+    positionPanel(el.roomsPanel, el.roomsToggle)
   }
 
   function resetMembers() {
@@ -1656,11 +1701,12 @@
   // --- WebSocket ------------------------------------------------------------
 
   function closeSocket() {
+    if (abortVideoHandoff !== null) abortVideoHandoff()
     if (socket !== null) {
       var closing = socket
       socket = null
       try {
-        closing.close()
+        closing.close(1000)
       } catch (error) {
         /* 已经关了 */
       }
@@ -1674,11 +1720,16 @@
   function handleEvent(event) {
     if (event.type === 'ready') {
       setStatus(onlineStatus(event.online), 'online')
+      if (videoCalls !== null) videoCalls.ready(event)
       // 连上了是重连连上的话，补一次历史，把断线期间漏掉的消息找回来。
       if (pendingCatchUp) {
         pendingCatchUp = false
         catchUp()
       }
+      return
+    }
+    if (event.type === 'call' || event.type === 'webrtc') {
+      if (videoCalls !== null) videoCalls.handle(event)
       return
     }
     if (event.type === 'presence') {
@@ -1695,16 +1746,21 @@
     if (event.type === 'message') {
       var shouldStick = nearBottom()
       insertMessage(event.message)
+      if (videoCalls !== null && event.message.kind !== KIND_SYSTEM && !isMediaOnly(event.message.body)) {
+        videoCalls.addMessage(event.message)
+      }
       if (shouldStick) scrollToBottom()
       return
     }
     if (event.type === 'deleted') {
       var node = findByID(event.id)
       if (node !== null) node.remove()
+      if (videoCalls !== null) videoCalls.removeMessage(event.id)
     }
     if (event.type === 'purged') {
       // 管理员清空了房间，别人那边也得跟着清，否则他们手上还留着已删除的内容
       clearMessages()
+      if (videoCalls !== null) videoCalls.clearMessages()
       notice('房间内容已被清空')
     }
   }
@@ -1734,42 +1790,135 @@
     }, delay)
   }
 
+  function socketUrl() {
+    return API.replace(/^http/, 'ws') + '/api/ws?room=' + encodeURIComponent(ROOM)
+  }
+
+  function sendVideoFrame(frame, target) {
+    var ws = target || socket
+    if (ws === null || ws.readyState !== WebSocket.OPEN) return false
+    try {
+      ws.send(JSON.stringify(frame))
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  function reconnectVideoSocket() {
+    if (videoCalls !== null) videoCalls.disconnected()
+    closeSocket()
+    setStatus('连接已断开，正在重连…', 'connecting')
+    scheduleReconnect()
+  }
+
+  // 在新的已认证连接上恢复通话，然后才关闭原连接。
+  function renewVideoSocket(resume) {
+    var previous = socket
+    if (previous === null || abortVideoHandoff !== null) return
+    refreshSession().then(function (state) {
+      if (me === null || socket !== previous || !videoCalls.owns(resume.callId)) return
+      if (state === 'expired') return handleSignedOut()
+      if (state !== 'ok' || abortVideoHandoff !== null) return
+
+      var next
+      var readyEvent
+      try { next = new WebSocket(socketUrl()) } catch (error) { return }
+      var timeout = setTimeout(cancel, 7000)
+      abortVideoHandoff = cancel
+
+      function finish() {
+        clearTimeout(timeout)
+        next.removeEventListener('message', receive)
+        next.removeEventListener('close', cancel)
+        if (abortVideoHandoff === cancel) abortVideoHandoff = null
+      }
+
+      function cancel() {
+        finish()
+        try { next.close(1000) } catch (error) { /* 已断开 */ }
+      }
+
+      function receive(message) {
+        var event
+        try { event = JSON.parse(message.data) } catch (error) { return }
+        if (!event) return
+        if (event.type === 'ready') {
+          readyEvent = event
+          if (!event.videoCalls || !sendVideoFrame({ type: 'call', action: 'hello' }, next)) cancel()
+          return
+        }
+        if (event.type !== 'call') return
+        if (event.action === 'available') {
+          if (!videoCalls.owns(resume.callId) || !sendVideoFrame(resume, next)) cancel()
+        } else if (event.action === 'error') {
+          cancel()
+        } else if (event.action === 'resumed' && event.callId === resume.callId) {
+          if (!readyEvent || !videoCalls.owns(resume.callId)) {
+            sendVideoFrame({ type: 'call', action: 'hangup', callId: resume.callId }, next)
+            return cancel()
+          }
+          if (socket !== previous && socket !== null) return cancel()
+          finish()
+          if (reconnectTimer !== null) {
+            clearTimeout(reconnectTimer)
+            reconnectTimer = null
+          }
+          socket = next
+          reconnectDelay = 1000
+          wireSocket(next)
+          videoCalls.replaced(readyEvent, event)
+          setStatus(onlineStatus(readyEvent.online), 'online')
+          try { previous.close(1000) } catch (error) { /* 已断开 */ }
+          catchUp()
+        }
+      }
+
+      next.addEventListener('message', receive)
+      next.addEventListener('close', cancel)
+    })
+  }
+
   /** isReconnect：这次连接是不是断线/切后台之后重新连上的。是的话连上后要补历史。 */
   function connect(isReconnect) {
     if (me === null) return
     pendingCatchUp = isReconnect === true
     closeSocket()
 
-    var url = API.replace(/^http/, 'ws') + '/api/ws?room=' + encodeURIComponent(ROOM)
     setStatus('正在连接…', 'connecting')
 
     var ws
     try {
-      ws = new WebSocket(url)
+      ws = new WebSocket(socketUrl())
     } catch (error) {
       setStatus('无法建立连接', 'offline')
       scheduleReconnect()
       return
     }
     socket = ws
+    wireSocket(ws)
+  }
 
+  function wireSocket(ws) {
     ws.addEventListener('open', function () {
       reconnectDelay = 1000
     })
 
     ws.addEventListener('message', function (messageEvent) {
+      if (socket !== ws) return
       var event
       try {
         event = JSON.parse(messageEvent.data)
       } catch (error) {
         return
       }
-      handleEvent(event)
+      if (event !== null) handleEvent(event)
     })
 
     ws.addEventListener('close', function () {
       if (socket !== ws) return
       socket = null
+      if (videoCalls !== null) videoCalls.disconnected()
       setStatus('连接已断开，正在重连…', 'connecting')
       scheduleReconnect()
     })
@@ -1869,6 +2018,7 @@
    * 再弹「密码已修改」，看起来像出了故障 —— 其实什么都没坏。
    */
   function resetToAuthPanel() {
+    if (videoCalls !== null) videoCalls.leave()
     me = null
     closeSocket()
     clearMessages()
@@ -2117,6 +2267,23 @@
     })
   }
 
+  // 卡片内的离线名单和房间链接照常操作，点外部才收起。
+  document.addEventListener('pointerdown', function (event) {
+    var inside = [el.membersPanel, el.membersToggle, el.roomsPanel, el.roomsToggle].some(function (element) {
+      return element !== null && element.contains(event.target)
+    })
+    if (!inside) {
+      setMembersExpanded(false)
+      setRoomsExpanded(false)
+    }
+  })
+  window.addEventListener('resize', positionOpenPanels)
+  if (typeof ResizeObserver !== 'undefined') {
+    var panelAnchorObserver = new ResizeObserver(positionOpenPanels)
+    var bar = root.querySelector('.chat__bar')
+    if (bar !== null) panelAnchorObserver.observe(bar)
+  }
+
   // 「离线」那一行本身也是折叠按钮，展开方向朝下
   if (el.offlineToggle !== null) {
     el.offlineToggle.addEventListener('click', function () {
@@ -2129,6 +2296,7 @@
 
   if (el.logout !== null) {
     el.logout.addEventListener('click', function () {
+      if (videoCalls !== null) videoCalls.leave()
       el.logout.disabled = true
       fetch(API + '/auth/logout', { method: 'POST', credentials: 'include' })
         .catch(function () {
@@ -2309,16 +2477,115 @@
   }
 
   document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape' && el.lightbox !== null && !el.lightbox.hidden) closeLightbox()
+    if (event.key !== 'Escape') return
+    if (el.lightbox !== null && !el.lightbox.hidden) {
+      closeLightbox()
+      return
+    }
+    var toggle = el.membersPanel !== null && !el.membersPanel.hidden ? el.membersToggle :
+      el.roomsPanel !== null && !el.roomsPanel.hidden ? el.roomsToggle : null
+    if (toggle !== null) {
+      event.preventDefault()
+      setMembersExpanded(false)
+      setRoomsExpanded(false)
+      toggle.focus()
+    }
   })
 
   // 从后台切回前台时，如果连接已经掉了就立刻重连，不用等退避计时器
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible' || me === null) return
+    if (videoCalls !== null) videoCalls.check()
     // 从后台切回来也当作重连处理：休眠期间连接可能已经悄悄断了。
     if (socket === null && reconnectTimer === null) connect(true)
   })
 
+  window.addEventListener('pagehide', function () {
+    if (videoCalls !== null) {
+      videoCalls.leave()
+      closeSocket()
+    }
+  })
+
+  window.addEventListener('pageshow', function (event) {
+    if (event.persisted && me !== null && socket === null) connect(true)
+  })
+
+  function setupMessageResize() {
+    if (el.resize === null) return
+    var minimum = 160
+    var maximum = 1200
+    var pointer = null
+    var startY = 0
+    var startHeight = 0
+    var pinned = false
+
+    function atBottom() {
+      return el.messages.scrollHeight - el.messages.clientHeight - el.messages.scrollTop < 24
+    }
+
+    function updateValue() {
+      var height = Math.round(el.messages.getBoundingClientRect().height)
+      if (height <= 0) return
+      el.resize.setAttribute('aria-valuenow', String(height))
+      el.resize.setAttribute('aria-valuetext', height + ' 像素')
+    }
+
+    function changeHeight(height, keepBottom) {
+      el.messages.style.height = Math.max(minimum, Math.min(maximum, height)) + 'px'
+      if (keepBottom) el.messages.scrollTop = el.messages.scrollHeight
+      updateValue()
+    }
+
+    function resetHeight() {
+      var keepBottom = atBottom()
+      el.messages.style.removeProperty('height')
+      if (keepBottom) el.messages.scrollTop = el.messages.scrollHeight
+      updateValue()
+    }
+
+    el.resize.setAttribute('aria-valuemin', String(minimum))
+    el.resize.setAttribute('aria-valuemax', String(maximum))
+    el.resize.addEventListener('focus', updateValue)
+    el.resize.addEventListener('dblclick', resetHeight)
+    el.resize.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0 || pointer !== null) return
+      event.preventDefault()
+      pointer = event.pointerId
+      startY = event.clientY
+      startHeight = el.messages.getBoundingClientRect().height
+      pinned = atBottom()
+      el.resize.setPointerCapture(pointer)
+      el.resize.focus({ preventScroll: true })
+    })
+    el.resize.addEventListener('pointermove', function (event) {
+      if (pointer !== event.pointerId) return
+      changeHeight(startHeight + event.clientY - startY, pinned)
+    })
+    function endDrag(event) {
+      if (pointer !== event.pointerId) return
+      pointer = null
+      if (el.resize.hasPointerCapture(event.pointerId)) el.resize.releasePointerCapture(event.pointerId)
+    }
+    el.resize.addEventListener('pointerup', endDrag)
+    el.resize.addEventListener('pointercancel', endDrag)
+    el.resize.addEventListener('lostpointercapture', function () { pointer = null })
+    el.resize.addEventListener('keydown', function (event) {
+      if (event.key === 'Home') {
+        event.preventDefault()
+        resetHeight()
+      } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+        event.preventDefault()
+        var step = event.key === 'ArrowDown' ? 16 : -16
+        changeHeight(el.messages.getBoundingClientRect().height + step, atBottom())
+      }
+    })
+    if ('ResizeObserver' in window) {
+      new ResizeObserver(updateValue).observe(el.messages)
+    }
+  }
+
+  setupMessageResize()
   setMode('login')
   boot()
 })()

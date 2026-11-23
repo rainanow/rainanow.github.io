@@ -392,17 +392,11 @@ try {
   /*
    * --- 消息区 / 输入框的面板色 ---
    *
-   * 需求：浅色下消息区和输入框都是 #f5f5f5；**深色下不做区分**，和页面背景同色。
-   *
-   * 断言的重点不是「等于 #f5f5f5」，而是「必须走变量」：
-   * 谁要是为了「就想要这个灰」把 background 写成硬编码 #f5f5f5，
-   * 浅色下一点异常都没有，深色下是浅底浅字、整块看不见 —— 属于最难发现的那类。
-   * 深色那条覆盖同理：它必须存在，否则深色会继承浅色那块浅灰。
+   * 消息区和输入框采用博客卡片的底色；页面背景、气泡保留各自的层次。
+   * 明暗两种主题都通过主题变量配色，避免出现浅底浅字。
    */
   section('消息区与输入框的面板色')
-  // 取**第一处** `<selector> {…}`。深色那条 `:root[data-theme="dark"] .chat {` 里也含
-  // `.chat {` 这个子串，但它在文件更后面，所以 `.chat` 取到的仍是浅色块；
-  // 万一有人把两条调换了顺序，下面的断言会**红**而不是静默放过。
+  // 读取每个选择器的基础规则，颜色值的实际显示另外通过浏览器检查。
   const cssRule = (selector) => {
     const start = chatCss.indexOf(`${selector} {`)
     return start === -1 ? '' : chatCss.slice(start, chatCss.indexOf('}', start))
@@ -413,29 +407,25 @@ try {
     /background:\s*var\(--chat-panel/.test(cssRule('.chat__composer textarea')),
   )
   check(
-    '浅色面板色走变量（--chat-panel 基于 --code-bg），没有写死十六进制',
-    /--chat-panel:\s*var\(--code-bg/.test(cssRule('.chat')),
+    '聊天面板采用博客卡片的主题色（--entry）',
+    /--chat-panel:\s*var\(--entry/.test(cssRule('.chat')),
   )
   check(
-    '深色主题把面板色覆盖成 transparent（和背景同色、不做区分）',
-    /\[data-theme="dark"\] \.chat \{[^}]*--chat-panel:\s*transparent/.test(chatCss),
+    '深色主题保留卡片层次，不再把面板设成透明',
+    !/--chat-panel:\s*transparent/.test(chatCss),
   )
 
   /*
-   * 气泡：浅色下是纯白，深色下仍是「比页面底色亮一档」的浮层色。
-   *
-   * 断言的是「这条规则还在、而且走变量」，不是某个具体颜色 ——
-   * 写死 #fff 就等于只对浅色负责：深色主题的正文是浅色的，白气泡会让文字看不见。
-   * 所以两条一起看：变量定义在 .chat 里，浅色那一份用 `:not([data-theme="dark"])`
-   * 覆盖（深色刻意不覆盖，跟 --chat-panel 正好相反）。
+   * 本人和其他成员的气泡使用不同深浅，随主题一起变化。
    */
   check(
     '气泡底色走自己的变量（--chat-bubble，不写死十六进制）',
     /--chat-bubble:\s*var\(--chat-surface\)/.test(cssRule('.chat')),
   )
   check(
-    '浅色主题把气泡覆盖成纯白（var(--theme)），深色不覆盖',
-    /\[data-theme="dark"\]\) \.chat \{[^}]*--chat-bubble:\s*var\(--theme/.test(chatCss),
+    '本人气泡使用更深一档的底色，浅色模式不再统一覆盖成白色',
+    /--chat-bubble-mine:\s*var\(--chat-surface-strong\)/.test(cssRule('.chat')) &&
+      !/--chat-bubble(?:-mine)?:\s*var\(--theme/.test(chatCss),
   )
 
   // --- 造一条「别人的消息」 ---
@@ -1132,7 +1122,7 @@ try {
       '源码里找不到 ok/expired 的判定',
     )
 
-    // ② 三个调用方都区分 retry：不该一看到失败就登出。
+    // ② HTTP、重连、通话续期和初始化都区分 retry：不该一看到失败就登出。
     //    用「从 refreshSession 调用处往后 600 字符」切段，而不是靠正则匹配函数体 ——
     //    正则要么抓不全（`\n  }` 会在嵌套的 then 里提前结束），要么抓太宽。
     const slices = []
@@ -1145,7 +1135,7 @@ try {
       if (!isDefinition) slices.push(src.slice(at, at + 600))
       from = at + 1
     }
-    check('源码里有 3 处调用 refreshSession', slices.length === 3, `实际 ${slices.length} 处`)
+    check('四处登录续期入口都纳入检查', slices.length === 4, `实际 ${slices.length} 处`)
 
     for (const [i, segment] of slices.entries()) {
       // 每处都该在 state 上分支，而不是 `if (state === 'ok')` 就完事

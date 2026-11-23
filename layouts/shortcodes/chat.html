@@ -47,7 +47,7 @@
 */ -}}
 {{- $rooms := sort (where site.RegularPages "Params.room" "!=" nil) "Params.room" -}}
 {{- $mediaBase := site.Params.chat.mediaBase | default "" -}}
-{{- $script := resources.Get "js/chat.js" | resources.Minify | resources.Fingerprint -}}
+{{- $script := resources.Concat "js/chat-bundle.js" (slice (resources.Get "js/chat-call-layout.js") (resources.Get "js/chat-call.js") (resources.Get "js/chat.js")) | resources.Minify | resources.Fingerprint -}}
 <div class="chat" id="chat-app" data-api="{{ $apiBase }}" data-room="{{ $room }}"
      data-media-base="{{ $mediaBase }}">
 
@@ -131,10 +131,9 @@
   <p class="chat__notice" data-chat-notice hidden></p>
 
   {{- /*
-    成员名单。展开时出现在这个位置：它在登录/注册框和聊天框**之前**，
-    所以一拉开，下面两块会被顶下去，看起来就是从那个箭头下面长出来的一横条。
+    成员名单：定位在按钮下方，浮在聊天框上，不挤动下方内容。
   */ -}}
-  <div class="chat__members-panel" id="chat-members-panel" data-chat-members-panel hidden>
+  <div class="chat__members-panel" id="chat-members-panel" data-chat-members-panel role="region" aria-label="成员列表" hidden>
     <p class="chat__members-status" data-chat-members-status>正在加载…</p>
 
     <div class="chat__members-group">
@@ -153,8 +152,8 @@
     </div>
   </div>
 
-  {{- /* 房间菜单：和成员面板同一位置（状态栏下方、登录框上方），两个面板互斥展开 */ -}}
-  <div class="chat__rooms-panel" id="chat-rooms-panel" data-chat-rooms-panel hidden>
+  {{- /* 房间菜单：浮在对应按钮下方，和成员卡片互斥展开 */ -}}
+  <div class="chat__rooms-panel" id="chat-rooms-panel" data-chat-rooms-panel role="region" aria-label="房间列表" hidden>
     <p class="chat__rooms-title">共 {{ len $rooms }} 个房间</p>
     <ul class="chat__rooms-list" data-chat-rooms-list>
       {{- range $rooms }}
@@ -235,12 +234,45 @@
     <p class="chat__hint" data-chat-password-hint hidden></p>
   </section>
 
-  {{- /* 已登录：消息列表 + 输入框 */ -}}
+  {{- /* 已登录：通话、消息列表和输入框 */ -}}
   <section class="chat__room" data-chat-room hidden>
+    <section class="chat__call" data-chat-call aria-label="视频通话" hidden>
+      <div class="chat__call-heading">
+        <strong data-call-peer></strong>
+        <span data-call-status role="status"></span>
+      </div>
+      <div class="chat__call-stage" data-call-stage hidden>
+        <video class="chat__call-feed" data-call-remote autoplay playsinline disablepictureinpicture disableremoteplayback
+               aria-label="对方视频" hidden></video>
+        <video class="chat__call-feed" data-call-local autoplay muted playsinline disablepictureinpicture disableremoteplayback
+               aria-label="本机预览" hidden></video>
+        <button class="chat__call-mini" type="button" data-call-mini
+                aria-label="拖动小窗，点击互换画面" title="拖动小窗，点击互换画面" hidden></button>
+        <div class="chat__call-overlay" data-call-overlay aria-hidden="true"></div>
+      </div>
+      <p class="chat__call-player-hint" data-call-player-hint role="status" hidden>在网页通话界面可以拖动小窗、互换双画面。</p>
+      <div class="chat__call-controls">
+        <button class="chat__button chat__button--primary" type="button" data-call-accept hidden>接听</button>
+        <button class="chat__button" type="button" data-call-reject hidden>拒绝</button>
+        <button class="chat__button" type="button" data-call-play hidden>播放通话</button>
+        <button class="chat__button" type="button" data-call-mic hidden>静音</button>
+        <button class="chat__button" type="button" data-call-camera hidden>关闭摄像头</button>
+        <button class="chat__button" type="button" data-call-switch hidden>切换摄像头</button>
+        <button class="chat__button" type="button" data-call-swap hidden>互换画面</button>
+        <button class="chat__button" type="button" data-call-expand hidden>放大</button>
+        <button class="chat__button" type="button" data-call-overlay-toggle aria-pressed="true" hidden>浮动消息</button>
+        <button class="chat__button chat__call-hangup" type="button" data-call-hangup hidden>挂断</button>
+      </div>
+    </section>
+
     <div class="chat__messages" data-chat-messages>
       <button type="button" class="chat__button chat__more" data-chat-more hidden>加载更早的消息</button>
       <p class="chat__empty" data-chat-empty>还没有人说话，来开场吧。</p>
     </div>
+
+    <div class="chat__resize" data-chat-resize role="separator" tabindex="0"
+         aria-label="调整聊天区高度" aria-orientation="horizontal"
+         title="拖动调整聊天区高度；双击恢复默认，也可用上下方向键调整"></div>
 
       <form class="chat__composer" data-chat-composer>
         {{- /* 「+」放在输入框内部左下角，所以 textarea 和它包在一个定位盒子里 */ -}}

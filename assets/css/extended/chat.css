@@ -1,115 +1,26 @@
-/*
- * 聊天室样式。
- *
- * 放在 assets/css/extended/ 下是 PaperMod 的既定扩展点：
- * 主题的 head.html 会 `resources.Match "css/extended/*.css"` 把所有文件
- * 打进同一张 stylesheet，自动享受压缩 + 指纹 + 长缓存，不用额外的 <link>。
- *
- * 颜色一律取主题的 CSS 变量（--theme / --entry / --primary / --secondary / --border），
- * 这样明暗模式切换是免费的。只有极少数「明暗方向必须相反」的地方（气泡、消息区面板）
- * 才用 `:root:not([data-theme="dark"])` / `:root[data-theme="dark"]` 覆盖**单个变量**，
- * 而不是复制一整套规则。
- * 每个变量都给了 fallback，避免哪天主题改名变成一堆透明块。
- */
+/* Chat uses the same page and card surfaces as the blog's article list. */
+body:has(.chat-page) {
+  background: var(--code-bg, #f5f5f5);
+}
+
+:root[data-theme="dark"] body:has(.chat-page) {
+  background: var(--theme, #1d1e20);
+}
 
 .chat {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  margin: 1.25rem 0 2rem;
+  margin: 0 0 2rem;
 
-  /*
-   * ── 浮层色（登录框、房间列表的 hover / 当前房间）──
-   *
-   * ## 为什么不能直接用 --entry / --theme
-   *
-   * 浅色主题里 `--entry` 和 `--theme` 是**同一个值**（都是纯白），浮层落在
-   * 正文的白色背景上完全看不出边界。深色那边 `--entry` 比 `--theme` 略亮，
-   * 看得见但不稳。也就是说：这两个变量**都不是**「比背景深一档的浮层色」。
-   *
-   * ## 为什么用 color-mix 而不是写死两个灰
-   *
-   * 写死 `#ededed` 就得再为深色写一份，而且主题配色一改就脱节。
-   * `color-mix(in srgb, var(--theme) X%, var(--primary) Y%)` 一句在两边都成立，
-   * 而且方向是自动对的：
-   *   浅色 = 白 + 8% 深灰 → 淡灰（比正文背景**深**一点）
-   *   深色 = 深灰 + 8% 浅灰 → 比页面底色**亮**一点
-   * 方向相反，效果一致：都是从背景里浮出来一层。
-   *
-   * 万一浏览器不支持 color-mix，紧挨着的前一句 `var(--code-bg)` 兜住 ——
-   * 那是主题里现成的「浮层色」（浅色 #f5f5f5 / 深色 rgb(55,56,62)），明暗都合适。
-   *
-   * ⚠️ 这一对**不要**拿去给气泡用（气泡见下面的 --chat-bubble）。
-   * 它现在只剩「落在白色正文页上」的那几个用途，所以**必须比白色更暗**。
-   */
+  --chat-panel: var(--entry, #fff);
   --chat-surface: var(--code-bg, #f5f5f5);
-  --chat-surface: color-mix(in srgb, var(--theme) 92%, var(--primary) 8%);
-  /* 再深一档：登录框、房间列表的「当前房间」——都是落在白色正文页上的浮层 */
-  --chat-surface-strong: var(--code-bg, #f5f5f5);
-  --chat-surface-strong: color-mix(in srgb, var(--theme) 85%, var(--primary) 15%);
-
-  /*
-   * ── 气泡自己的底色 ──
-   *
-   * 单独占一对变量，而不是直接改上面那对。原因：`--chat-surface` /
-   * `--chat-surface-strong` 还被房间列表的 hover 与选中态用来做「反馈」
-   * （见 .chat__room-link），那两个是落在**白色页面背景**上的 ——
-   * 跟着气泡一起改，就等于把「鼠标划过去没有任何反馈、当前房间也看不出来」
-   * 这个已经修过的 bug 原样放回去。
-   *
-   * 浅色主题下这对变量会被覆盖成纯白（见紧跟的 :root:not([data-theme="dark"])），
-   * 深色主题下就用上面那两档浮层色。
-   */
+  --chat-surface: color-mix(in srgb, var(--entry) 92%, var(--primary) 8%);
+  --chat-surface-strong: var(--border, #eee);
+  --chat-surface-strong: color-mix(in srgb, var(--entry) 85%, var(--primary) 15%);
   --chat-bubble: var(--chat-surface);
   --chat-bubble-mine: var(--chat-surface-strong);
-
-  /*
-   * ── 消息区 / 输入框的「面板色」──
-   *
-   * 浅色主题下就是 #f5f5f5 —— 它**正好等于** --code-bg（rgb(245, 245, 245)），
-   * 所以走变量，不写死十六进制。
-   *
-   * 深色主题下这个变量被覆盖成 `transparent`（见紧跟着的那条
-   * `:root[data-theme="dark"] .chat`）：消息区和输入框**都不做区分**，
-   * 退回和页面背景同色。
-   *
-   * ⚠️ 无论如何都不能在这儿写死 #f5f5f5。颜色是明暗共用同一份 CSS 的，
-   * 写死就等于只对浅色负责 —— 深色主题的文字是浅色的，一块浅底会让正文彻底看不见。
-   */
-  --chat-panel: var(--code-bg, #f5f5f5);
-}
-
-/*
- * 浅色主题：气泡改纯白（`--theme` 在浅色下就是纯白），从 #f5f5f5 的面板里浮起来。
- *
- * 方向和以前相反：以前是「比页面背景更深一档」，因为那时正文背景是纯白；
- * 浅色的背景现在换成灰面板了，气泡再往下压只会和面板糊在一起
- * （旧的 #ececec 与面板 #f5f5f5 只差 9 级，肉眼几乎看不出边界）。
- *
- * 深色**不覆盖**：深色下 `--theme` 就是页面底色，纯白气泡配浅色正文等于看不见。
- *
- * 用 `:root:not([data-theme="dark"])` 而不是再写一份 `light`：属性值只可能是
- * light / dark / auto，`auto` 会被 head.html 的内联脚本在首屏之前解析掉，
- * 所以「不是 dark」等价于「浅色」。这样以后主题加枚举值也不会漏。
- */
-:root:not([data-theme="dark"]) .chat {
-  --chat-bubble: var(--theme, #fff);
-  --chat-bubble-mine: var(--theme, #fff);
-}
-
-/*
- * 深色主题：消息区和输入框都不做区分，和改动之前一样退回页面背景色。
- *
- * 用 `transparent` 而不是 `var(--theme)`：--theme 此刻确实就是 body 的背景色，
- * 但写 transparent 意思更准确（「别画底色」），以后 --theme 被改也不受影响。
- * 输入框在深色下只靠那圈 1px 边框表明「这里是能打字的」—— 这一点本来就是这样。
- *
- * 选择器必须是 `:root[data-theme="dark"]`：PaperMod 的 data-theme 在构建期只写
- * light / dark / auto，auto 再由 head.html 里的内联脚本用 prefers-color-scheme
- * 解析成 light 或 dark 写到同一个属性上 —— 所以属性才是唯一的可靠依据。
- */
-:root[data-theme="dark"] .chat {
-  --chat-panel: transparent;
 }
 
 /*
@@ -123,20 +34,11 @@
   display: none !important;
 }
 
-/*
- * 这一页本身就叫「聊天室」，正文顶上再挂一个大标题是重复的。
- *
- * 用 :has() 把范围锁死在「正文里含聊天室」的那一页 —— 主题的 single.html
- * 没有隐藏标题的开关，而直接改主题模板会波及全部文章页。
- */
-.post-single:has(#chat-app) .post-title {
-  display: none;
-}
-
 /* --- 顶栏：连接状态 + 当前用户 --- */
 
 .chat__bar {
   display: flex;
+  flex: none;
   align-items: center;
   gap: 0.75rem;
   flex-wrap: wrap;
@@ -183,6 +85,204 @@
   margin-left: auto;
 }
 
+.chat__call {
+  display: grid;
+  gap: 0.7rem;
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  background: var(--chat-panel);
+}
+
+.chat__call[hidden],
+.chat__call [hidden] {
+  display: none;
+}
+
+.chat__call-heading,
+.chat__call-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.chat__call-heading {
+  overflow-wrap: anywhere;
+}
+
+.chat__call-heading [role="status"] {
+  color: var(--secondary);
+  font-size: 0.87rem;
+}
+
+.chat__call-stage {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 55vh;
+  border-radius: var(--radius, 8px);
+  background: #15171b;
+}
+
+.chat__call-feed {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.chat__call-feed.is-small,
+.chat__call-mini {
+  position: absolute;
+  inset: var(--call-mini-y, 0) auto auto var(--call-mini-x, 0);
+  width: var(--call-mini-width, 0);
+  height: var(--call-mini-height, 0);
+  border-radius: 0.4rem;
+}
+
+.chat__call-feed.is-small {
+  z-index: 2;
+  border: 1px solid #ffffff70;
+  background: #202226;
+}
+
+.chat__call-mini {
+  z-index: 3;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.chat__call-mini.is-dragging {
+  cursor: grabbing;
+}
+
+.chat__call-mini:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: -3px;
+}
+
+.chat__call-overlay {
+  position: absolute;
+  z-index: 1;
+  inset: auto auto 0.5rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.25rem;
+  max-width: var(--call-overlay-width, 70%);
+  max-height: 45%;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.chat__call-stage[data-overlay-side="right"] .chat__call-overlay {
+  inset: auto 0.5rem 0.5rem auto;
+}
+
+.chat__call-overlay > p {
+  margin: 0;
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.3rem;
+  color: #fff;
+  background: #13161ace;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  flex: none;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.chat__call-player-hint {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 0.82rem;
+}
+
+.chat__call-controls [aria-pressed="true"] {
+  background: var(--chat-surface-strong);
+}
+
+.chat__room.is-call-expanded {
+  position: fixed;
+  z-index: 80;
+  inset: var(--call-viewport-top, 0) 0 auto;
+  height: var(--call-viewport-height, 100vh);
+  padding: max(0.5rem, env(safe-area-inset-top)) max(0.5rem, env(safe-area-inset-right))
+           max(0.5rem, env(safe-area-inset-bottom)) max(0.5rem, env(safe-area-inset-left));
+  background: var(--theme);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+@supports (height: 100dvh) {
+  .chat__room.is-call-expanded {
+    height: var(--call-viewport-height, 100dvh);
+  }
+}
+
+body:has(.chat__room.is-call-expanded) {
+  overflow: hidden;
+}
+
+.chat:has(.chat__room.is-call-expanded) > .chat__notice {
+  position: fixed;
+  z-index: 81;
+  inset: max(0.5rem, env(safe-area-inset-top)) 0.5rem auto;
+}
+
+.chat__room.is-call-expanded > .chat__call {
+  display: flex;
+  flex-direction: column;
+  flex: 1 0 auto;
+  min-height: 11rem;
+  padding: 0.4rem;
+  gap: 0.42rem;
+}
+
+.chat__room.is-call-expanded .chat__call-stage {
+  flex: 1 0 6rem;
+  aspect-ratio: auto;
+  max-height: none;
+}
+
+.chat__room.is-call-expanded > .chat__messages,
+.chat__room.is-call-expanded > .chat__resize {
+  display: none;
+}
+
+.chat__room.is-call-expanded .chat__call-controls .chat__button {
+  min-height: 2.4rem;
+  padding: 0.3rem 0.65rem;
+}
+
+.chat__button.chat__member-call {
+  padding: 0.15rem 0.42rem;
+  font-size: 0.76rem;
+}
+
+.chat__button.chat__call-hangup {
+  color: #b42332;
+  border-color: currentColor;
+}
+
+:root[data-theme="dark"] .chat__button.chat__call-hangup {
+  color: #ff929b;
+}
+
 /* --- 提示条 / 报错 --- */
 
 .chat__notice {
@@ -207,6 +307,8 @@
 /* --- 登录 / 注册面板 --- */
 
 .chat__auth {
+  min-height: 0;
+  overflow-y: auto;
   border: 1px solid var(--border, #e5e7eb);
   border-radius: var(--radius, 6px);
   background: var(--entry, #f9fafb);
@@ -331,19 +433,50 @@
 
 .chat__messages {
   height: min(58vh, 34rem);
+  min-height: 160px;
   overflow-y: auto;
   overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
-  /* 消息之间的距离再收一半（0.6 → 0.3 → 0.15rem），聊天记录看着更连贯 */
-  gap: 0.15rem;
+  gap: 0.6rem;
   /* 一整块面板：底色 + 圆角，把「消息区」和博客正文明确分开。
      原先是「无底色 + 上下两条淡线」—— 那两条线是**没有底色时**用来标出
      可滚动范围的替代品；现在有底色了，它们就成了多余的第二道边界，一起去掉。
      左右内边距跟着从 0.25rem 加到 0.75rem：有底色之后气泡再贴着边就难看了。 */
   padding: 0.6rem 0.75rem;
   border-radius: var(--radius, 6px);
-  background: var(--chat-panel, #f5f5f5);
+  background: var(--chat-panel, #fff);
+}
+
+/* A visible drag target also supports arrow keys and double-click/Home to reset. */
+.chat__resize {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+  margin-block: -0.3rem;
+  border-radius: 4px;
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.chat__resize::before {
+  content: "";
+  width: 3rem;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--tertiary, #ddd);
+}
+
+.chat__resize:hover::before,
+.chat__resize:focus-visible::before {
+  background: var(--secondary, #777);
+}
+
+.chat__resize:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 /*
@@ -376,35 +509,45 @@
  * 排版沿用博客正文：同样的字体、行高、文字颜色，明暗模式白拿。
  */
 .chat__message {
+  position: relative;
   display: flex;
   flex-direction: column;
-  /* 作者行和气泡之间也收紧（原来 0.2rem） */
+  flex: 0 0 auto;
+  align-self: flex-start;
+  width: 100%;
   gap: 0.1rem;
   max-width: 100%;
+  padding-inline-end: 1.25em;
+}
+
+.chat__message.is-mine {
+  align-self: flex-end;
+  align-items: flex-end;
 }
 
 .chat__message-head {
   display: flex;
+  width: 100%;
   align-items: baseline;
   gap: 0.5rem;
-  /* 撑满整行，下面的撤回按钮才能靠 margin-left:auto 落到最右边 */
-  width: 100%;
+  flex-wrap: wrap;
   font-size: 0.75rem;
   color: var(--secondary, #6b7280);
+}
+
+.chat__message.is-mine .chat__message-head {
+  flex-direction: row-reverse;
+  justify-content: flex-start;
 }
 
 /* 用户名统一加粗，不再套尖括号 —— 就是个普通的昵称样式 */
 .chat__author {
   font-weight: 600;
   color: var(--secondary, #6b7280);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
-/*
- * 自己发的：用户名用正文主色，别人的淡一档。
- * ⚠️ 浅色主题下自己的气泡和别人的都是纯白，所以「我说的」现在**只靠这一条**区分，
- * 别顺手删。
- */
+/* Own messages use the stronger bubble shade and primary author text. */
 .chat__message.is-mine .chat__author {
   color: var(--primary, #111827);
 }
@@ -412,27 +555,38 @@
 .chat__time {
   color: var(--secondary, #6b7280);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /*
- * 撤回按钮：每条消息都有、始终可见，位置在那一行最右。
+ * 每条消息预留右侧一格给撤回按钮；本人气泡和名字一起向左让出这一格。
  * 没有权限的置成 disabled（灰掉），后端还有一道 403 兜底。
  */
 .chat__delete {
-  margin-left: auto;
+  position: absolute;
+  inset-inline-end: 0;
+  top: 0;
+  flex: 0 0 auto;
+  min-width: 1.2rem;
   appearance: none;
   border: none;
   background: none;
   color: var(--secondary, #6b7280);
   cursor: pointer;
-  font-size: 0.95rem;
-  line-height: 1;
-  padding: 0 0.2rem;
+  font: inherit;
+  line-height: 1.4;
+  padding: 0.1rem 0.2rem;
+  border-radius: 3px;
   transition: color 0.12s ease;
 }
 
 .chat__delete:hover:not(:disabled) {
   color: #ef4444;
+}
+
+.chat__delete:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .chat__delete:disabled {
@@ -450,7 +604,7 @@
   margin: 0;
   padding: 0.4rem 0.65rem;
   border-radius: var(--radius, 6px);
-  /* 气泡色（浅色 = 纯白，深色 = 比页面底色亮一档的浮层色）—— 见 .chat 里那一段 */
+  /* Theme-derived shades keep both light and dark modes readable. */
   background: var(--chat-bubble, #f2f2f2);
   /* 字体不指定，直接继承博客正文——这是「和博客一致」最省事也最准的做法 */
   font-size: 0.92rem;
@@ -460,13 +614,9 @@
   color: var(--content, #374151);
 }
 
-/*
- * 自己发的换底色区分。
- * 注意：浅色主题下这一条和上面那条**取到的是同一个值**（都是纯白）——
- * 那时「我说的」靠 .chat__author 的主色来区分（见上面那一条）。
- * 深色下两者才不同（自己的更亮一档）。
- */
+/* Own bubbles align right and use a stronger shade than other members. */
 .chat__message.is-mine .chat__body {
+  align-self: flex-end;
   background: var(--chat-bubble-mine, #e2e2e2);
 }
 
@@ -483,20 +633,9 @@
 
 /* --- 系统提示：谁进了房间 / 谁撤回了一条 --- */
 
-/*
- * 一条**居中的窄条**，和普通消息在视觉上完全分开。
- *
- * 设计要求来自「不影响对话的连贯性」，拆开就是三条：
- *   - 不是气泡：气泡意味着「有人说了什么」，而它只是一行注记。
- *     套上作者行 + 撤回按钮之后，视觉上会和真实发言混在一起。
- *   - 居中 + 宽度贴合内容（`align-self: center` 让它不再撑满一行）：
- *     读者的视线可以整条跳过去，不会被右侧的空白拽住。
- *   - 高度压到最小：小字、无内边距的上下留白、圆角胶囊。
- *     一串人进出之后，真正在聊的内容仍然连成一片 —— 这是这一条的全部意义。
- *
- * 底色用最浅的那一档（--chat-surface），因为它比自己的气泡还次要。
- */
+/* System events stay centered as plain text, without a bubble background. */
 .chat__message--system {
+  width: fit-content;
   /* 普通消息是「作者行 + 气泡」两行，这里改成一行 */
   flex-direction: row;
   align-items: center;
@@ -507,9 +646,8 @@
   max-width: min(100%, 30rem);
   /* 上下各留一点：完全贴住会把相邻两条消息粘在一起，反而不好读 */
   margin: 0.15rem 0;
-  padding: 0.05rem 0.6rem;
-  border-radius: 999px;
-  background: var(--chat-surface, #f2f2f2);
+  padding: 0;
+  background: transparent;
   color: var(--secondary, #6b7280);
   font-size: 0.75rem;
   line-height: 1.6;
@@ -677,19 +815,21 @@
   cursor: default;
 }
 
-/*
- * 展开后是一横条，位置在登录/注册框和聊天框之上（DOM 顺序决定），
- * 把下面两块顶下去。max-height + 滚动兜住人多的情况。
- */
+/* 按钮下方的浮动卡片，不占聊天区的布局空间；长名单在卡片内滚动。 */
 .chat__members-panel,
 .chat__rooms-panel {
-  max-height: 14rem;
+  position: absolute;
+  z-index: 20;
+  width: min(18rem, 100%, calc(100vw - 24px));
+  min-height: 0;
+  max-height: min(18rem, 50dvh, var(--chat-popover-space, 50dvh));
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0.6rem 0.75rem;
   border: 1px solid var(--border, #eee);
   border-radius: var(--radius, 6px);
   background: var(--entry, #f9fafb);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
   font-size: 0.85rem;
 }
 
@@ -925,7 +1065,8 @@
 
 .chat__composer {
   display: flex;
-  align-items: flex-end;
+  flex: none;
+  align-items: flex-start;
   gap: 0.5rem;
 }
 
@@ -937,21 +1078,24 @@
 }
 
 .chat__composer textarea {
+  display: block;
   width: 100%;
   font: inherit;
   font-size: 0.9rem;
   line-height: 1.5;
   resize: vertical;
   min-height: 2.6rem;
-  max-height: 9rem;
+  max-height: min(9rem, 25dvh);
   color: var(--primary, #111827);
-  /* 和消息区同一块面板色（浅色 = #f5f5f5）。两边同色之后，输入框靠这圈 border
-     跟人区分边界 —— 它和消息区之间还隔着 .chat__room 的 gap，不会糊成一整块。 */
-  background: var(--chat-panel, #f5f5f5);
+  background: var(--chat-panel, #fff);
   border: 1px solid var(--border, #e5e7eb);
   border-radius: var(--radius, 6px);
   /* 左边留一截给「+」，文字整体避开它 */
   padding: 0.5rem 0.65rem 0.5rem 1.9rem;
+}
+
+.chat__room.is-call-expanded .chat__composer textarea {
+  font-size: max(1rem, 16px);
 }
 
 .chat__composer textarea:focus-visible {
