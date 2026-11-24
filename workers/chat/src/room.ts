@@ -235,8 +235,9 @@ export class ChatRoom implements DurableObject {
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     try {
-      // 客户端发起的关闭要由服务端回一个 close 才算完成握手；不回的话连接可能悬着。
-      ws.close(code, reason)
+      // 客户端未发送关闭码时，运行时报告的 1005 不能写回关闭帧。
+      if (code >= 1000 && code < 5000 && ![1004, 1005, 1006, 1015].includes(code)) ws.close(code, reason)
+      else ws.close()
     } catch {
       // 已经关了，无所谓。
     }

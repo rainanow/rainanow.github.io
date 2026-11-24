@@ -105,7 +105,8 @@ test('设备换登录、刷新、跨房间注销及计数', { timeout: 60000 }, 
   const extraTab = await open(t, replacement, rooms[0])
   assert.equal(extraTab.ready.online, 2)
   extraTab.socket.close()
-  await extraTab.closed
+  await waitFor(() => extraTab.socket.readyState === WebSocket.CLOSED)
+  assert.ok([1000, 1005].includes(await extraTab.closed))
 
   const refresh = await status('/auth/refresh', 200, { method: 'POST', cookie: replacement })
   await status('/api/me', 200, { cookie: cookies(refresh) })
