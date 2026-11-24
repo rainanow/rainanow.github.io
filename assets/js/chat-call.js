@@ -31,13 +31,14 @@
   const defaultBitrateMbps = 2
   const foregroundDelay = 900
   const cameraRetryDelay = 400
+  const displayChannelLabel = 'chat-call-display-v1'
+  const cameraNames = { user: '前摄', environment: '后摄' }
 
-  function cameraConstraints(current) {
-    const height = resolutions.get(current.quality.resolution)
-    const ratio = aspectRatios.get(current.quality.ratio)
+  function qualityConstraints(quality) {
+    const height = resolutions.get(quality.resolution)
+    const ratio = aspectRatios.get(quality.ratio)
     // Request even landscape dimensions. The camera can report them rotated.
     const constraints = {
-      facingMode: { ideal: current.facing },
       width: { ideal: Math.round(height * ratio / 2) * 2 },
       height: { ideal: height },
       aspectRatio: { ideal: ratio },
@@ -46,6 +47,54 @@
       constraints.resizeMode = { ideal: 'crop-and-scale' }
     }
     return constraints
+  }
+
+  function cameraConstraints(quality, selection, limits) {
+    const constraints = qualityConstraints(quality)
+    if (selection?.deviceId) constraints.deviceId = { exact: selection.deviceId }
+    else if (selection?.facing) constraints.facingMode = { exact: selection.facing }
+    else constraints.facingMode = { ideal: 'user' }
+
+    if (limits) {
+      const width = Math.max(limits.width, limits.height)
+      const height = Math.min(limits.width, limits.height)
+      constraints.width = { ideal: Math.min(width, constraints.width.ideal), max: width }
+      constraints.height = { ideal: Math.min(height, constraints.height.ideal), max: height }
+      if (limits.frameRate > 0) constraints.frameRate = { max: limits.frameRate }
+    }
+    return constraints
+  }
+
+  function cameraFacings(source) {
+    try { return source?.getCapabilities?.()?.facingMode ?? [] } catch { return [] }
+  }
+
+  function cameraFacing(value) {
+    return value === 'user' || value === 'environment' ? value : undefined
+  }
+
+  function describeCamera(track, selection) {
+    const settings = track?.getSettings?.() ?? {}
+    const facings = cameraFacings(track)
+    const reported = settings.facingMode ?? (facings.length === 1 ? facings[0] : undefined)
+    const supported = navigator.mediaDevices.getSupportedConstraints?.()
+    const deviceId = settings.deviceId || selection?.deviceId
+    if (selection?.deviceId && settings.deviceId && settings.deviceId !== selection.deviceId) {
+      throw new DOMException('The selected camera was not opened', 'NotFoundError')
+    }
+    const exactSelection = selection?.deviceId
+      ? settings.deviceId === selection.deviceId || supported?.deviceId
+      : supported?.facingMode
+    const facing = cameraFacing(reported ?? (exactSelection ? selection?.facing : undefined))
+    if (selection?.facing && facing !== selection.facing) {
+      throw new DOMException('The selected camera direction was not available', 'NotFoundError')
+    }
+    return { deviceId, facing, settings }
+  }
+
+  function missingCamera(error) {
+    return error?.name === 'NotFoundError' || error?.name === 'OverconstrainedError' &&
+      (!error.constraint || error.constraint === 'facingMode' || error.constraint === 'deviceId')
   }
 
   function supportsBitrate(sender) {
@@ -58,6 +107,7 @@
       const encoding = parameters.encodings?.[0]
       if (!encoding) return false
       const maxBitrate = mbps * 1_000_000
+      if (encoding.maxBitrate === maxBitrate) return true
       encoding.maxBitrate = maxBitrate
       await sender.setParameters(parameters)
       return sender.getParameters().encodings?.[0]?.maxBitrate === maxBitrate
@@ -89,15 +139,17 @@
   window.createYuloCallController = function (root, options) {
     const panel = root.querySelector('[data-chat-call]')
     if (!panel || !window.isSecureContext || !navigator.mediaDevices?.getUserMedia ||
-        typeof RTCPeerConnection !== 'function' || typeof window.createYuloCallLayout !== 'function') return null
+        typeof RTCPeerConnection !== 'function' || typeof window.createYuloCallLayout !== 'function' ||
+        typeof window.createYuloCallAudio !== 'function') return null
 
-    const layout = window.createYuloCallLayout(panel)
     const control = (name) => panel.querySelector('[data-call-' + name + ']')
     const qualityOptions = panel.querySelectorAll('[data-call-resolution], [data-call-ratio]')
     const ui = {
       peer: control('peer'), status: control('status'), stage: control('stage'),
       local: control('local'), remote: control('remote'), accept: control('accept'),
       hangup: control('hangup'), mic: control('mic'), camera: control('camera'),
+      cameraToggle: control('camera-toggle'), cameraFacing: control('camera-facing'),
+      cameraMirror: control('camera-mirror'),
       main: control('main'), playHint: control('play-hint'),
       bitrate: control('bitrate'),
     }
@@ -106,6 +158,16 @@
     let accessExpiresAt = 0
     const discardedInvites = new Set()
     const discardedAccepts = new Set()
+    const audio = window.createYuloCallAudio(panel, {
+      notice: options.notice,
+      replayRemote: () => playRemote(call),
+    })
+    const layout = window.createYuloCallLayout(panel, {
+      onCameraQuickToggle: toggleCamera,
+      onCameraOpen: () => refreshCameraSupport(call),
+      onMicQuickToggle: audio.toggleMic,
+      onAudioOpen: audio.refresh,
+    })
 
     function send(action, fields = {}, type = 'call') {
       return options.send({ type, action, ...fields })
@@ -120,8 +182,8 @@
     function state(peer, phase, id = null, publicInvite = false) {
       return {
         peer, phase, id, publicInvite, signalQueue: Promise.resolve(), earlyIce: [],
-        facing: 'user', lastStatus: Date.now(), renewAfter: 0,
-        cameraEnabled: true, quality: defaultQuality,
+        lastStatus: Date.now(), renewAfter: 0,
+        cameraEnabled: true, cameraMirror: false, cameraIds: {}, quality: defaultQuality,
       }
     }
 
@@ -137,6 +199,8 @@
         ui.stage.hidden = true
         ui.local.hidden = true
         ui.remote.hidden = true
+        ui.local.classList.remove('is-mirrored')
+        ui.remote.classList.remove('is-mirrored')
         setPlaybackBlocked(false)
         layout.reset()
         return
@@ -157,8 +221,7 @@
         : call.peerReconnecting ? '对方正在重新连接…'
           : call.mediaInterrupted ? '音视频连接正在恢复…' : labels[call.phase]
       const inMedia = call.pc != null
-      const videoOn = call.local?.getVideoTracks().some((track) => track.readyState === 'live')
-      const audioOn = call.local?.getAudioTracks().some((track) => track.enabled)
+      const videoOn = !!liveCamera(call)
       ui.stage.hidden = !call.local && !inMedia
       ui.local.hidden = !videoOn
       ui.remote.hidden = !inMedia
@@ -168,14 +231,130 @@
       ui.hangup.title = hangupLabel
       ui.hangup.setAttribute('aria-label', hangupLabel)
       ui.mic.hidden = !inMedia
-      ui.mic.title = audioOn ? '静音' : '取消静音'
-      ui.mic.setAttribute('aria-pressed', String(!audioOn))
       ui.camera.hidden = !inMedia
-      ui.camera.disabled = !!call.changingCamera
-      ui.camera.title = videoOn ? '关闭摄像头' : '开启摄像头'
-      ui.camera.setAttribute('aria-pressed', String(!videoOn))
+      renderCamera(call, videoOn)
       renderQuality(call)
       layout.update(inMedia, call.phase === 'active')
+    }
+
+    function liveCamera(current) {
+      return current.local?.getVideoTracks().find((track) => track.readyState === 'live')
+    }
+
+    function mirrorAvailable(current, videoOn) {
+      return videoOn && current.phase === 'active' && current.cameraDevice?.facing === 'user' &&
+        current.displayChannel?.readyState === 'open' && current.peerMirror !== undefined
+    }
+
+    function renderCamera(current, videoOn = !!liveCamera(current)) {
+      const canToggle = !!current.videoSender && !current.changingCamera
+      const facing = current.cameraDevice?.facing
+      const target = current.cameraTarget?.facing
+      const canMirror = mirrorAvailable(current, videoOn)
+      ui.camera.toggleAttribute('data-media-off', !videoOn)
+      ui.local.classList.toggle('is-mirrored', canMirror && current.cameraMirror)
+      ui.remote.classList.toggle('is-mirrored',
+        current.displayChannel?.readyState === 'open' && current.peerMirror === true)
+      if (ui.cameraToggle) {
+        ui.cameraToggle.disabled = !canToggle
+        ui.cameraToggle.textContent = videoOn ? '关闭' : '开启'
+        ui.cameraToggle.setAttribute('aria-label', '摄像头')
+        ui.cameraToggle.setAttribute('aria-pressed', String(videoOn))
+      }
+      if (ui.cameraFacing) {
+        ui.cameraFacing.disabled = !canToggle || !videoOn || !target
+        ui.cameraFacing.textContent = cameraNames[facing] ?? '切换'
+        const label = target ? `切换至${cameraNames[target]}` : '切换前后摄像头'
+        ui.cameraFacing.setAttribute('aria-label', label)
+        ui.cameraFacing.title = label
+      }
+      if (ui.cameraMirror) {
+        ui.cameraMirror.disabled = !canToggle || !canMirror
+        ui.cameraMirror.setAttribute('aria-pressed', String(canMirror && current.cameraMirror))
+      }
+    }
+
+    function chooseCamera(current, device) {
+      current.cameraDevice = device
+      current.cameraTarget = null
+      if (device.facing && device.deviceId) current.cameraIds[device.facing] = device.deviceId
+    }
+
+    async function refreshCameraSupport(current) {
+      const device = current?.cameraDevice
+      if (!device || call !== current || !navigator.mediaDevices.enumerateDevices) return
+      let cameras
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices()
+        cameras = devices.filter(({ kind, deviceId }) => kind === 'videoinput' && deviceId && deviceId !== 'default')
+      } catch {
+        return
+      }
+      if (call !== current || current.cameraDevice !== device) return
+      if (!device.facing && device.deviceId) {
+        const facings = cameraFacings(cameras.find((camera) => camera.deviceId === device.deviceId))
+        if (facings.length === 1) device.facing = cameraFacing(facings[0])
+        if (device.facing) current.cameraIds[device.facing] = device.deviceId
+      }
+      const target = device.facing === 'user' ? 'environment' : device.facing === 'environment' ? 'user' : null
+      current.cameraTarget = null
+      if (target && target !== current.unavailableFacing) {
+        const knownId = current.cameraIds[target]
+        const alternate = cameras.find((camera) => camera.deviceId !== device.deviceId &&
+          (camera.deviceId === knownId || cameraFacings(camera).includes(target)))
+        const handheld = navigator.userAgentData?.mobile || window.matchMedia?.('(pointer: coarse)')?.matches
+        if (alternate) current.cameraTarget = { facing: target, deviceId: alternate.deviceId }
+        else if (handheld && new Set(cameras.map((camera) => camera.deviceId)).size > 1 &&
+            navigator.mediaDevices.getSupportedConstraints?.()?.facingMode) {
+          current.cameraTarget = { facing: target }
+        }
+      }
+      renderCamera(current)
+      publishMirror(current)
+    }
+
+    function publishMirror(current, refresh = false) {
+      const channel = current.displayChannel
+      if (channel?.readyState !== 'open') return
+      const mirror = mirrorAvailable(current, !!liveCamera(current)) && current.cameraMirror
+      if (!refresh && current.sentMirror === mirror) return
+      try {
+        channel.send(JSON.stringify({ mirror }))
+        current.sentMirror = mirror
+      } catch { /* The channel can close without ending audio and video. */ }
+    }
+
+    function bindDisplayChannel(current, channel) {
+      if (call !== current || channel.label !== displayChannelLabel || current.displayChannel) return
+      current.displayChannel = channel
+      channel.addEventListener('open', () => {
+        if (call === current) publishMirror(current, true)
+      })
+      channel.addEventListener('message', ({ data }) => {
+        if (call !== current || current.displayChannel !== channel || typeof data !== 'string' || data.length > 64) return
+        let state
+        try { state = JSON.parse(data) } catch { return }
+        if (typeof state?.mirror !== 'boolean') return
+        current.peerMirror = state.mirror
+        renderCamera(current)
+        publishMirror(current)
+      })
+      channel.addEventListener('close', () => {
+        if (call !== current || current.displayChannel !== channel) return
+        current.displayChannel = null
+        current.peerMirror = undefined
+        current.sentMirror = undefined
+        renderCamera(current)
+      })
+      if (channel.readyState === 'open') publishMirror(current, true)
+    }
+
+    function toggleMirror() {
+      const current = call
+      if (!current || current.changingCamera || !mirrorAvailable(current, !!liveCamera(current))) return
+      current.cameraMirror = !current.cameraMirror
+      renderCamera(current)
+      publishMirror(current)
     }
 
     function renderQuality(current) {
@@ -206,10 +385,11 @@
       renderBitrate(current)
       const applied = await current.bitrateUpdate
       current.bitrateUpdate = null
-      if (call !== current) return
+      if (call !== current) return false
       if (applied) current.bitrateMbps = mbps
       else if (manual) options.notice('无法调整视频发送码率', 'error')
       renderBitrate(current)
+      return applied
     }
 
     function cycleBitrate() {
@@ -237,8 +417,11 @@
       clearTimeout(current.reconnectTimer)
       clearTimeout(current.foregroundTimer)
       clearInterval(current.monitor)
+      audio.stop()
+      current.displayChannel?.close()
       if (current.pc) current.pc.close()
       stopTracks(current.local)
+      stopTracks(current.pendingCamera)
       ui.local.srcObject = null
       ui.remote.srcObject = null
       render()
@@ -267,16 +450,17 @@
     async function capture(current) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true, video: cameraConstraints(current),
+          audio: true, video: cameraConstraints(current.quality),
         })
         if (call !== current) {
           stopTracks(stream)
           return null
         }
         current.local = stream
-        current.facing = stream.getVideoTracks()[0]?.getSettings?.()?.facingMode ?? current.facing
+        chooseCamera(current, describeCamera(stream.getVideoTracks()[0]))
         ui.local.srcObject = stream
         render()
+        void refreshCameraSupport(current)
         return stream
       } catch (error) {
         current.captureError = captureError(error)
@@ -377,6 +561,7 @@
         current.mediaInterrupted = false
         reportConnected(current)
         render()
+        publishMirror(current, true)
       } else if (status === 'failed') {
         failMedia(current, endText['media-error'])
       } else if (status === 'disconnected' && current.mediaTimer === undefined) {
@@ -422,9 +607,21 @@
           }
         }
         pc.onconnectionstatechange = () => connectionChanged(current)
+        let audioSender
         for (const track of stream.getTracks()) {
           const sender = pc.addTrack(track, stream)
           if (track.kind === 'video') current.videoSender = sender
+          else if (track.kind === 'audio') audioSender = sender
+        }
+        audio.start(stream, audioSender)
+        // Include the display channel in the first offer, before signaling starts.
+        if (current.role === 'caller') {
+          try {
+            const channel = pc.createDataChannel?.(displayChannelLabel, { ordered: true })
+            if (channel) bindDisplayChannel(current, channel)
+          } catch { /* Older clients can still use the audio and video session. */ }
+        } else {
+          pc.ondatachannel = ({ channel }) => bindDisplayChannel(current, channel)
         }
         if (!send('media-ready', { callId: current.id })) {
           return failMedia(current, endText.disconnected)
@@ -479,6 +676,7 @@
       if (event.action === 'resumed') {
         call.localReconnecting = false
         clearTimeout(call.reconnectTimer)
+        publishMirror(call, true)
       }
       render()
     }
@@ -501,6 +699,7 @@
       check()
       const current = call
       if (current?.phase !== 'active' || document.visibilityState === 'hidden') return
+      void audio.refresh()
       if (current.pc.connectionState === 'disconnected') {
         clearTimeout(current.mediaTimer)
         current.mediaTimer = undefined
@@ -513,6 +712,7 @@
       const remoteFrames = videoFrames(ui.remote)
       void playLocal(current)
       void playRemote(current)
+      publishMirror(current, true)
 
       // Some WebViews resume playback without unfreezing the camera. Wait for frames
       // before replacing the sender's video track, and leave the audio track untouched.
@@ -527,7 +727,7 @@
         }
         if (current.cameraEnabled && current.local.getVideoTracks()[0] === localTrack &&
             (!localTrack || videoStalled(ui.local, localTrack, localFrames))) {
-          void changeCamera(current, true, true)
+          void changeCamera(current, 'recover')
         }
       }, foregroundDelay)
     }
@@ -621,7 +821,7 @@
           current.monitor = setInterval(check, 5000)
           render()
           // Some browsers expose a writable encoding only after offer/answer.
-          if (current.bitrateMbps === undefined) void setBitrate(current, defaultBitrateMbps)
+          if (current.bitrateMbps === undefined && !current.changingCamera) void setBitrate(current, defaultBitrateMbps)
           break
         case 'status':
         case 'resumed':
@@ -634,67 +834,135 @@
       }
     }
 
-    async function captureVideo(current, recovering) {
-      if (recovering && document.visibilityState === 'hidden') return null
-      const constraints = { audio: false, video: cameraConstraints(current) }
+    function canOpenCamera(current) {
+      return call === current && current.cameraEnabled && document.visibilityState !== 'hidden'
+    }
+
+    async function captureVideo(current, selection, limits) {
+      if (!canOpenCamera(current)) return null
+      const constraints = { audio: false, video: cameraConstraints(current.quality, selection, limits) }
       try {
         return await navigator.mediaDevices.getUserMedia(constraints)
       } catch (error) {
-        if (!recovering || error?.name !== 'NotReadableError') throw error
-        // Android can still hold the old camera briefly after the tab becomes visible.
+        if (error?.name !== 'NotReadableError') throw error
+        // A phone may still hold the previous camera briefly after its track stops.
         await new Promise((resolve) => setTimeout(resolve, cameraRetryDelay))
-        if (call !== current || document.visibilityState === 'hidden') return null
+        if (!canOpenCamera(current)) return null
         return navigator.mediaDevices.getUserMedia(constraints)
       }
     }
 
-    async function changeCamera(current, enabled, recovering = false) {
-      if (call !== current || !current?.videoSender || current.changingCamera) return
+    async function attachCamera(current, selection, limits) {
+      const stream = await captureVideo(current, selection, limits)
+      if (!stream) return false
+      current.pendingCamera = stream
+      const track = stream.getVideoTracks()[0]
+      let adopted = false
+      try {
+        if (!canOpenCamera(current)) return false
+        if (track?.readyState !== 'live') throw new Error('Missing live camera track')
+        const device = describeCamera(track, selection)
+        await current.videoSender.replaceTrack(track)
+        if (!canOpenCamera(current) || track.readyState !== 'live') {
+          if (call === current) await current.videoSender.replaceTrack(null)
+          if (!canOpenCamera(current)) return false
+          throw new Error('The new camera track ended')
+        }
+        current.local.addTrack(track)
+        adopted = true
+        chooseCamera(current, device)
+        ui.local.srcObject = null
+        ui.local.srcObject = current.local
+        void playLocal(current)
+        return true
+      } finally {
+        current.pendingCamera = null
+        for (const captured of stream.getTracks()) {
+          if (!adopted || captured !== track) captured.stop()
+        }
+      }
+    }
+
+    async function openCamera(current, selection, previousSettings) {
+      let opened
+      try {
+        opened = await attachCamera(current, selection)
+      } catch (error) {
+        if (error?.name !== 'InvalidModificationError' || !previousSettings?.width || !previousSettings.height) throw error
+        // Stay within the earlier track's dimensions if the sender declines the new source.
+        opened = await attachCamera(current, selection, previousSettings)
+      }
+      if (!opened || call !== current) return false
+      const mbps = current.bitrateMbps ?? (current.phase === 'active' ? defaultBitrateMbps : undefined)
+      if (mbps !== undefined) {
+        const applied = await setBitrate(current, mbps)
+        if (!applied && call === current) current.bitrateMbps = undefined
+      }
+      return call === current
+    }
+
+    async function changeCamera(current, action, target = current.cameraDevice) {
+      if (call !== current || !current.videoSender || current.changingCamera) return
+      const enabled = action !== 'disable'
+      const startedConnecting = current.phase === 'connecting'
+      const previous = current.cameraDevice
+      const track = current.local.getVideoTracks()[0]
       current.changingCamera = true
       current.cameraEnabled = enabled
       render()
-      const track = current.local.getVideoTracks()[0]
-      let replacement = null
       try {
         if (current.bitrateUpdate) await current.bitrateUpdate
-        if (call !== current) return
+        if (call !== current || enabled && !canOpenCamera(current)) return
         if (track) {
           current.local.removeTrack(track)
           track.stop()
           await current.videoSender.replaceTrack(null)
         }
-        if (!enabled || call !== current) return
-        const stream = await captureVideo(current, recovering)
-        if (!stream) return
-        replacement = stream.getVideoTracks()[0]
-        if (!replacement) throw new Error('Missing camera track')
-        if (call !== current || (recovering && document.visibilityState === 'hidden')) return
-        await current.videoSender.replaceTrack(replacement)
-        if (call !== current) return
-        current.local.addTrack(replacement)
-        current.facing = replacement.getSettings?.()?.facingMode ?? current.facing
-        replacement = null
-        ui.local.srcObject = null
-        ui.local.srcObject = current.local
-        void playLocal(current)
-      } catch {
-        current.cameraEnabled = false
-        if (call === current) {
-          const failure = recovering ? '无法恢复摄像头，请重新开启' : enabled ? '无法开启摄像头' : '无法关闭摄像头'
-          options.notice(failure, 'error')
+        if (enabled && canOpenCamera(current)) await openCamera(current, target, previous?.settings)
+      } catch (error) {
+        if (call !== current || enabled && !canOpenCamera(current)) return
+        if (action === 'switch') {
+          if (missingCamera(error)) current.unavailableFacing = target.facing
+          let restored = false
+          try { restored = await openCamera(current, previous, previous?.settings) } catch { /* Keep the call in audio. */ }
+          if (!canOpenCamera(current)) return
+          current.cameraEnabled = restored
+          options.notice(restored ? '无法切换摄像头，已恢复原镜头' : '无法切换摄像头，请重新开启', 'error')
+          return
         }
+        if (action === 'enable' && (target?.deviceId || target?.facing) && missingCamera(error)) {
+          try {
+            if (await openCamera(current, undefined, previous?.settings)) {
+              options.notice('原摄像头不可用，已启用默认摄像头')
+              return
+            }
+          } catch { /* Report the failed camera request below. */ }
+          if (!canOpenCamera(current)) return
+        }
+        current.cameraEnabled = false
+        const failure = action === 'recover' ? '无法恢复摄像头，请重新开启' : enabled ? '无法开启摄像头' : '无法关闭摄像头'
+        options.notice(failure, 'error')
       } finally {
-        replacement?.stop()
         current.changingCamera = false
-        if (call === current) render()
+        if (call === current) {
+          render()
+          publishMirror(current)
+          if (liveCamera(current)) void refreshCameraSupport(current)
+          if (startedConnecting && current.phase === 'active' && current.bitrateMbps === undefined) {
+            void setBitrate(current, defaultBitrateMbps)
+          }
+        }
       }
     }
 
     function toggleCamera() {
       const current = call
-      if (!current?.videoSender || current.changingCamera) return
-      const enabled = !current.local.getVideoTracks().some((track) => track.readyState === 'live')
-      void changeCamera(current, enabled)
+      if (current) void changeCamera(current, liveCamera(current) ? 'disable' : 'enable')
+    }
+
+    function switchCamera() {
+      const current = call
+      if (current?.cameraTarget && liveCamera(current)) void changeCamera(current, 'switch', current.cameraTarget)
     }
 
     async function changeQuality(event) {
@@ -713,7 +981,8 @@
       current.changingCamera = true
       render()
       try {
-        await track.applyConstraints(cameraConstraints(current))
+        await track.applyConstraints(qualityConstraints(current.quality))
+        if (current.cameraDevice) current.cameraDevice.settings = track.getSettings?.() ?? {}
       } catch {
         current.quality = previous
       } finally {
@@ -728,12 +997,14 @@
       const message = call.phase === 'incoming' ? '已拒绝通话' : call.pc ? '通话已结束' : '已取消呼叫'
       endCurrent(message)
     })
-    ui.mic.addEventListener('click', () => {
-      const tracks = call?.local?.getAudioTracks() || []
-      tracks.forEach((track) => { track.enabled = !track.enabled })
-      render()
+    ui.cameraToggle?.addEventListener('click', toggleCamera)
+    ui.cameraFacing?.addEventListener('click', switchCamera)
+    ui.cameraMirror?.addEventListener('click', toggleMirror)
+    navigator.mediaDevices.addEventListener?.('devicechange', () => {
+      if (!call) return
+      call.unavailableFacing = null
+      void refreshCameraSupport(call)
     })
-    ui.camera.addEventListener('click', toggleCamera)
     for (const button of qualityOptions) button.addEventListener('click', changeQuality)
     ui.bitrate.addEventListener('click', cycleBitrate)
     ui.main.addEventListener('click', () => {

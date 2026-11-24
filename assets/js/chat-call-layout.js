@@ -5,8 +5,11 @@
   const edge = 8
   const dragThreshold = 6
   const controlsIdleMs = 3000
+  const longPressMs = 500
+  const touchSlop = 10
+  const syntheticClickMs = 1000
 
-  window.createYuloCallLayout = function (panel) {
+  window.createYuloCallLayout = function (panel, options = {}) {
     const room = panel.closest('[data-chat-room]')
     const control = (name) => panel.querySelector('[data-call-' + name + ']')
     const stage = control('stage')
@@ -16,9 +19,6 @@
     const mini = control('mini')
     const controls = control('controls')
     const preview = control('preview')
-    const qualityButton = control('quality')
-    const qualityPanel = control('quality-panel')
-    const composeButton = control('compose')
     const composerPanel = control('composer-panel')
     const composer = room.querySelector('[data-chat-composer]')
     const input = composer.querySelector('[data-chat-input]')
@@ -26,6 +26,23 @@
     const playerHint = control('player-hint')
     const compact = window.matchMedia?.('(max-width: 640px), (max-width: 940px) and (max-height: 520px)')
     const viewport = window.visualViewport
+    const previews = {
+      compose: { opener: control('compose'), content: composerPanel, label: '发消息', focus: () => input },
+      quality: {
+        opener: control('quality'), content: control('quality-panel'), label: '画质设置',
+        focus: () => control('quality-panel')?.querySelector('[data-call-resolution][aria-pressed="true"]'),
+      },
+      camera: {
+        opener: control('camera'), content: control('camera-panel'), label: '摄像头设置',
+        focus: () => control('camera-toggle'),
+        quickToggle: options.onCameraQuickToggle, onOpen: options.onCameraOpen,
+      },
+      audio: {
+        opener: control('mic'), content: control('audio-panel'), label: '音频设置',
+        focus: () => control('mic-toggle'),
+        quickToggle: options.onMicQuickToggle, onOpen: options.onAudioOpen,
+      },
+    }
     let preferredMain = remote
     let fraction = null
     let thumbnail = null
@@ -35,6 +52,8 @@
     let hasPeer = false
     let active = false
     let previewMode = null
+    let touchPress = null
+    let ignoredClick = null
     let controlsTimer
     let hintTimer
     const messages = new Map()
@@ -53,7 +72,7 @@
 
     function scheduleControlsHide() {
       clearTimeout(controlsTimer)
-      if (!active || previewMode !== null) return
+      if (!active || previewMode !== null || (touchPress && touchPress.finishedAt === null)) return
       controlsTimer = setTimeout(() => {
         if (controlsHaveKeyboardFocus()) return
         controls.classList.add('is-idle')
@@ -66,38 +85,115 @@
       previewMode = mode
       preview.hidden = mode === null
       preview.classList.toggle('chat__call-preview--compose', mode === 'compose')
-      preview.setAttribute('aria-label', mode === 'compose' ? '发消息' : '画质设置')
-      composerPanel.hidden = mode !== 'compose'
-      qualityPanel.hidden = mode !== 'quality'
-      composeButton.setAttribute('aria-expanded', String(mode === 'compose'))
-      qualityButton.setAttribute('aria-expanded', String(mode === 'quality'))
+      preview.setAttribute('aria-label', mode === null ? '通话预览' : previews[mode].label)
+      for (const [key, view] of Object.entries(previews)) {
+        if (!view.opener || !view.content) continue
+        view.content.hidden = mode !== key
+        view.opener.setAttribute('aria-expanded', String(mode === key))
+      }
       showControls()
     }
 
-    function togglePreview(mode, focusTarget) {
+    function togglePreview(mode, view) {
+      if (view.opener.hidden || view.opener.disabled) return
       if (previewMode === mode) {
         setPreview(null)
       } else {
         setPreview(mode)
-        focusTarget.focus({ preventScroll: true })
+        view.onOpen?.()
+        const target = view.focus()
+        const focused = target && !target.disabled ? target : view.opener
+        focused.focus({ preventScroll: true })
       }
+    }
+
+    function ignoreClick(view) {
+      ignoredClick = { view, until: Date.now() + syntheticClickMs }
+    }
+
+    function finishTouchPress(press, canceled = false) {
+      if (!press || press.finishedAt !== null) return
+      press.finishedAt = Date.now()
+      clearTimeout(press.timer)
+      if (press.fired || canceled) ignoreClick(press.view)
+      scheduleControlsHide()
+    }
+
+    function triggerTouchShortcut(press) {
+      const { view } = press
+      if (touchPress !== press || press.finishedAt !== null || press.fired) return
+      if (!hasPeer || view.opener.hidden || view.opener.disabled) return
+      press.fired = true
+      clearTimeout(press.timer)
+      ignoreClick(view)
+      showControls()
+      view.quickToggle()
+    }
+
+    function bindShortcut(view) {
+      const button = view.opener
+      button.addEventListener('pointerdown', (event) => {
+        if (event.isPrimary === false) return
+        finishTouchPress(touchPress, true)
+        touchPress = null
+        ignoredClick = null
+        if (event.pointerType !== 'touch' || event.button !== 0 || !hasPeer || button.hidden || button.disabled) return
+        const press = { view, id: event.pointerId, x: event.clientX, y: event.clientY, fired: false, finishedAt: null }
+        touchPress = press
+        press.timer = setTimeout(() => triggerTouchShortcut(press), longPressMs)
+        showControls()
+      })
+      const matchesPress = (event) => touchPress?.view === view && touchPress.id === event.pointerId
+      button.addEventListener('pointermove', (event) => {
+        if (!matchesPress(event)) return
+        if (Math.hypot(event.clientX - touchPress.x, event.clientY - touchPress.y) > touchSlop) {
+          finishTouchPress(touchPress, true)
+        }
+      })
+      button.addEventListener('pointerup', (event) => {
+        if (matchesPress(event)) finishTouchPress(touchPress)
+      })
+      for (const event of ['pointercancel', 'lostpointercapture']) {
+        button.addEventListener(event, (pointer) => {
+          if (matchesPress(pointer)) finishTouchPress(touchPress, true)
+        })
+      }
+      button.addEventListener('contextmenu', (event) => {
+        event.preventDefault()
+        if (!hasPeer || button.hidden || button.disabled) return
+        const press = touchPress?.view === view ? touchPress : null
+        const fromTouch = event.pointerType === 'touch' || event.sourceCapabilities?.firesTouchEvents ||
+          (press && (press.finishedAt === null || Date.now() - press.finishedAt < syntheticClickMs))
+        if (fromTouch) {
+          if (press) triggerTouchShortcut(press)
+          return
+        }
+        ignoreClick(view)
+        showControls()
+        view.quickToggle()
+      })
     }
 
     mainTarget.addEventListener('click', () => {
       if (previewMode !== null) setPreview(null)
       else showControls()
     })
-    composeButton.addEventListener('click', () => {
-      if (!composeButton.hidden) togglePreview('compose', input)
-    })
-    qualityButton.addEventListener('click', () => {
-      if (qualityButton.hidden) return
-      const selected = qualityPanel.querySelector('[data-call-resolution][aria-pressed="true"]')
-      togglePreview('quality', selected)
-    })
+    for (const [mode, view] of Object.entries(previews)) {
+      if (!view.opener || !view.content) continue
+      if (view.quickToggle) bindShortcut(view)
+      view.opener.addEventListener('click', (event) => {
+        if (touchPress?.view === view) finishTouchPress(touchPress)
+        const fromPointer = event.detail !== 0 || event.pointerType || event.sourceCapabilities?.firesTouchEvents
+        if (fromPointer && ignoredClick?.view === view && Date.now() <= ignoredClick.until) {
+          event.preventDefault()
+          return
+        }
+        togglePreview(mode, view)
+      })
+    }
     panel.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape' || previewMode === null) return
-      const opener = previewMode === 'compose' ? composeButton : qualityButton
+      const { opener } = previews[previewMode]
       event.preventDefault()
       event.stopPropagation()
       setPreview(null)
@@ -108,6 +204,10 @@
       if (controlsHaveKeyboardFocus()) showControls()
     })
     controls.addEventListener('focusout', scheduleControlsHide)
+    window.addEventListener('blur', () => finishTouchPress(touchPress, true))
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) finishTouchPress(touchPress, true)
+    })
 
     function pixels(name, value) {
       stage.style.setProperty(name, value + 'px')
@@ -172,9 +272,11 @@
       mainTarget.hidden = !hasPeer
       const expanded = hasPeer && !!compact?.matches
       room.classList.toggle('is-call-expanded', expanded)
-      composeButton.hidden = !active || !expanded
-      qualityButton.hidden = !active
-      if (!active || (!expanded && previewMode === 'compose')) setPreview(null)
+      previews.compose.opener.hidden = !active || !expanded
+      previews.quality.opener.hidden = !active
+      const available = { compose: active && expanded, quality: active, camera: hasPeer, audio: hasPeer }
+      if (previewMode !== null && !available[previewMode]) setPreview(null)
+      if (!hasPeer) finishTouchPress(touchPress, true)
       const composerParent = expanded ? composerPanel : room
       if (composer.parentElement !== composerParent) {
         composerParent.append(composer)

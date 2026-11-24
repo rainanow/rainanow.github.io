@@ -53,7 +53,7 @@ async function createUser() {
   return user
 }
 
-function observeBrowser({ relay }) {
+function observeBrowser({ relay, cameraFacings = [] }) {
   const audit = { pcs: [], sockets: [], tracks: [], signals: [], quality: [], readyMessages: new Map(), denyNext: false }
   window.callTest = audit
   const applyConstraints = MediaStreamTrack.prototype.applyConstraints
@@ -76,13 +76,38 @@ function observeBrowser({ relay }) {
     }
     return play.call(this)
   }
+  const listDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices)
+  if (cameraFacings.length) {
+    navigator.mediaDevices.enumerateDevices = async () => [
+      ...(await listDevices()).filter((device) => device.kind !== 'videoinput'),
+      ...cameraFacings.map((facing) => ({
+        kind: 'videoinput', deviceId: `test-camera-${facing}`, label: `Camera ${facing}`,
+        getCapabilities: () => ({ facingMode: [facing] }),
+      })),
+    ]
+  }
   const capture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
   navigator.mediaDevices.getUserMedia = async (constraints) => {
     if (audit.denyNext) {
       audit.denyNext = false
       throw new DOMException('Test permission denial', 'NotAllowedError')
     }
+    let facing
+    if (constraints.video && cameraFacings.length) {
+      const { deviceId, facingMode, ...video } = constraints.video
+      facing = deviceId?.exact ? deviceId.exact.replace('test-camera-', '')
+        : facingMode?.exact ?? facingMode?.ideal ?? cameraFacings[0]
+      if (!cameraFacings.includes(facing)) throw new DOMException('Test missing camera', 'OverconstrainedError')
+      constraints = { ...constraints, video }
+    }
     const stream = await capture(constraints)
+    if (facing) {
+      const [track] = stream.getVideoTracks()
+      const readSettings = track.getSettings.bind(track)
+      const readCapabilities = track.getCapabilities.bind(track)
+      track.getSettings = () => ({ ...readSettings(), deviceId: `test-camera-${facing}`, facingMode: facing })
+      track.getCapabilities = () => ({ ...readCapabilities(), facingMode: [facing] })
+    }
     audit.tracks.push(...stream.getTracks())
     return stream
   }
@@ -149,6 +174,20 @@ async function showControls(page) {
   await page.locator('[data-call-controls]:not(.is-idle)').waitFor()
 }
 
+async function holdTouch(page, button) {
+  const box = await button.boundingBox()
+  assert.ok(box, '长按目标可见')
+  const touchPoints = [{ x: box.x + box.width / 2, y: box.y + box.height / 2 }]
+  const session = await page.context().newCDPSession(page)
+  try {
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints })
+    await delay(650)
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  } finally {
+    await session.detach()
+  }
+}
+
 async function invite(page) {
   await page.locator('[data-chat-call-invite]').click()
   await callPanel(page, 'outgoing').waitFor()
@@ -212,7 +251,7 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   const errors = []
   const [alice, bob, spectator] = await Promise.all([createUser(), createUser(), createUser()])
   const a = await openPage(browser, alice, { relay: false })
-  const b = await openPage(browser, bob, { relay: false, mobile: true })
+  const b = await openPage(browser, bob, { relay: false, mobile: true, cameraFacings: ['user', 'environment'] })
   const viewer = await openPage(browser, spectator, { relay: false })
   for (const { page } of [a, b, viewer]) page.on('pageerror', (error) => errors.push(error.message))
   await a.page.evaluate(() => { window.callTest.denyNext = true })
@@ -344,16 +383,30 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   await a.page.locator('[data-call-bitrate]').click()
   await videoBitrateLimit(a.page, 3)
   await showControls(a.page)
-  await a.page.locator('[data-call-mic]').click()
+  const desktopMic = a.page.locator('[data-call-mic]')
+  const desktopAudio = a.page.locator('[data-call-audio-panel]')
+  await desktopMic.press('Space')
+  await desktopAudio.waitFor()
+  assert.equal(await a.page.evaluate(() =>
+    document.querySelector('[data-call-local]').srcObject.getAudioTracks()[0].enabled), true)
+  await a.page.keyboard.press('Escape')
+  await desktopAudio.waitFor({ state: 'hidden' })
+  assert.ok(await desktopMic.evaluate((button) => button === document.activeElement))
+  await desktopMic.click({ button: 'right' })
   assert.equal(await a.page.evaluate(() =>
     document.querySelector('[data-call-local]').srcObject.getAudioTracks()[0].enabled), false)
-  await a.page.locator('[data-call-mic]').click()
+  await desktopAudio.waitFor({ state: 'hidden' })
+  await desktopMic.click()
+  await a.page.locator('[data-call-mic-toggle]').click()
   assert.equal(await a.page.evaluate(() =>
     document.querySelector('[data-call-local]').srcObject.getAudioTracks()[0].enabled), true)
   await a.page.locator('[data-call-camera]').click()
+  await desktopAudio.waitFor({ state: 'hidden' })
+  assert.ok(await a.page.locator('[data-call-camera-facing]').isDisabled(), '单摄相机切换灰显')
+  await a.page.locator('[data-call-camera-toggle]').click()
   await a.page.waitForFunction(() => window.callTest.tracks
     .filter((track) => track.kind === 'video').every((track) => track.readyState === 'ended'))
-  await a.page.locator('[data-call-camera][aria-pressed="true"]').click()
+  await a.page.locator('[data-call-camera-toggle]').click()
   await a.page.waitForFunction(() =>
     document.querySelector('[data-call-local]').srcObject.getVideoTracks().length === 1)
   await videoBitrateLimit(a.page, 3)
@@ -366,6 +419,56 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
     document.querySelector('[data-call-local]').srcObject.getVideoTracks().some((track) => track.readyState === 'live'), priorCaptureCount)
   await videoBitrateLimit(a.page, 3)
   assert.equal(await a.page.evaluate(() => window.callTest.pcs.length), 1)
+
+  await b.page.setViewportSize({ width: 320, height: 720 })
+  await showControls(b.page)
+  const mobileMic = b.page.locator('[data-call-mic]')
+  const mobileAudio = b.page.locator('[data-call-audio-panel]')
+  await holdTouch(b.page, mobileMic)
+  assert.equal(await mobileMic.getAttribute('data-media-off') !== null, true, '长按只切换一次闭麦')
+  await mobileAudio.waitFor({ state: 'hidden' })
+  await mobileMic.tap()
+  await mobileAudio.waitFor()
+  await delay(3100)
+  assert.ok(await b.page.locator('[data-call-controls]:not(.is-idle)').isVisible(), '设备面板展开时暂停控制条消隐')
+  const audioBox = await mobileAudio.boundingBox()
+  assert.ok(audioBox.x >= 0 && audioBox.x + audioBox.width <= 321)
+  assert.ok(await b.page.locator('[data-call-audio-input]').isVisible())
+  assert.ok(await b.page.locator('[data-call-audio-output]').isVisible())
+  if (screenshots) await b.page.screenshot({ path: resolve(screenshots, 'mobile-audio.png') })
+  await b.page.locator('[data-call-mic-toggle]').tap()
+  assert.equal(await mobileMic.getAttribute('data-media-off'), null)
+
+  await b.page.locator('[data-call-camera]').tap()
+  await mobileAudio.waitFor({ state: 'hidden' })
+  const cameraPanel = b.page.locator('[data-call-camera-panel]')
+  const mirrorToggle = b.page.locator('[data-call-camera-mirror]')
+  const facingToggle = b.page.locator('[data-call-camera-facing]')
+  await cameraPanel.waitFor()
+  const firstRow = await cameraPanel.locator('button').evaluateAll((buttons) =>
+    buttons.map((button) => button.getBoundingClientRect().top))
+  assert.equal(firstRow.length, 3)
+  assert.ok(firstRow.every((top) => top === firstRow[0]), '320px 视口三项相机控制在同一行')
+  if (screenshots) await b.page.screenshot({ path: resolve(screenshots, 'mobile-camera.png') })
+  await mirrorToggle.tap()
+  await b.page.locator('[data-call-local].is-mirrored').waitFor()
+  await a.page.locator('[data-call-remote].is-mirrored').waitFor()
+  assert.match(await a.page.locator('[data-call-remote]').evaluate((video) => getComputedStyle(video).transform),
+    /^matrix\(-1, 0, 0, 1, 0, 0\)$/)
+  const ownView = b.page.locator('[data-call-local]')
+  const wasSmall = await ownView.evaluate((video) => video.classList.contains('is-small'))
+  await b.page.locator('[data-call-mini]').tap()
+  assert.notEqual(await ownView.evaluate((video) => video.classList.contains('is-small')), wasSmall)
+  assert.ok(await ownView.evaluate((video) => video.classList.contains('is-mirrored')))
+  await facingToggle.tap()
+  await b.page.waitForFunction(() => document.querySelector('[data-call-local]').srcObject.getVideoTracks()[0]
+    ?.getSettings().facingMode === 'environment')
+  await a.page.locator('[data-call-remote].is-mirrored').waitFor({ state: 'hidden' })
+  await facingToggle.tap()
+  await a.page.locator('[data-call-remote].is-mirrored').waitFor()
+  assert.equal(await b.page.evaluate(() => window.callTest.pcs.length), 1)
+  assert.equal(await a.page.evaluate(() => window.callTest.signals.filter(({ action }) => action === 'offer').length), 1)
+  assert.equal(await b.page.evaluate(() => window.callTest.signals.filter(({ action }) => action === 'answer').length), 1)
 
   const previousSocket = await a.page.evaluate(() => {
     const { sockets } = window.callTest

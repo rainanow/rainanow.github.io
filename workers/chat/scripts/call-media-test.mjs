@@ -82,12 +82,20 @@ function fixture(user, options) {
   const timers = new Set()
   const received = { audio: 0, video: 0 }
   const cameraRequests = []
+  const microphoneRequests = []
+  const devices = [
+    { kind: 'videoinput', deviceId: 'front-camera', label: 'Front camera', facing: 'user' },
+    { kind: 'videoinput', deviceId: 'back-camera', label: 'Back camera', facing: 'environment' },
+    { kind: 'audioinput', deviceId: 'mic', label: 'Built-in microphone' },
+    { kind: 'audiooutput', deviceId: 'speaker', label: 'Built-in speaker' },
+  ]
   const applied = []
   const playback = { local: 0, remote: 0 }
   let localFrames = 0
   let visibility = 'visible'
   let denyNext = false
   let busyNext = false
+  let sinkId = ''
   let shorten = Boolean(options.shorten)
   const sent = { resume: 0, refresh: 0 }
   Object.defineProperty(window, 'isSecureContext', { value: true })
@@ -98,6 +106,15 @@ function fixture(user, options) {
   }
   window.HTMLVideoElement.prototype.getVideoPlaybackQuality = function () {
     return { totalVideoFrames: this.hasAttribute('data-call-local') ? localFrames : 0 }
+  }
+  if (!options.noAudioRouting) {
+    Object.defineProperty(select('[data-call-remote]'), 'sinkId', { get: () => sinkId })
+    select('[data-call-remote]').setSinkId = async (id) => {
+      if (id && !devices.some((device) => device.kind === 'audiooutput' && device.deviceId === id)) {
+        throw new window.DOMException('Missing speaker', 'NotFoundError')
+      }
+      sinkId = id
+    }
   }
   window.MediaStream = rtc.MediaStream
 
@@ -116,8 +133,12 @@ function fixture(user, options) {
     return track
   }
 
-  Object.defineProperty(window.navigator, 'mediaDevices', { value: {
-    enumerateDevices: async () => [{ kind: 'videoinput' }, { kind: 'videoinput' }],
+  const mediaDevices = Object.assign(new window.EventTarget(), {
+    getSupportedConstraints: () => ({ facingMode: true }),
+    enumerateDevices: async () => devices.map((device) => ({
+      ...device,
+      getCapabilities: () => device.facing ? { facingMode: [device.facing] } : {},
+    })),
     getUserMedia: async ({ audio, video }) => {
       if (denyNext) {
         denyNext = false
@@ -125,12 +146,19 @@ function fixture(user, options) {
       }
       const output = []
       if (audio) {
+        const deviceId = audio.deviceId?.exact ?? 'mic'
+        microphoneRequests.push(deviceId)
+        if (!devices.some((device) => device.kind === 'audioinput' && device.deviceId === deviceId)) {
+          throw new window.DOMException('Missing microphone', 'NotFoundError')
+        }
         const source = new RTCAudioSource()
         const samples = new Int16Array(480)
         for (let i = 0; i < samples.length; i++) samples[i] = Math.sin(i / 15) * 1200
-        output.push(captureTrack(source, () => source.onData({
+        const track = captureTrack(source, () => source.onData({
           samples, sampleRate: 48000, bitsPerSample: 16, channelCount: 1, numberOfFrames: 480,
-        }), 10))
+        }), 10)
+        Object.defineProperty(track, 'getSettings', { value: () => ({ deviceId, channelCount: 1 }) })
+        output.push(track)
       }
       if (video) {
         cameraRequests.push(video)
@@ -138,12 +166,15 @@ function fixture(user, options) {
           busyNext = false
           throw new window.DOMException('camera still in use', 'NotReadableError')
         }
+        const facing = video.facingMode?.exact ?? video.facingMode?.ideal ?? 'user'
+        const deviceId = video.deviceId?.exact ?? (facing === 'environment' ? 'back-camera' : 'front-camera')
+        const camera = devices.find((device) => device.kind === 'videoinput' && device.deviceId === deviceId)
+        if (!camera) throw new window.DOMException('Missing camera', 'OverconstrainedError')
         const source = new RTCVideoSource()
         const width = 160
         const height = 90
         const data = new Uint8ClampedArray(width * height * 1.5).fill(128)
         let frames = 0
-        const facing = video.facingMode?.exact ?? video.facingMode?.ideal ?? 'user'
         const track = captureTrack(source, () => {
           data.fill(70 + frames++ % 60, 0, width * height)
           source.onFrame({ width, height, data })
@@ -153,11 +184,12 @@ function fixture(user, options) {
         function chooseSettings(constraints) {
           const height = Math.min(720, constraints.height?.ideal ?? 720)
           const ratio = constraints.aspectRatio?.ideal ?? 16 / 9
-          settings = { width: Math.round(height * ratio), height, facingMode: facing }
+          settings = { width: Math.round(height * ratio), height, deviceId, facingMode: camera.facing }
         }
         chooseSettings(video)
         Object.defineProperties(track, {
           getSettings: { value: () => settings },
+          getCapabilities: { value: () => ({ facingMode: [camera.facing] }) },
           applyConstraints: { value: async (constraints) => {
             applied.push({ track, constraints })
             chooseSettings(constraints)
@@ -167,7 +199,8 @@ function fixture(user, options) {
       }
       return new rtc.MediaStream(output)
     },
-  } })
+  })
+  Object.defineProperty(window.navigator, 'mediaDevices', { value: mediaDevices })
 
   window.RTCPeerConnection = class extends rtc.RTCPeerConnection {
     constructor(config) {
@@ -242,9 +275,24 @@ function fixture(user, options) {
   window.eval(script)
 
   return {
-    select, tracks, sockets, peers, received, signals, sent, errors, cameraRequests, applied, playback,
+    select, tracks, sockets, peers, received, signals, sent, errors, cameraRequests, microphoneRequests, applied, playback,
     deny: () => { denyNext = true },
     cameraBusy: () => { busyNext = true },
+    changeDevice(node, value) {
+      node.value = value
+      node.dispatchEvent(new window.Event('change', { bubbles: true }))
+    },
+    connectHeadset(notify = true) {
+      devices.push(
+        { kind: 'audioinput', deviceId: 'bt-mic', label: 'Bluetooth microphone' },
+        { kind: 'audiooutput', deviceId: 'bt-speaker', label: 'Bluetooth headphones' },
+      )
+      if (notify) mediaDevices.dispatchEvent(new window.Event('devicechange'))
+    },
+    disconnectHeadset() {
+      for (const id of ['bt-mic', 'bt-speaker']) devices.splice(devices.findIndex((device) => device.deviceId === id), 1)
+      mediaDevices.dispatchEvent(new window.Event('devicechange'))
+    },
     qualityOption: (setting, value) => select(`[data-call-${setting}="${value}"]`),
     foreground: () => {
       for (visibility of ['hidden', 'visible']) window.document.dispatchEvent(new window.Event('visibilitychange'))
@@ -312,6 +360,14 @@ async function mediaPath(page, relay) {
   }, relay ? '双向 TURN 音视频路径' : '双向直连音视频路径', 20000)
 }
 
+function mirrors(page, feed) {
+  return page.select('[data-call-' + feed + ']').classList.contains('is-mirrored')
+}
+
+function available(button) {
+  return !button.disabled && button.getAttribute('aria-disabled') !== 'true'
+}
+
 test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async (t) => {
   const pages = []
   let turn
@@ -322,7 +378,7 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
   async function two(options) {
     const [left, right] = await Promise.all([account(), account()])
     const a = fixture(left, options)
-    const b = fixture(right, { ...options, shorten: false })
+    const b = fixture(right, { ...options, shorten: false, noAudioRouting: true })
     pages.push(a, b)
     await Promise.all([a, b].map((page) => waitFor(() =>
       page.signals.includes('hello') && !page.select('[data-chat-room]').hidden, '房间已连接')))
@@ -406,8 +462,10 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
     a.select('[data-call-main]').click()
 
     a.select('[data-call-mic]').click()
+    assert.equal(audio.enabled, true, '点按麦克风仅展开菜单')
+    a.select('[data-call-mic-toggle]').click()
     assert.equal(audio.enabled, false)
-    assert.equal(a.select('[data-call-mic]').getAttribute('aria-pressed'), 'true')
+    assert.ok(a.select('[data-call-mic]').hasAttribute('data-media-off'))
     a.foreground()
     a.advanceFrames()
     await delay(1100)
@@ -427,9 +485,46 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
     assert.equal(a.cameraRequests.at(-1).aspectRatio.ideal, 4 / 3)
     const peerFrames = b.received.video
     await waitFor(() => b.received.video > peerFrames + 1, '前台恢复后对方继续收视频')
+
     a.select('[data-call-camera]').click()
+    const cameraFacing = a.select('[data-call-camera-facing]')
+    const mirror = a.select('[data-call-camera-mirror]')
+    const cameraToggle = a.select('[data-call-camera-toggle]')
+    await waitFor(() => available(cameraFacing) && available(mirror), '双摄与双端镜像可用')
+    assert.equal(mirrors(a, 'local'), false, '前摄默认正向')
+    assert.equal(mirrors(b, 'remote'), false)
+    const videoSender = a.peers[0].getSenders().find((sender) => sender.track?.kind === 'video')
+    mirror.click()
+    await waitFor(() => mirrors(a, 'local') && mirrors(b, 'remote'), '双方前摄镜像')
+    assert.equal(mirrors(a, 'remote'), false)
+    assert.equal(mirrors(b, 'local'), false)
+    assert.equal(videoSender.track, local.getVideoTracks()[0], '打开镜像沿用相机轨道')
+    const frontTrack = videoSender.track
+    cameraFacing.click()
+    await waitFor(() => videoSender.track?.getSettings().facingMode === 'environment' &&
+      !mirrors(a, 'local') && !mirrors(b, 'remote'), '后摄切换并同步正向画面')
+    assert.equal(frontTrack.readyState, 'ended')
+    assert.equal(local.getVideoTracks()[0], videoSender.track)
+    assert.equal(videoSender.track.getSettings().width, 960)
+    assert.equal(local.getAudioTracks()[0], audio)
+    assert.equal(audio.enabled, false)
+    assert.ok(!available(mirror))
+    const rearTrack = videoSender.track
+    a.deny()
+    cameraFacing.click()
+    await waitFor(() => videoSender.track !== rearTrack &&
+      videoSender.track?.getSettings().facingMode === 'environment' && available(cameraFacing), '切换失败后恢复原摄像头')
+    assert.equal(rearTrack.readyState, 'ended')
+    cameraFacing.click()
+    await waitFor(() => videoSender.track?.getSettings().facingMode === 'user' &&
+      mirrors(a, 'local') && mirrors(b, 'remote'), '切回前摄恢复镜像偏好')
+    assert.equal(a.signals.filter((action) => action === 'offer').length, 1)
+    assert.equal(b.signals.filter((action) => action === 'answer').length, 1)
+
+    cameraToggle.click()
     await waitFor(() => local.getVideoTracks().length === 0 &&
-      a.select('[data-call-camera]').getAttribute('aria-pressed') === 'true', '关闭摄像头')
+      a.select('[data-call-camera]').hasAttribute('data-media-off') && !mirrors(b, 'remote'), '关闭摄像头')
+    assert.ok(!available(cameraFacing) && !available(mirror))
     a.select('[data-call-quality]').click()
     a.qualityOption('resolution', '480p').click()
     a.qualityOption('ratio', '16:9').click()
@@ -438,16 +533,64 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
     await delay(1100)
     assert.equal(a.cameraRequests.length, captures, '切回前台不重开手动关掉的摄像头')
     assert.equal(local.getVideoTracks().length, 0)
-    a.select('[data-call-main]').click()
     a.select('[data-call-camera]').click()
+    cameraToggle.click()
     await waitFor(() => local.getVideoTracks().length === 1 &&
-      a.select('[data-call-camera]').getAttribute('aria-pressed') === 'false', '恢复摄像头')
+      !a.select('[data-call-camera]').hasAttribute('data-media-off') && mirrors(b, 'remote'), '恢复摄像头和镜像')
     assert.equal(a.cameraRequests.at(-1).width.ideal, 854)
     assert.equal(a.cameraRequests.at(-1).height.ideal, 480)
     assert.equal(local.getVideoTracks()[0].getSettings().height, 480)
     assert.equal(audio.enabled, false)
+
     a.select('[data-call-mic]').click()
-    assert.equal(audio.enabled, true)
+    const inputDevice = a.select('[data-call-audio-input]')
+    const outputDevice = a.select('[data-call-audio-output]')
+    const playbackToggle = a.select('[data-call-playback-toggle]')
+    const remoteVideo = a.select('[data-call-remote]')
+    const audioSender = a.peers[0].getSenders().find((sender) => sender.track?.kind === 'audio')
+    assert.equal(audioSender.track, audio)
+    assert.equal(a.select('[data-call-camera-panel]').hidden, true)
+    playbackToggle.click()
+    assert.equal(remoteVideo.muted, true)
+    assert.equal(audio.enabled, false)
+    await waitFor(() => inputDevice.querySelector('[value="mic"]'), '音频面板已刷新内置设备')
+    a.connectHeadset(false)
+    assert.equal(inputDevice.querySelector('[value="bt-mic"]'), null)
+    a.select('[data-call-audio-refresh]').click()
+    await waitFor(() => inputDevice.querySelector('[value="bt-mic"]') &&
+      outputDevice.querySelector('[value="bt-speaker"]'), '手动刷新发现新接入的蓝牙设备')
+    assert.equal(audioSender.track, audio, '新设备接入时保留当前麦克风')
+    a.deny()
+    a.changeDevice(inputDevice, 'bt-mic')
+    await waitFor(() => available(inputDevice) && inputDevice.value !== 'bt-mic', '麦克风授权失败时还原选择')
+    assert.equal(audioSender.track, audio)
+    assert.equal(audio.readyState, 'live')
+    a.changeDevice(inputDevice, 'bt-mic')
+    await waitFor(() => audioSender.track?.getSettings().deviceId === 'bt-mic' && audio.readyState === 'ended', '切换蓝牙麦克风')
+    const bluetooth = audioSender.track
+    assert.equal(bluetooth, local.getAudioTracks()[0])
+    assert.equal(bluetooth.enabled, false)
+    a.changeDevice(outputDevice, 'bt-speaker')
+    await waitFor(() => remoteVideo.sinkId === 'bt-speaker', '切换蓝牙输出')
+    assert.equal(remoteVideo.muted, true)
+    playbackToggle.click()
+    assert.equal(remoteVideo.muted, false)
+    a.select('[data-call-mini]').click()
+    assert.equal(remoteVideo.sinkId, 'bt-speaker')
+    a.disconnectHeadset()
+    await waitFor(() => audioSender.track?.getSettings().deviceId === 'mic' && bluetooth.readyState === 'ended' &&
+      remoteVideo.sinkId === '', '蓝牙断开后输入和输出回到系统默认')
+    assert.equal(audioSender.track.enabled, false)
+    assert.deepEqual(a.microphoneRequests, ['mic', 'bt-mic', 'mic'])
+    const priorAudio = b.received.audio
+    a.select('[data-call-mic-toggle]').click()
+    assert.equal(audioSender.track.enabled, true)
+    await waitFor(() => b.received.audio > priorAudio, '换麦后对方继续收音频')
+    b.select('[data-call-mic]').click()
+    assert.ok(!available(b.select('[data-call-audio-output]')), '不支持切换时由系统选择输出')
+    b.select('[data-call-playback-toggle]').click()
+    assert.equal(b.select('[data-call-remote]').muted, true)
+
     a.select('[data-call-quality]').click()
     const hd = a.qualityOption('resolution', '720p')
     hd.click()
@@ -458,9 +601,10 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
     await waitFor(() => a.sent.resume > 0 && a.select('[data-call-status]').textContent === '通话中', '认证重连')
     assert.equal(a.peers.length, 1)
     assert.ok(a.sent.refresh > 0)
+    assert.equal(mirrors(b, 'remote'), true)
     b.select('[data-call-hangup]').click()
     await Promise.all([released(a), released(b)])
-    t.diagnostic('邀请取消、权限拒绝、画质设置、前台恢复、麦克风与视频轨道控制、重连和挂断通过')
+    t.diagnostic('双端镜像、切摄回退、前台恢复、蓝牙输入输出热插拔、重连和挂断通过')
 
     const secretPath = process.env.RTC_TEST_TURN_KEY
     if (secretPath) {
@@ -488,6 +632,11 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
       await Promise.all([phase(relay.a, 'active'), phase(relay.b, 'active')])
       assert.equal(signed, 2)
       t.diagnostic('中继收发 ' + JSON.stringify(await Promise.all([mediaPath(relay.a, true), mediaPath(relay.b, true)])))
+      relay.b.select('[data-call-camera]').click()
+      const relayMirror = relay.b.select('[data-call-camera-mirror]')
+      await waitFor(() => available(relayMirror), '中继通话镜像可用')
+      relayMirror.click()
+      await waitFor(() => mirrors(relay.b, 'local') && mirrors(relay.a, 'remote'), '中继通话同步接听端镜像')
       await waitFor(() => relay.a.sent.resume > 0 && relay.a.sent.refresh > 0 &&
         relay.a.sockets[0].readyState === WebSocket.CLOSED, '客户端主动续期')
       assert.equal(relay.a.peers.length, 1)
