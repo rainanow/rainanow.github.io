@@ -20,7 +20,7 @@ export interface ChatMessage {
 /** 服务端推给浏览器的 WebSocket 事件。 */
 export type ChatServerEvent =
   /** 握手成功，附带当前在线人数 */
-  | { type: 'ready'; online: number; room: string }
+  | { type: 'ready'; online: number; room: string; videoCalls?: true; accessExpiresAt?: number }
   /** 有新消息（普通消息和系统消息都走这里） */
   | { type: 'message'; message: ChatMessage }
   /**
@@ -38,6 +38,9 @@ export type ChatServerEvent =
 export interface SocketAttachment {
   userId: string
   username: string
+  /** 仅视频信令启用后的新连接分配 ID。hello 后才加入可呼叫列表。 */
+  connectionId?: string
+  callReady?: true
   /**
    * 这条连接属于哪个房间。
    *

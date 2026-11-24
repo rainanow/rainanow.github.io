@@ -1,10 +1,9 @@
 /**
- * ChatRoom：一个聊天室一个实例，只负责「把消息推给所有连着的浏览器」。
+ * ChatRoom：一个聊天室一个实例，管理在线连接、文字广播和定向视频信令。
  *
  * 职责边界是刻意划的：
- *   - 消息的**校验和落库**在 Worker 里做（Hono + nanoka 的验证器都在那边）；
- *   - DO 只做广播，外加维护在线人数。
- * 于是 DO 里没有业务逻辑，只有连接管理，休眠唤醒的代价也最小。
+ *   - 文字消息在 Worker 上校验和落库，DO 广播给房间成员。
+ *   - 通话由 CallSignaling 校验，只向指定连接转发。
  *
  * 用 Hibernation API（`acceptWebSocket` 而不是 `server.accept()`）：
  * 连接空闲时 DO 会被换出内存，不计 compute duration。免费套餐给的是
@@ -14,7 +13,9 @@
 
 import { verify } from '@nanokajs/auth'
 
-import { ACCESS_TOKEN_COOKIE, ACCESS_TOKEN_TTL_SECONDS, DEFAULT_ROOM } from './config'
+import { CallSignaling, callSocketTags } from './calls/signaling'
+import { ICE_ACCESS_PATH, iceAccessSchema } from './calls/ice'
+import { ACCESS_TOKEN_COOKIE, ACCESS_TOKEN_TTL_SECONDS, normalizeRoom } from './config'
 import type { Env } from './env'
 import { readAccessToken } from './origins'
 import {
@@ -52,11 +53,13 @@ export class ChatRoom implements DurableObject {
 
   /** 已经处理过离场的连接，用来挡「error 和 close 各播一次 leave」。见 handleDeparture。 */
   private readonly departed = new WeakSet<WebSocket>()
+  private readonly calls: CallSignaling
 
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env,
   ) {
+    this.calls = new CallSignaling(ctx, env.DB, env.VIDEO_CALL_ROOMS, this.departed)
     // 客户端每 45 秒发一次文本 "ping"，运行时直接回 "pong"：
     // 不唤醒 DO、不计 compute duration。这一条是省额度的关键。
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
@@ -66,6 +69,12 @@ export class ChatRoom implements DurableObject {
     const { pathname } = new URL(request.url)
     if (pathname === BROADCAST_PATH) return this.handleBroadcast(request)
     if (pathname === ONLINE_PATH) return this.handleOnline()
+    if (pathname === ICE_ACCESS_PATH) {
+      if (request.method !== 'POST') return new Response(null, { status: 405 })
+      const access = iceAccessSchema.safeParse(await request.json().catch(() => undefined))
+      const allowed = access.success && await this.calls.canIssueIce(access.data)
+      return new Response(null, { status: allowed ? 204 : 403 })
+    }
     return this.handleUpgrade(request)
   }
 
@@ -168,13 +177,15 @@ export class ChatRoom implements DurableObject {
      * 时刻就是握手这一下 —— 取到之后立刻记进 attachment，让房间名跟着连接走。
      * 这样即便 DO 中途被驱逐（内存全丢），断开时触发的离场提示仍然写得对房间。
      */
-    const room = new URL(request.url).searchParams.get('room') ?? DEFAULT_ROOM
+    const room = normalizeRoom(new URL(request.url).searchParams.get('room'))
+    const connectionId = this.calls.enabled(room) ? crypto.randomUUID() : undefined
 
     const attachment: SocketAttachment = {
       userId: payload.sub,
       username: row.username,
       exp,
       room,
+      ...(connectionId === undefined ? {} : { connectionId }),
     }
 
     /*
@@ -189,13 +200,17 @@ export class ChatRoom implements DurableObject {
 
     const pair = new WebSocketPair()
     const server = pair[1]
-    this.ctx.acceptWebSocket(server)
+    const tags = connectionId === undefined ? undefined : callSocketTags(payload.sub, connectionId)
+    this.ctx.acceptWebSocket(server, tags)
     // 休眠会把内存里的东西全丢掉，只有 attachment 会被持久化下来。
     server.serializeAttachment(attachment)
 
-    server.send(
-      JSON.stringify({ type: 'ready', online: this.onlineCount(), room } satisfies ChatServerEvent),
-    )
+    const ready: ChatServerEvent = { type: 'ready', online: this.onlineCount(), room }
+    if (connectionId !== undefined) {
+      ready.videoCalls = true
+      ready.accessExpiresAt = exp * 1000
+    }
+    server.send(JSON.stringify(ready))
 
     /*
      * 这里有两种播报，去重只落在后面那一种上：
@@ -212,14 +227,14 @@ export class ChatRoom implements DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] })
   }
 
-  async webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     // 心跳的 "ping" 已经被 setWebSocketAutoResponse 拦掉了，根本走不到这里。
-    // 剩下的是客户端发来的其它内容：这个聊天室是「只推不收」的，
-    // 消息一律由 POST /api/messages 进来（那边才有校验和落库），所以这里什么都不做。
-    // 仍然实现它，是为了让运行时有明确的处理器可调，而不是走未定义分支。
-    //
-    // 唯一做的事是「顺手验一下这张凭证还活着吗」——见 SocketAttachment.exp。
-    this.evictIfExpired(ws)
+    if (this.evictIfExpired(ws)) return
+    await this.calls.receive(ws, message)
+  }
+
+  async alarm(): Promise<void> {
+    await this.calls.alarm()
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
@@ -229,14 +244,14 @@ export class ChatRoom implements DurableObject {
     } catch {
       // 已经关了，无所谓。
     }
-    this.handleDeparture(ws)
+    await this.handleDeparture(ws)
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error('chatroom websocket error', error)
     // 异常断开同样要记：用户掉线时往往就是这个路径，
     // 只在 webSocketClose 里写的话，拔网线/杀进程的人会永远停在「在线」。
-    this.handleDeparture(ws)
+    await this.handleDeparture(ws)
   }
 
   /**
@@ -252,7 +267,7 @@ export class ChatRoom implements DurableObject {
    * 用 WeakSet 按连接对象去重、**不持久化**：DO 被驱逐后集合清空，
    * 最坏结果只是多播一次 leave，不影响正确性；用 storage 持久化反而多一次写。
    */
-  private handleDeparture(ws: WebSocket): void {
+  private async handleDeparture(ws: WebSocket): Promise<void> {
     if (this.departed.has(ws)) return
     this.departed.add(ws)
 
@@ -276,6 +291,7 @@ export class ChatRoom implements DurableObject {
     if (!this.hasConnectionFor(attachment.userId, ws)) {
       this.notifyPresence('leave', attachment.username, attachment.room)
     }
+    await this.calls.departure(attachment)
   }
 
   /**

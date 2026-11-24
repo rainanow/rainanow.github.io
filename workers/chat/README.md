@@ -31,7 +31,7 @@ api.yulo.top  ──  Worker（Hono + nanoka）
    │
    └──► ChatRoom Durable Object（一个房间一个实例）
             └── 用 Hibernation API 持有所有 WebSocket，
-                收到新消息就广播给所有在线连接，并维护在线人数
+                广播文字消息、维护在线人数，并在启用的房间定向转发通话信令
 ```
 
 为什么 WebSocket 走独立的 Durable Object 而不是轮询 D1：
@@ -157,11 +157,72 @@ HUGO_PARAMS_CHAT_APIBASE=http://127.0.0.1:8787 hugo server
 
 改完前端记得重建一次并跑 `npm run verify-build`，它守的是这次线上事故的那两个不变式。
 
+### 视频通话信令联调
+
+`VIDEO_CALL_ROOMS` 默认未设置。以逗号分隔的房间名启用对应房间的信令。已启用的房间在
+WebSocket `ready` 事件中返回 `videoCalls: true` 和当前连接的到期时间 `accessExpiresAt`
+（epoch 毫秒）。支持通话的客户端发送 `{ type: 'call', action: 'hello' }` 后可参与呼叫。
+信令格式见 [protocol.ts](src/calls/protocol.ts)，实施阶段见 [视频通话开发计划](视频通话开发计划.md)。
+
+完成本地数据库初始化后，在一个终端开启测试房间，另一个终端运行通话测试。
+
+```bash
+npm run dev -- --local --var VIDEO_CALL_ROOMS:call-test,call-other
+npm run call-test
+```
+
+测试使用三个本地账号及多个 WebSocket 连接，在真实 Worker 上覆盖邀请、接听竞态、
+SDP/ICE 隔离、重连、挂断和无人接听超时。房间 `call-disabled` 用于验证默认关闭时的行为。
+
+### 本地音视频联调
+
+预览页面使用 `http://localhost:1313/chat/`，让 Hugo 的 `params.chat.apiBase`
+指向 `http://localhost:8787`。启动本地 Worker 时启用主聊天室 `general`。
+
+```bash
+npm run dev -- --local --var VIDEO_CALL_ROOMS:general
+```
+
+用两个独立浏览器会话登录不同的测试账号，从主聊天室的在线成员列表发起通话。
+同时联调技术房间时，使用 `VIDEO_CALL_ROOMS:general,tech`。
+
+`npm run call-media-test` 在本地 Worker 上运行聊天室代码，用 WebRTC 引擎发送合成音频和视频。
+它检查双方实际收到的采样和帧，以及选中的 ICE 候选对、重连和设备释放。测试默认读取
+`.tmp/rtc-stage2/public` 的 Hugo 产物，可以用 `RTC_TEST_PUBLIC` 覆盖。测试工具可安装到独立目录。
+
+```bash
+npm install --prefix .tmp/rtc-tools --no-save --ignore-scripts @roamhq/wrtc@0.10.0 node-turn@0.0.6
+```
+
+将 `RTC_TEST_NATIVE` 和 `RTC_TEST_TOOLS` 都指向上述目录。设置 `RTC_TEST_TURN_KEY`
+为本地测试密钥文件的路径可额外验证强制中继。Worker 需使用同一把测试密钥作为
+`RTC_TURN_SECRET`，并配置 `RTC_TURN_URLS=turn:127.0.0.1:34788?transport=udp`。
+测试中继只监听回环地址。 [实机与网络测试清单](视频通话开发计划.md#第四阶段-验收与回归)
+
+### Cloudflare Realtime TURN
+
+Worker 按房间启用视频通话。先在测试环境配置中继，再用 `VIDEO_CALL_ROOMS` 选择开放的房间，
+例如 `general` 对应 `/chat/`。生产和测试使用不同的 TURN Key。
+线上房间开关、TURN 供应商和 Key ID 在 Worker 的变量中维护。`keep_vars` 让后续 Wrangler 部署保留这些设置。
+
+| Worker 配置 | 用途 |
+| --- | --- |
+| `RTC_TURN_PROVIDER=cloudflare` | 使用 Cloudflare 托管中继。设为 `coturn` 或省略时使用原有本地配置。 |
+| `RTC_CLOUDFLARE_TURN_KEY_ID` | Realtime TURN Key ID，对应创建密钥接口的 `uid`。 |
+| `RTC_CLOUDFLARE_TURN_TOKEN` | Realtime TURN Key 的运行时 Bearer，对应创建密钥接口的 `secret`。以 Worker Secret 注入。 |
+
+已获通话权限的客户端继续调用 `/api/calls/ice-servers`。Cloudflare 模式返回短时 `iceServers` 和预计过期时间。
+`npm run call-ice-test` 用模拟响应验证签发契约和错误处理。正式启用前，用真实密钥验证直连、强制中继和 TURN/TLS 443。
+[Cloudflare 凭证签发](https://developers.cloudflare.com/realtime/turn/generate-credentials/)
+
+在 Workers Logs 过滤 `video_call_connected`、`video_call_ended` 和 `video_call_ice_failed`，
+可查看接通、结束原因和凭证签发失败。切换中继供应商或收回房间通话能力时更新对应 Worker 配置。
+
 ---
 
 ## 部署
 
-> 下面标 **[你操作]** 的步骤需要你自己的 Cloudflare / GitHub 凭据，Agent 代替不了。
+> 下面标 **[你操作]** 的步骤需要使用账号持有者的 Cloudflare 或 GitHub 凭据，可以由持有者执行，也可以用受限凭据授权执行。
 
 ### 0. 前置条件
 

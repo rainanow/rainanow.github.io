@@ -2,10 +2,10 @@
 date = '2026-10-01T13:55:00+08:00'
 draft = false
 title = '乐谱'
-summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
+summary = '吉他谱存档，共 182 张，图片存在 R2 上。'
 +++
 
-吉他谱存档，共 171 张。图片存在 Cloudflare R2（`img.yulo.top`），这里是直链。
+吉他谱存档，共 182 张。图片存在 Cloudflare R2（`img.yulo.top`），这里是直链。
 
 <!--more-->
 
@@ -60,6 +60,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 # Episode 33
 
 {{< score src="https://img.yulo.top/sky/Episode%2033_%E7%99%BD%E5%BA%95.jpg" title="Episode 33" w="1920" h="13024" >}}
+
+# Eppure Sentire
+
+{{< score src="https://img.yulo.top/sky/Eppure%20Sentire_%E7%99%BD%E5%BA%95.jpg" title="Eppure Sentire" w="1920" h="10354" >}}
 
 # Falling U
 
@@ -157,6 +161,14 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/Where%20Did%20U%20Go_%E7%99%BD%E5%BA%95.jpg" title="Where Did U Go" w="1920" h="12223" >}}
 
+# You Are All I Need
+
+{{< score src="https://img.yulo.top/sky/You%20Are%20All%20I%20Need_%E7%99%BD%E5%BA%95.jpg" title="You Are All I Need" w="1920" h="13558" >}}
+
+# Your Call
+
+{{< score src="https://img.yulo.top/sky/Your%20Call_%E7%99%BD%E5%BA%95.jpg" title="Your Call" w="1920" h="12490" >}}
+
 # 《灵感菇》变奏曲
 
 {{< score src="https://img.yulo.top/sky/%E3%80%8A%E7%81%B5%E6%84%9F%E8%8F%87%E3%80%8B%E5%8F%98%E5%A5%8F%E6%9B%B2_%E7%99%BD%E5%BA%95.jpg" title="《灵感菇》变奏曲" w="1920" h="5815" >}}
@@ -193,6 +205,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/%E4%B8%8D%E8%AF%B4%EF%BC%88%E6%97%A7%E7%89%88%EF%BC%89_%E7%99%BD%E5%BA%95.jpg" title="不说（旧版）" w="1920" h="10354" >}}
 
+# 不死鸟
+
+{{< score src="https://img.yulo.top/sky/%E4%B8%8D%E6%AD%BB%E9%B8%9F_%E7%99%BD%E5%BA%95.jpg" title="不死鸟" w="1920" h="16495" >}}
+
 # 不遗憾
 
 {{< score src="https://img.yulo.top/sky/%E4%B8%8D%E9%81%97%E6%86%BE_%E7%99%BD%E5%BA%95.jpg" title="不遗憾" w="1920" h="13291" >}}
@@ -216,6 +232,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 # 倒带
 
 {{< score src="https://img.yulo.top/sky/%E5%80%92%E5%B8%A6_%E7%99%BD%E5%BA%95.jpg" title="倒带" w="1920" h="11086" >}}
+
+# 等你的季节
+
+{{< score src="https://img.yulo.top/sky/%E7%AD%89%E4%BD%A0%E7%9A%84%E5%AD%A3%E8%8A%82_%E7%99%BD%E5%BA%95.jpg" title="等你的季节" w="1920" h="11956" >}}
 
 # 第57次取消发送
 
@@ -361,6 +381,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/%E6%B2%A1%E6%9C%89%E7%90%86%E7%94%B1_%E7%99%BD%E5%BA%95.jpg" title="没有理由" w="1920" h="11947" >}}
 
+# 明知故犯
+
+{{< score src="https://img.yulo.top/sky/%E6%98%8E%E7%9F%A5%E6%95%85%E7%8A%AF_%E7%99%BD%E5%BA%95.jpg" title="明知故犯" w="1920" h="10087" >}}
+
 # 蘑菇浓汤
 
 {{< score src="https://img.yulo.top/sky/%E8%98%91%E8%8F%87%E6%B5%93%E6%B1%A4_%E7%99%BD%E5%BA%95.jpg" title="蘑菇浓汤" w="1920" h="4945" >}}
@@ -368,6 +392,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 # 暮色回响
 
 {{< score src="https://img.yulo.top/sky/%E6%9A%AE%E8%89%B2%E5%9B%9E%E5%93%8D_%E7%99%BD%E5%BA%95.jpg" title="暮色回响" w="1920" h="8485" >}}
+
+# 哪里都是你
+
+{{< score src="https://img.yulo.top/sky/%E5%93%AA%E9%87%8C%E9%83%BD%E6%98%AF%E4%BD%A0_%E7%99%BD%E5%BA%95.jpg" title="哪里都是你" w="1920" h="9949" >}}
 
 # 那时雨
 
@@ -497,6 +525,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/%E7%89%B9%E5%88%AB%E7%9A%84%E4%BA%BA_%E7%99%BD%E5%BA%95.jpg" title="特别的人" w="1920" h="11422" >}}
 
+# 天龙八部之宿敌
+
+{{< score src="https://img.yulo.top/sky/%E5%A4%A9%E9%BE%99%E5%85%AB%E9%83%A8%E4%B9%8B%E5%AE%BF%E6%95%8C_%E7%99%BD%E5%BA%95.jpg" title="天龙八部之宿敌" w="1920" h="8752" >}}
+
 # 跳楼机
 
 {{< score src="https://img.yulo.top/sky/%E8%B7%B3%E6%A5%BC%E6%9C%BA_%E7%99%BD%E5%BA%95.jpg" title="跳楼机" w="1920" h="8683" >}}
@@ -521,6 +553,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 
 {{< score src="https://img.yulo.top/sky/%E7%A8%B3%E7%A8%B3%E7%9A%84%E5%B9%B8%E7%A6%8F_%E7%99%BD%E5%BA%95.jpg" title="稳稳的幸福" w="1920" h="9019" >}}
 
+# 我爱你
+
+{{< score src="https://img.yulo.top/sky/%E6%88%91%E7%88%B1%E4%BD%A0_%E7%99%BD%E5%BA%95.jpg" title="我爱你" w="1920" h="14221" >}}
+
 # 我愛你
 
 {{< score src="https://img.yulo.top/sky/%E6%88%91%E6%84%9B%E4%BD%A0_%E7%99%BD%E5%BA%95.jpg" title="我愛你" w="1920" h="12352" >}}
@@ -532,6 +568,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 # 我好想你
 
 {{< score src="https://img.yulo.top/sky/%E6%88%91%E5%A5%BD%E6%83%B3%E4%BD%A0_%E7%99%BD%E5%BA%95.jpg" title="我好想你" w="1920" h="15427" >}}
+
+# 我好像在哪见过你
+
+{{< score src="https://img.yulo.top/sky/%E6%88%91%E5%A5%BD%E5%83%8F%E5%9C%A8%E5%93%AA%E8%A7%81%E8%BF%87%E4%BD%A0_%E7%99%BD%E5%BA%95.jpg" title="我好像在哪见过你" w="1920" h="11086" >}}
 
 # 我怀念的
 
@@ -556,6 +596,10 @@ summary = '吉他谱存档，共 171 张，图片存在 R2 上。'
 # 小半
 
 {{< score src="https://img.yulo.top/sky/%E5%B0%8F%E5%8D%8A_%E7%99%BD%E5%BA%95.jpg" title="小半" w="1920" h="10621" >}}
+
+# 小跳蛙
+
+{{< score src="https://img.yulo.top/sky/%E5%B0%8F%E8%B7%B3%E8%9B%99_%E7%99%BD%E5%BA%95.jpg" title="小跳蛙" w="1920" h="5014" >}}
 
 # 心做し
 

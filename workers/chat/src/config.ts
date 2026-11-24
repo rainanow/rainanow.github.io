@@ -18,8 +18,13 @@ export const ACCESS_TOKEN_TTL_SECONDS = 1800
 /** refresh token 有效期 7 天（库默认值，写出来是为了让这个决定显式）。 */
 export const REFRESH_TOKEN_TTL_SECONDS = 604800
 
-/** 默认聊天室。表里带 room 列是为了以后能开多房间，现在只用这一个。 */
+/** 没有有效房间名时使用的聊天室。 */
 export const DEFAULT_ROOM = 'general'
+
+export function normalizeRoom(value: string | null | undefined): string {
+  const room = value?.trim() ?? ''
+  return /^[a-z0-9_-]{1,32}$/.test(room) ? room : DEFAULT_ROOM
+}
 
 /**
  * 单条消息最大长度。后端两处（Zod 校验、表约束）都读这个常量。

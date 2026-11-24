@@ -1,10 +1,10 @@
 import { and, asc, desc, eq, lt, sql } from 'drizzle-orm'
 import { HTTPException } from 'hono/http-exception'
+import { bodyLimit } from 'hono/body-limit'
 import type { Context } from 'hono'
 import { z } from 'zod'
 
 import {
-  DEFAULT_ROOM,
   DELETE_ALLOWED_PER_WINDOW,
   DELETE_WINDOW_SECONDS,
   EXPORT_LIMIT,
@@ -15,10 +15,12 @@ import {
   MESSAGE_ALLOWED_PER_WINDOW,
   MESSAGE_WINDOW_SECONDS,
   REFRESH_TOKEN_COOKIE,
+  normalizeRoom,
 } from '../config'
 import { deleteCookie } from 'hono/cookie'
 
 import { scryptHasher } from '../hasher'
+import { ICE_ACCESS_PATH, callRooms, iceRequestSchema, issueIceServers } from '../calls/ice'
 import { extractMediaKeys } from '../media'
 import { refundUpload } from '../quota'
 import { isMuted, mutedRemaining } from '../moderation'
@@ -66,13 +68,6 @@ function requireSubject(c: Context<AppEnv>): string {
     throw new HTTPException(401, { message: '未登录' })
   }
   return sub
-}
-
-/** 聊天室名只允许小写下划线，别的入口一律退回默认房间，避免拿房间名当注入面。 */
-function normalizeRoom(value: string | undefined): string {
-  if (value === undefined) return DEFAULT_ROOM
-  const trimmed = value.trim()
-  return /^[a-z0-9_-]{1,32}$/.test(trimmed) ? trimmed : DEFAULT_ROOM
 }
 
 /**
@@ -144,6 +139,41 @@ async function broadcast(env: Env, room: string, event: ChatServerEvent): Promis
 export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: ChatContext): void {
   /** 存活探针。不带鉴权，用来确认 Worker、路由和 D1 绑定都活着。 */
   app.get('/api/health', (c) => c.json({ ok: true, service: 'yulo-chat' }))
+
+  app.post(
+    '/api/calls/ice-servers',
+    cookieAuthBridge,
+    auth.middleware(),
+    bodyLimit({ maxSize: 2048 }),
+    async (c) => {
+      c.header('Cache-Control', 'no-store')
+      if (!isAllowedOrigin(c.env.ALLOWED_ORIGINS, c.req.header('Origin'))) {
+        return c.json({ error: '来源不被允许' }, 403)
+      }
+      const parsed = iceRequestSchema.safeParse(await c.req.json().catch(() => undefined))
+      if (!parsed.success) return c.json({ error: '无效的通话请求' }, 400)
+      const userId = requireSubject(c)
+      const { room } = parsed.data
+      if (!callRooms(c.env.VIDEO_CALL_ROOMS).has(room)) return c.json({ error: '房间未启用通话' }, 404)
+
+      const limit = await consumeRateLimit(c.env.DB, 'call-ice:' + userId, effectiveLimit(c.env, 12), 60)
+      if (limit.blocked) {
+        c.header('Retry-After', String(limit.retryAfterSeconds))
+        return c.json({ error: '连接请求过于频繁，请稍后再试' }, 429)
+      }
+      const stub = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(room))
+      const access = await stub.fetch('https://chat-room.internal' + ICE_ACCESS_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...parsed.data, userId }),
+      })
+      if (access.status !== 204) return c.json({ error: '通话连接已失效' }, 403)
+      const configuration = await issueIceServers(c.env, userId)
+      return configuration === undefined
+        ? c.json({ error: '暂时无法获取音视频连接配置，请稍后重试' }, 503)
+        : c.json(configuration)
+    },
+  )
 
   app.get('/api/me', cookieAuthBridge, auth.middleware(), async (c) => {
     const user = await User.findOne(requireSubject(c))
@@ -853,7 +883,7 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       return c.json({ error: '来源不被允许' }, 403)
     }
 
-    const room = normalizeRoom(c.req.query('room'))
+    const room = normalizeRoom(new URL(c.req.url).searchParams.get('room'))
 
     // 禁言的人不许连 WebSocket。
     //

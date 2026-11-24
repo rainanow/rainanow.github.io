@@ -2,8 +2,20 @@
 export interface Env {
   /** D1：账号、消息、吊销名单、限流计数 */
   DB: D1Database
-  /** 每个聊天室一个实例的 Durable Object（只做 WebSocket 广播） */
+  /** 每个聊天室一个实例，管理 WebSocket、在线状态和视频信令。 */
   CHAT_ROOM: DurableObjectNamespace
+  /** 启用视频信令的房间名，逗号分隔。未配置时关闭。 */
+  VIDEO_CALL_ROOMS?: string
+  /** 中继供应商。默认 coturn，也可设为 cloudflare。 */
+  RTC_TURN_PROVIDER?: string
+  /** coturn 模式使用的 STUN 和 TURN URL，分别以逗号分隔。 */
+  RTC_STUN_URLS?: string
+  RTC_TURN_URLS?: string
+  /** coturn 的临时凭证签名密钥。通过 Worker Secret 注入。 */
+  RTC_TURN_SECRET?: string
+  /** Cloudflare Realtime TURN Key ID 和运行时签发凭证专用的 Worker Secret。 */
+  RTC_CLOUDFLARE_TURN_KEY_ID?: string
+  RTC_CLOUDFLARE_TURN_TOKEN?: string
   /** 聊天室上传的图片和文档（R2 对象存储） */
   MEDIA: R2Bucket
   /** HS256 签名密钥，至少 32 字符。用 `wrangler secret put AUTH_SECRET` 注入，不要写进仓库。 */

@@ -7,6 +7,8 @@
   // WebCrypto 的 PBKDF2 要 40ms，超过免费套餐 10ms 的 CPU 上限）。
   // node:crypto 需要这个 flag。免费套餐同样支持 nodejs_compat。
   "compatibility_flags": ["nodejs_compat"],
+  // 房间开关和 TURN Key ID 按部署环境设置，后续部署保留控制台中的变量。
+  "keep_vars": true,
 
   // 自定义域：绑定后 api.yulo.top 与站点 yulo.top 属于同一个可注册域，
   // 于是 HttpOnly Cookie 是「同站」的，SameSite=Lax 就能正常工作，
