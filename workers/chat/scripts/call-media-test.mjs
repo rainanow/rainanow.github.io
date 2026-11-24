@@ -117,6 +117,8 @@ function fixture(user, options) {
     }
   }
   window.MediaStream = rtc.MediaStream
+  // The fetch bridge below expects Node's AbortSignal.
+  window.AbortController = AbortController
 
   function captureTrack(source, feed, spacing) {
     const track = source.createTrack()

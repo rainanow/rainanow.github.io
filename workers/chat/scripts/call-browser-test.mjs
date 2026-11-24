@@ -56,6 +56,14 @@ async function createUser() {
 function observeBrowser({ relay, cameraFacings = [] }) {
   const audit = { pcs: [], sockets: [], tracks: [], signals: [], quality: [], readyMessages: new Map(), denyNext: false }
   window.callTest = audit
+  const watchDevices = navigator.mediaDevices.addEventListener.bind(navigator.mediaDevices)
+  navigator.mediaDevices.addEventListener = (type, listener, options) => {
+    if (type === 'devicechange' && audit.rejectDeviceEvents) {
+      audit.deviceEventsRejected = true
+      throw new DOMException('Test unavailable device event', 'NotSupportedError')
+    }
+    return watchDevices(type, listener, options)
+  }
   const applyConstraints = MediaStreamTrack.prototype.applyConstraints
   MediaStreamTrack.prototype.applyConstraints = async function (requested) {
     const change = { requested }
@@ -269,8 +277,19 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   await invitation(viewer.page, alice.username).waitFor({ state: 'hidden' })
   await released(a.page)
   await delay(4100)
+  let iceReplies = 0
+  await b.page.route(api + '/api/calls/ice-servers', async (route) => {
+    const response = await route.fetch()
+    assert.equal(response.status(), 200)
+    iceReplies++
+    if (iceReplies === 1) await route.abort('connectionreset')
+    else await route.fulfill({ response })
+  })
   await invite(a.page)
-  await b.page.evaluate(() => { window.callTest.blockRemotePlayback = true })
+  await b.page.evaluate(() => {
+    window.callTest.blockRemotePlayback = true
+    window.callTest.rejectDeviceEvents = true
+  })
   await join(b.page, alice.username)
   await Promise.all([callPanel(a.page, 'active').waitFor(), callPanel(b.page, 'active').waitFor()])
   await b.page.locator('[data-chat-notice]').waitFor({ state: 'hidden' })
@@ -279,6 +298,9 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   await showControls(b.page)
   await b.page.locator('[data-call-play-hint]').waitFor({ state: 'hidden' })
   await Promise.all([mediaStats(a.page, false), mediaStats(b.page, false)])
+  assert.equal(iceReplies, 2, 'ICE 响应丢失后重试一次')
+  assert.equal(await b.page.evaluate(() => window.callTest.deviceEventsRejected), true,
+    '浏览器拒绝监听设备变化时仍能建立通话')
   const activeStrip = viewer.page.locator('[data-chat-active-calls]')
   await activeStrip.filter({ hasText: alice.username + '、' + bob.username + '正在视频通话' }).waitFor()
   assert.equal(await invitation(viewer.page, alice.username).getByRole('button', { name: '加入通话' }).count(), 0)

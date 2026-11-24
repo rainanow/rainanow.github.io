@@ -31,6 +31,8 @@
   const defaultBitrateMbps = 2
   const foregroundDelay = 900
   const cameraRetryDelay = 400
+  const iceRequestTimeout = 8000
+  const retryableIceErrors = new Set(['TypeError', 'NetworkError', 'AbortError', 'TimeoutError'])
   const displayChannelLabel = 'chat-call-display-v1'
   const cameraNames = { user: '前摄', environment: '后摄' }
 
@@ -412,6 +414,7 @@
       if (current.phase === 'inviting') remember(discardedInvites, current.requestId)
       if (current.phase === 'accepting' || current.phase === 'joining') remember(discardedAccepts, current.id)
       call = null
+      current.iceRequest?.abort()
       clearTimeout(current.deadline)
       clearTimeout(current.mediaTimer)
       clearTimeout(current.reconnectTimer)
@@ -577,21 +580,43 @@
       }
     }
 
+    async function requestIce(current) {
+      for (let attempt = 0; attempt < 2 && call === current; attempt++) {
+        const controller = new AbortController()
+        current.iceRequest = controller
+        const timeout = setTimeout(() => controller.abort(), iceRequestTimeout)
+        try {
+          const response = await options.api('/api/calls/ice-servers', {
+            method: 'POST', signal: controller.signal,
+            body: { room: options.room, callId: current.id, resumeToken: current.resumeToken },
+          })
+          const config = await response.json().catch((error) => {
+            if (error?.name === 'SyntaxError') return null
+            throw error
+          })
+          if (response.ok && Array.isArray(config?.iceServers)) return { iceServers: config.iceServers }
+          return { error: typeof config?.error === 'string' && config.error || '无法获取音视频连接配置' }
+        } catch (error) {
+          if (call !== current) return null
+          if (attempt === 1 || !retryableIceErrors.has(error?.name)) throw error
+        } finally {
+          clearTimeout(timeout)
+          current.iceRequest = null
+        }
+      }
+      return null
+    }
+
     async function connectMedia(current) {
+      let stage = '获取连接配置'
       try {
         const stream = await current.media
         if (call !== current) return
         if (!stream) return failMedia(current, current.captureError, 'device-error')
-        const response = await options.api('/api/calls/ice-servers', {
-          method: 'POST',
-          body: { room: options.room, callId: current.id, resumeToken: current.resumeToken }
-        })
-        if (call !== current) return
-        const config = await response.json().catch(() => ({}))
-        if (call !== current) return
-        if (!response.ok || !Array.isArray(config.iceServers)) {
-          return failMedia(current, config.error || '无法获取音视频连接配置')
-        }
+        const config = await requestIce(current)
+        if (call !== current || !config) return
+        if (config.error) return failMedia(current, config.error)
+        stage = '初始化浏览器连接'
         const pc = new RTCPeerConnection({ iceServers: config.iceServers })
         current.pc = pc
         const remote = new MediaStream()
@@ -607,28 +632,30 @@
           }
         }
         pc.onconnectionstatechange = () => connectionChanged(current)
+        stage = '添加音视频轨道'
         let audioSender
         for (const track of stream.getTracks()) {
           const sender = pc.addTrack(track, stream)
           if (track.kind === 'video') current.videoSender = sender
           else if (track.kind === 'audio') audioSender = sender
         }
-        audio.start(stream, audioSender)
+        try { audio.start(stream, audioSender) } catch { /* Device controls are optional to the call. */ }
         // Include the display channel in the first offer, before signaling starts.
-        if (current.role === 'caller') {
-          try {
+        try {
+          if (current.role === 'caller') {
             const channel = pc.createDataChannel?.(displayChannelLabel, { ordered: true })
             if (channel) bindDisplayChannel(current, channel)
-          } catch { /* Older clients can still use the audio and video session. */ }
-        } else {
-          pc.ondatachannel = ({ channel }) => bindDisplayChannel(current, channel)
-        }
+          } else {
+            pc.ondatachannel = ({ channel }) => bindDisplayChannel(current, channel)
+          }
+        } catch { /* The display channel is optional to the call. */ }
         if (!send('media-ready', { callId: current.id })) {
           return failMedia(current, endText.disconnected)
         }
         render()
-      } catch {
-        failMedia(current, '无法建立音视频连接，请重试')
+      } catch (error) {
+        const errorName = /^[A-Za-z]{1,32}$/.test(error?.name) ? ` · ${error.name}` : ''
+        failMedia(current, `无法建立音视频连接（${stage}${errorName}），请重试`)
       }
     }
 

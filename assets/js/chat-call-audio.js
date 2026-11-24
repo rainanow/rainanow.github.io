@@ -206,7 +206,7 @@
       const state = current
       if (!state) return
       current = null
-      devices.removeEventListener?.('devicechange', devicesChanged)
+      if (state.watchingDevices) devices.removeEventListener('devicechange', devicesChanged)
       state.track?.removeEventListener?.('ended', refresh)
       state.pendingTrack?.stop()
       state.pendingTrack = null
@@ -222,9 +222,14 @@
       current = state
       ui.remote.muted = false
       track?.addEventListener?.('ended', refresh)
-      devices.addEventListener?.('devicechange', devicesChanged)
       renderToggles(state)
       renderDevices(state)
+      if (typeof devices.addEventListener === 'function') {
+        try {
+          devices.addEventListener('devicechange', devicesChanged)
+          state.watchingDevices = true
+        } catch { /* Device refresh is also available when opening the panel. */ }
+      }
       void refresh()
     }
 
