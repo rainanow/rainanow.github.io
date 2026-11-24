@@ -18,7 +18,7 @@ import { JSDOM } from 'jsdom'
 import { WebSocket as NodeWebSocket } from 'ws'
 
 const WORKER = process.env.CHAT_BASE_URL ?? 'http://127.0.0.1:8787'
-const SITE_ORIGIN = 'https://yulo.top'
+const SITE_ORIGIN = process.env.CHAT_SITE_ORIGIN ?? 'https://yulo.top'
 const PAGE_PATH = process.env.CHAT_PAGE ?? '../../../public/chat/index.html'
 
 let passed = 0
@@ -124,17 +124,46 @@ window.fetch = async (input, init = {}) => {
   return response
 }
 
+let chatSocket
 class CookieWebSocket extends NodeWebSocket {
   constructor(url) {
     const headers = { Origin: SITE_ORIGIN }
     const cookie = jarHeader()
     if (cookie !== '') headers.Cookie = cookie
     super(url, { headers })
+    chatSocket = this
   }
 }
 // CONNECTING / OPEN / CLOSING / CLOSED 是 ws 上的静态属性，子类会直接继承，
 // 不需要（也不能）再赋值一次。
 window.WebSocket = CookieWebSocket
+
+// 媒体本身由 call-media-test 覆盖。这里隔离验证聊天室怎样显示和分派邀请。
+const callActions = { invites: 0, joined: [], foregrounds: 0 }
+window.createYuloCallController = (_, { availabilityChanged }) => {
+  let available = false
+  const setAvailable = (value) => {
+    available = value
+    availabilityChanged()
+  }
+  return {
+    canInvite: () => available,
+    ready: () => setAvailable(true),
+    disconnected: () => setAvailable(false),
+    leave: () => setAvailable(false),
+    inviteRoom: () => { callActions.invites += 1 },
+    joinRoomCall: (call) => callActions.joined.push(call.callId),
+    foreground: () => { callActions.foregrounds += 1 },
+    handle() {},
+    addMessage() {},
+    removeMessage() {},
+    clearMessages() {},
+  }
+}
+
+function emitChat(event) {
+  chatSocket.emit('message', JSON.stringify(event), false)
+}
 
 const errors = []
 window.addEventListener('error', (event) => errors.push(String(event.message)))
@@ -223,6 +252,35 @@ try {
   await waitFor('WebSocket 连上', () => ($('[data-chat-status]')?.textContent ?? '').includes('在线'), 15000)
   check('WebSocket 已连接并显示在线人数', ($('[data-chat-status]')?.textContent ?? '').includes('在线'))
   check('历史加载没有报错', $('[data-chat-notice]')?.hidden === true)
+
+  section('公开通话邀请')
+  const inviteButton = $('[data-chat-call-invite]')
+  check('上传按钮上方有视频邀请图标', visible('[data-chat-call-invite]') && inviteButton?.querySelector('svg') !== null)
+  inviteButton.click()
+  check('点视频图标发出公开邀请', callActions.invites === 1)
+  const caller = { userId: 'test-caller', username: '<b>邀请者</b>' }
+  const invitation = { callId: 'test-call', caller, phase: 'ringing', publicInvite: true, createdAt: Date.now() }
+  const emitCalls = (...calls) => emitChat({ type: 'call-room', calls })
+  emitCalls(invitation)
+  check('待接听邀请出现在聊天框，名字按文本显示', visible('[data-chat-call-cards]') &&
+    $('.chat__call-card-title')?.textContent === '<b>邀请者</b> 发起了视频通话' && $('.chat__call-card-title b') === null)
+  $('.chat__call-card-action')?.click()
+  check('卡片按钮按邀请 ID 加入', callActions.joined.join(',') === invitation.callId)
+
+  const profileResponse = await window.fetch(`${WORKER}/api/me`, { credentials: 'include' })
+  const profile = await profileResponse.json()
+  emitCalls({ ...invitation, caller: { userId: profile.id, username } })
+  check('自己只能看到邀请的等待状态', $('.chat__call-card-status')?.textContent === '等待成员加入' && $('.chat__call-card-action') === null)
+  const callee = { userId: 'test-callee', username: '接听者' }
+  emitCalls({ ...invitation, phase: 'connecting', callee })
+  check('被接听的邀请关闭加入按钮', $('.chat__call-card-status')?.textContent === '正在连接' && $('.chat__call-card-action') === null)
+  emitCalls({ ...invitation, phase: 'active', callee })
+  check('接通后状态栏显示两位参与者', visible('[data-chat-active-calls]') &&
+    $('[data-chat-active-calls]')?.textContent === '<b>邀请者</b>、接听者正在视频通话')
+  emitCalls()
+  check('通话结束后移除卡片和状态', !visible('[data-chat-call-cards]') && !visible('[data-chat-active-calls]'))
+  document.dispatchEvent(new window.Event('visibilitychange'))
+  check('回到前台通知通话控制器恢复媒体', callActions.foregrounds === 1)
 
   // --- 发消息（验证去重：HTTP 响应 + WebSocket 广播是同一份） ---
   section('发消息与去重')
@@ -388,6 +446,19 @@ try {
     '系统提示用 textContent 写入（不碰 innerHTML）',
     systemRenderer.includes('textContent') && !systemRenderer.includes('innerHTML'),
   )
+
+  const presenceTime = Date.now()
+  const emitSystem = (id, body, createdAt) => emitChat({ type: 'message', message: { id, body, kind: 'system', createdAt } })
+  emitSystem('presence-a', '回归成员 加入了房间', presenceTime)
+  emitSystem('presence-z', '回归成员 离开了房间', presenceTime)
+  emitSystem('presence-late', '回归成员 加入了房间', presenceTime - 1)
+  emitSystem('presence-other', '另一成员 加入了房间', presenceTime)
+  emitSystem('presence-undo', '回归成员 撤回了一条消息', presenceTime)
+  const notices = [...document.querySelectorAll('.chat__system-text')].map((element) => element.textContent)
+  check('同一成员只保留最新进出提示，旧消息乱序到达也不覆盖', notices.includes('回归成员 离开了房间') &&
+    !notices.includes('回归成员 加入了房间'))
+  check('保留其他成员的进出提示及撤回提示', notices.includes('另一成员 加入了房间') &&
+    notices.includes('回归成员 撤回了一条消息'))
 
   /*
    * --- 消息区 / 输入框的面板色 ---
@@ -1168,6 +1239,24 @@ try {
   check('退出后「登录」tab 回来了', $('[data-chat-login-tab]').hidden === false)
   check('退出后「注册」tab 回来了', $('[data-chat-register-tab]').hidden === false)
   check('退出后「修改密码」tab 收起来了', $('[data-chat-password-tab]').hidden === true)
+
+  section('换设备登录后原页面退回登录面板')
+  $('[data-chat-username]').value = username
+  $('[data-chat-password]').value = password
+  submitForm('[data-chat-form]')
+  await waitFor('原设备重新连接', () => ($('[data-chat-status]')?.textContent ?? '').includes('在线'), 15000)
+  emitCalls({ ...invitation, phase: 'active', callee })
+  check('替换前页面仍显示通话信息', visible('[data-chat-active-calls]') && visible('[data-chat-call-cards]'))
+
+  const replacement = await fetch(`${WORKER}/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: SITE_ORIGIN },
+    body: JSON.stringify({ username, password }),
+  })
+  check('新设备使用独立会话登录成功', replacement.ok, `HTTP ${replacement.status}`)
+  await replacement.text()
+  await waitFor('原设备登录态已退出', () => visible('[data-chat-auth]'))
+  check('原设备收到会话失效提示', $('[data-chat-notice]')?.textContent === '登录会话已失效，请重新登录')
+  check('原设备下线后清空通话卡片和状态栏', !visible('[data-chat-call-cards]') && !visible('[data-chat-active-calls]'))
 
   section('运行期错误')
   check('没有未捕获的 JS 错误', errors.length === 0, errors.join(' | '))

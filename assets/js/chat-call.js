@@ -19,7 +19,60 @@
     unavailable: '对方暂时无法接听',
     'rate-limited': '呼叫过于频繁，请稍后再试',
     disabled: endText.disabled,
-    ended: endText.hangup
+    ended: endText.hangup,
+    'invalid-state': '这条邀请已有人加入或已结束',
+  }
+
+  const resolutions = new Map([['1080p', 1080], ['720p', 720], ['480p', 480]])
+  const aspectRatios = new Map([['16:9', 16 / 9], ['4:3', 4 / 3]])
+  const defaultQuality = { resolution: '720p', ratio: '16:9' }
+  const minBitrateMbps = 1
+  const maxBitrateMbps = 5
+  const defaultBitrateMbps = 2
+  const foregroundDelay = 900
+  const cameraRetryDelay = 400
+
+  function cameraConstraints(current) {
+    const height = resolutions.get(current.quality.resolution)
+    const ratio = aspectRatios.get(current.quality.ratio)
+    // Request even landscape dimensions. The camera can report them rotated.
+    const constraints = {
+      facingMode: { ideal: current.facing },
+      width: { ideal: Math.round(height * ratio / 2) * 2 },
+      height: { ideal: height },
+      aspectRatio: { ideal: ratio },
+    }
+    if (navigator.mediaDevices.getSupportedConstraints?.()?.resizeMode) {
+      constraints.resizeMode = { ideal: 'crop-and-scale' }
+    }
+    return constraints
+  }
+
+  function supportsBitrate(sender) {
+    return typeof sender?.getParameters === 'function' && typeof sender.setParameters === 'function'
+  }
+
+  async function applyBitrate(sender, mbps) {
+    try {
+      const parameters = sender.getParameters()
+      const encoding = parameters.encodings?.[0]
+      if (!encoding) return false
+      const maxBitrate = mbps * 1_000_000
+      encoding.maxBitrate = maxBitrate
+      await sender.setParameters(parameters)
+      return sender.getParameters().encodings?.[0]?.maxBitrate === maxBitrate
+    } catch {
+      return false
+    }
+  }
+
+  function videoFrames(video) {
+    const frames = video.getVideoPlaybackQuality?.().totalVideoFrames
+    return Number.isFinite(frames) ? frames : null
+  }
+
+  function videoStalled(video, track, frames) {
+    return track.readyState !== 'live' || track.muted || frames === null || videoFrames(video) <= frames
   }
 
   function stopTracks(stream) {
@@ -40,11 +93,13 @@
 
     const layout = window.createYuloCallLayout(panel)
     const control = (name) => panel.querySelector('[data-call-' + name + ']')
+    const qualityOptions = panel.querySelectorAll('[data-call-resolution], [data-call-ratio]')
     const ui = {
       peer: control('peer'), status: control('status'), stage: control('stage'),
       local: control('local'), remote: control('remote'), accept: control('accept'),
       hangup: control('hangup'), mic: control('mic'), camera: control('camera'),
       main: control('main'), playHint: control('play-hint'),
+      bitrate: control('bitrate'),
     }
     let available = false
     let call = null
@@ -62,10 +117,11 @@
       options.availabilityChanged()
     }
 
-    function state(peer, phase, id = null) {
+    function state(peer, phase, id = null, publicInvite = false) {
       return {
-        peer, phase, id, signalQueue: Promise.resolve(), earlyIce: [],
+        peer, phase, id, publicInvite, signalQueue: Promise.resolve(), earlyIce: [],
         facing: 'user', lastStatus: Date.now(), renewAfter: 0,
+        cameraEnabled: true, quality: defaultQuality,
       }
     }
 
@@ -86,13 +142,14 @@
         return
       }
       panel.dataset.phase = call.phase
-      ui.peer.textContent = call.peer.username
+      ui.peer.textContent = call.peer?.username ?? '视频邀请'
       const labels = {
         preparing: '正在打开摄像头和麦克风…',
-        inviting: '正在发起呼叫…',
-        outgoing: '正在等待对方接听…',
+        inviting: call.publicInvite ? '正在发送视频邀请…' : '正在发起呼叫…',
+        outgoing: call.publicInvite ? '等待房间成员加入…' : '正在等待对方接听…',
         incoming: '视频来电',
         accepting: '正在接听…',
+        joining: '正在加入通话…',
         connecting: '正在连接音视频…',
         active: '通话中',
       }
@@ -117,7 +174,50 @@
       ui.camera.disabled = !!call.changingCamera
       ui.camera.title = videoOn ? '关闭摄像头' : '开启摄像头'
       ui.camera.setAttribute('aria-pressed', String(!videoOn))
+      renderQuality(call)
       layout.update(inMedia, call.phase === 'active')
+    }
+
+    function renderQuality(current) {
+      for (const button of qualityOptions) {
+        const { callResolution, callRatio } = button.dataset
+        const selected = callResolution === current.quality.resolution || callRatio === current.quality.ratio
+        button.setAttribute('aria-pressed', String(selected))
+        button.setAttribute('aria-disabled', String(!!current.changingCamera))
+      }
+      renderBitrate(current)
+    }
+
+    function renderBitrate(current) {
+      const mbps = current.bitrateMbps
+      const value = mbps === undefined ? '—' : `${mbps}M`
+      if (ui.bitrate.textContent !== value) {
+        ui.bitrate.textContent = value
+        ui.bitrate.setAttribute('aria-label', mbps === undefined ? '切换视频发送码率上限'
+          : `视频发送码率上限 ${mbps} Mbps，点按切换`)
+      }
+      const disabled = !supportsBitrate(current.videoSender) || !!current.bitrateUpdate || !!current.changingCamera
+      ui.bitrate.setAttribute('aria-disabled', String(disabled))
+    }
+
+    async function setBitrate(current, mbps, manual = false) {
+      if (current.bitrateUpdate || !supportsBitrate(current.videoSender)) return
+      current.bitrateUpdate = applyBitrate(current.videoSender, mbps)
+      renderBitrate(current)
+      const applied = await current.bitrateUpdate
+      current.bitrateUpdate = null
+      if (call !== current) return
+      if (applied) current.bitrateMbps = mbps
+      else if (manual) options.notice('无法调整视频发送码率', 'error')
+      renderBitrate(current)
+    }
+
+    function cycleBitrate() {
+      const current = call
+      if (current?.phase !== 'active' || current.changingCamera) return
+      const mbps = current.bitrateMbps ?? (defaultBitrateMbps - 1)
+      const next = mbps === maxBitrateMbps ? minBitrateMbps : mbps + 1
+      void setBitrate(current, next, true)
     }
 
     function remember(set, key) {
@@ -130,11 +230,12 @@
       if (call !== current) return
       // 撤销拨号和接听的响应可能在界面关闭后才到，收到后补发结束信令。
       if (current.phase === 'inviting') remember(discardedInvites, current.requestId)
-      if (current.phase === 'accepting') remember(discardedAccepts, current.id)
+      if (current.phase === 'accepting' || current.phase === 'joining') remember(discardedAccepts, current.id)
       call = null
       clearTimeout(current.deadline)
       clearTimeout(current.mediaTimer)
       clearTimeout(current.reconnectTimer)
+      clearTimeout(current.foregroundTimer)
       clearInterval(current.monitor)
       if (current.pc) current.pc.close()
       stopTracks(current.local)
@@ -147,7 +248,7 @@
     function endCurrent(message) {
       const current = call
       if (!current) return
-      if (current.id) {
+      if (current.id && current.phase !== 'joining') {
         const action = current.phase === 'incoming' || current.phase === 'accepting' ? 'reject'
           : current.phase === 'outgoing' ? 'cancel' : 'hangup'
         send(action, { callId: current.id })
@@ -166,14 +267,14 @@
     async function capture(current) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true, video: { facingMode: { ideal: 'user' } },
+          audio: true, video: cameraConstraints(current),
         })
         if (call !== current) {
           stopTracks(stream)
           return null
         }
         current.local = stream
-        current.facing = stream.getVideoTracks()[0]?.getSettings().facingMode ?? 'user'
+        current.facing = stream.getVideoTracks()[0]?.getSettings?.()?.facingMode ?? current.facing
         ui.local.srcObject = stream
         render()
         return stream
@@ -183,24 +284,50 @@
       }
     }
 
-    async function invite(member) {
-      if (!available) return
-      if (call) return options.notice('请先结束当前通话')
-      const current = state({ userId: member.id, username: member.username }, 'preparing')
+    function beginCall(peer, phase, id, publicInvite) {
+      if (!available) return null
+      if (call) {
+        options.notice('请先结束当前通话')
+        return null
+      }
+      const current = state(peer, phase, id, publicInvite)
       options.notice('')
       call = current
       render()
-      current.media = capture(current)
-      const stream = await current.media
-      if (call !== current) return
-      if (!stream) return finish(current, current.captureError, 'error')
+      return current
+    }
+
+    function sendInvite(current, action, fields = {}) {
       current.requestId = crypto.randomUUID()
       current.phase = 'inviting'
-      if (!send('invite', { userId: member.id, requestId: current.requestId })) {
+      if (!send(action, { ...fields, requestId: current.requestId })) {
         return finish(current, '连接已断开，请稍后重拨', 'error')
       }
       deadline(current, Date.now() + 8000, '呼叫未得到响应，请重试', 9000)
       render()
+    }
+
+    async function invite(member) {
+      const current = beginCall({ userId: member.id, username: member.username }, 'preparing')
+      if (!current) return
+      current.media = capture(current)
+      const stream = await current.media
+      if (call !== current) return
+      if (!stream) return finish(current, current.captureError, 'error')
+      sendInvite(current, 'invite', { userId: member.id })
+    }
+
+    function inviteRoom() {
+      const current = beginCall(null, 'inviting', null, true)
+      if (current) sendInvite(current, 'invite-room')
+    }
+
+    function joinRoomCall(card) {
+      if (!card?.publicInvite || card.phase !== 'ringing') return
+      const current = beginCall(card.caller, 'joining', card.callId, true)
+      if (!current) return
+      if (!send('join', { callId: current.id })) return finish(current, endText.disconnected, 'error')
+      deadline(current, Date.now() + 8000, '加入通话未得到响应，请重试', 9000)
     }
 
     function accept() {
@@ -218,13 +345,21 @@
       finish(current, text, 'error')
     }
 
-    function playRemote(current) {
+    async function playLocal(current) {
+      if (call !== current || !current.cameraEnabled) return
+      try { await ui.local.play() } catch { /* The preview might still be waiting for video. */ }
+    }
+
+    async function playRemote(current) {
       if (!current?.pc || call !== current) return
-      ui.remote.play().then(() => {
-        if (call === current) setPlaybackBlocked(false)
-      }).catch(() => {
-        if (call === current) setPlaybackBlocked(true)
-      })
+      const attempt = (current.playAttempt ?? 0) + 1
+      current.playAttempt = attempt
+      try {
+        await ui.remote.play()
+        if (call === current && current.playAttempt === attempt) setPlaybackBlocked(false)
+      } catch {
+        if (call === current && current.playAttempt === attempt) setPlaybackBlocked(true)
+      }
     }
 
     function reportConnected(current) {
@@ -247,7 +382,13 @@
       } else if (status === 'disconnected' && current.mediaTimer === undefined) {
         current.mediaInterrupted = true
         render()
-        current.mediaTimer = setTimeout(() => failMedia(current, endText['media-error']), 10_000)
+        if (document.visibilityState === 'hidden') return
+        current.mediaTimer = setTimeout(() => {
+          current.mediaTimer = undefined
+          if (document.visibilityState !== 'hidden' && current.pc.connectionState === 'disconnected') {
+            failMedia(current, endText['media-error'])
+          }
+        }, 10_000)
       }
     }
 
@@ -356,6 +497,41 @@
       }
     }
 
+    function foreground() {
+      check()
+      const current = call
+      if (current?.phase !== 'active' || document.visibilityState === 'hidden') return
+      if (current.pc.connectionState === 'disconnected') {
+        clearTimeout(current.mediaTimer)
+        current.mediaTimer = undefined
+        connectionChanged(current)
+      }
+      const localTrack = current.local.getVideoTracks()[0]
+      const remoteStream = ui.remote.srcObject
+      const remoteTrack = remoteStream?.getVideoTracks()[0]
+      const localFrames = videoFrames(ui.local)
+      const remoteFrames = videoFrames(ui.remote)
+      void playLocal(current)
+      void playRemote(current)
+
+      // Some WebViews resume playback without unfreezing the camera. Wait for frames
+      // before replacing the sender's video track, and leave the audio track untouched.
+      clearTimeout(current.foregroundTimer)
+      current.foregroundTimer = setTimeout(() => {
+        if (call !== current || document.visibilityState === 'hidden') return
+        if (remoteTrack?.readyState === 'live' && ui.remote.srcObject === remoteStream &&
+            videoStalled(ui.remote, remoteTrack, remoteFrames)) {
+          ui.remote.srcObject = null
+          ui.remote.srcObject = remoteStream
+          void playRemote(current)
+        }
+        if (current.cameraEnabled && current.local.getVideoTracks()[0] === localTrack &&
+            (!localTrack || videoStalled(ui.local, localTrack, localFrames))) {
+          void changeCamera(current, true, true)
+        }
+      }, foregroundDelay)
+    }
+
     function disconnected() {
       setAvailable(false)
       accessExpiresAt = 0
@@ -404,12 +580,12 @@
         } else if (current?.phase === 'inviting' && current.requestId === event.requestId) {
           current.id = event.callId
           current.phase = 'outgoing'
-          deadline(current, event.expiresAt, endText['no-answer'], 31_000)
+          deadline(current, event.expiresAt, current.publicInvite ? '视频邀请已过期' : endText['no-answer'], 31_000)
           render()
         }
         return
       }
-      if (event.action === 'accepted' && discardedAccepts.delete(event.callId)) {
+      if (event.action === 'accepted' && discardedAccepts.delete(event.callId) && current?.id !== event.callId) {
         send('hangup', { callId: event.callId })
         return
       }
@@ -424,10 +600,13 @@
       if (!current || current.id !== event.callId) return
       switch (event.action) {
         case 'accepted':
+          if (current.phase === 'connecting' || current.phase === 'active') break
+          if (event.peer) current.peer = event.peer
           current.phase = 'connecting'
           current.role = event.role
           current.resumeToken = event.resumeToken
           deadline(current, event.expiresAt, endText['connection-timeout'], 46_000)
+          current.media ??= capture(current)
           render()
           connectMedia(current)
           break
@@ -441,47 +620,103 @@
           clearInterval(current.monitor)
           current.monitor = setInterval(check, 5000)
           render()
+          // Some browsers expose a writable encoding only after offer/answer.
+          if (current.bitrateMbps === undefined) void setBitrate(current, defaultBitrateMbps)
           break
         case 'status':
         case 'resumed':
           status(event)
           break
         case 'ended':
-          finish(current, endText[event.reason] || endText.hangup)
+          finish(current, current.publicInvite && event.reason === 'no-answer' ? '视频邀请已过期'
+            : endText[event.reason] || endText.hangup)
           break
       }
     }
 
-    async function toggleCamera() {
-      const current = call
-      if (!current?.videoSender || current.changingCamera) return
+    async function captureVideo(current, recovering) {
+      if (recovering && document.visibilityState === 'hidden') return null
+      const constraints = { audio: false, video: cameraConstraints(current) }
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints)
+      } catch (error) {
+        if (!recovering || error?.name !== 'NotReadableError') throw error
+        // Android can still hold the old camera briefly after the tab becomes visible.
+        await new Promise((resolve) => setTimeout(resolve, cameraRetryDelay))
+        if (call !== current || document.visibilityState === 'hidden') return null
+        return navigator.mediaDevices.getUserMedia(constraints)
+      }
+    }
+
+    async function changeCamera(current, enabled, recovering = false) {
+      if (call !== current || !current?.videoSender || current.changingCamera) return
       current.changingCamera = true
-      ui.camera.disabled = true
+      current.cameraEnabled = enabled
+      render()
       const track = current.local.getVideoTracks()[0]
       let replacement = null
       try {
+        if (current.bitrateUpdate) await current.bitrateUpdate
+        if (call !== current) return
         if (track) {
           current.local.removeTrack(track)
           track.stop()
           await current.videoSender.replaceTrack(null)
-          return
         }
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: false, video: { facingMode: { ideal: current.facing } },
-        })
+        if (!enabled || call !== current) return
+        const stream = await captureVideo(current, recovering)
+        if (!stream) return
         replacement = stream.getVideoTracks()[0]
-        if (!replacement) return
-        if (call !== current) return
+        if (!replacement) throw new Error('Missing camera track')
+        if (call !== current || (recovering && document.visibilityState === 'hidden')) return
         await current.videoSender.replaceTrack(replacement)
-        if (call === current) {
-          current.local.addTrack(replacement)
-          current.facing = replacement.getSettings().facingMode ?? current.facing
-          replacement = null
-        }
+        if (call !== current) return
+        current.local.addTrack(replacement)
+        current.facing = replacement.getSettings?.()?.facingMode ?? current.facing
+        replacement = null
+        ui.local.srcObject = null
+        ui.local.srcObject = current.local
+        void playLocal(current)
       } catch {
-        if (call === current) options.notice(track ? '无法关闭摄像头' : '无法开启摄像头', 'error')
+        current.cameraEnabled = false
+        if (call === current) {
+          const failure = recovering ? '无法恢复摄像头，请重新开启' : enabled ? '无法开启摄像头' : '无法关闭摄像头'
+          options.notice(failure, 'error')
+        }
       } finally {
         replacement?.stop()
+        current.changingCamera = false
+        if (call === current) render()
+      }
+    }
+
+    function toggleCamera() {
+      const current = call
+      if (!current?.videoSender || current.changingCamera) return
+      const enabled = !current.local.getVideoTracks().some((track) => track.readyState === 'live')
+      void changeCamera(current, enabled)
+    }
+
+    async function changeQuality(event) {
+      const current = call
+      if (current?.phase !== 'active' || current.changingCamera) return
+      const previous = current.quality
+      const { callResolution, callRatio } = event.currentTarget.dataset
+      const next = { resolution: callResolution ?? previous.resolution, ratio: callRatio ?? previous.ratio }
+      if (!resolutions.has(next.resolution) || !aspectRatios.has(next.ratio)) return
+      if (next.resolution === previous.resolution && next.ratio === previous.ratio) return
+
+      current.quality = next
+      const track = current.local.getVideoTracks()[0]
+      if (!current.cameraEnabled || track?.readyState !== 'live') return renderQuality(current)
+
+      current.changingCamera = true
+      render()
+      try {
+        await track.applyConstraints(cameraConstraints(current))
+      } catch {
+        current.quality = previous
+      } finally {
         current.changingCamera = false
         if (call === current) render()
       }
@@ -499,6 +734,8 @@
       render()
     })
     ui.camera.addEventListener('click', toggleCamera)
+    for (const button of qualityOptions) button.addEventListener('click', changeQuality)
+    ui.bitrate.addEventListener('click', cycleBitrate)
     ui.main.addEventListener('click', () => {
       if (!ui.playHint.hidden) playRemote(call)
     })
@@ -506,7 +743,7 @@
     return {
       canInvite: () => available,
       owns: (callId) => call?.phase === 'active' && call.id === callId,
-      invite, ready, handle, disconnected, check,
+      invite, inviteRoom, joinRoomCall, ready, handle, disconnected, check, foreground,
       addMessage: layout.addMessage,
       removeMessage: layout.removeMessage,
       clearMessages: layout.clearMessages,

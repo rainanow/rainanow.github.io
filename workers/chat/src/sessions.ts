@@ -1,83 +1,139 @@
-/**
- * 有效 refresh token 的登记与吊销。
- *
- * 存在的理由见 `models/user-session.ts` 的注释：一句话概括，
- * **没有这张表就做不到「吊销某个用户的全部会话」**，而这让「改密码」形同虚设 ——
- * 改完密码，之前泄露出去的 refresh token 照样能换出新 access token。
- *
- * 和 `blacklist.ts` 的分工：
- *   - `auth_blacklist`（拒绝名单）：记「哪些 jti 已经被吊销」，防的是**重放**；
- *   - `user_sessions`（有效名单）：记「哪些 jti 还有效」，防的是**改密码后没换 token**。
- * 两者不能互相替代，缺一不可。
- */
+/** 当前设备会话与 refresh token 的轮换。 */
+import type { Env } from './env'
 
-const TABLE = 'user_sessions'
+export const CLOSE_SESSION_PATH = '/session/close'
 
-/** 清理过期行的频率：每 16 次写入顺手清一次。 */
-const CLEANUP_INTERVAL = 16
-
-let cleanupCounter = 0
-
-/**
- * 登记一个刚签发的 refresh token。
- *
- * `jti` 存明文而不是像 blacklist 那样存 `sha256(jti)`：这张表要回答的是
- * 「这个 jti 还在不在有效列表里」，中间件每次 refresh 都要匹配一次，
- * 存哈希的话每次多一次 SHA-256（不贵，但没必要）。
- * 权衡：D1 里被看到能拿到有效 jti 清单 —— 但能看 D1 的人本来就能读密码哈希。
- */
-export async function registerSession(
-  db: D1Database,
-  jti: string,
-  userId: string,
-  expiresAt: number,
-): Promise<void> {
-  cleanupCounter += 1
-  const shouldCleanup = cleanupCounter % CLEANUP_INTERVAL === 0
-
-  const statements: D1PreparedStatement[] = [
-    db
-      .prepare(
-        `INSERT INTO ${TABLE} (jti, userId, expiresAt) VALUES (?1, ?2, ?3)
-         ON CONFLICT(jti) DO UPDATE SET expiresAt = excluded.expiresAt`,
-      )
-      .bind(jti, userId, expiresAt),
-  ]
-
-  // 过期行本来也匹配不上（token 自己都过期了），留着只是让表无限变大。
-  if (shouldCleanup) {
-    statements.push(db.prepare(`DELETE FROM ${TABLE} WHERE expiresAt < ?1`).bind(nowSeconds()))
-  }
-
-  await db.batch(statements)
+interface StoredSession {
+  sessionId: string | null
+  rooms: string
 }
 
-/** 这个 jti 现在还有效吗？改密码之后会被判成无效。 */
-export async function isSessionActive(db: D1Database, jti: string): Promise<boolean> {
-  const row = await db
-    .prepare(`SELECT 1 AS ok FROM ${TABLE} WHERE jti = ?1 AND expiresAt >= ?2 LIMIT 1`)
-    .bind(jti, nowSeconds())
-    .first<{ ok: number }>()
-  return row !== null
-}
-
-/**
- * 吊销某个用户的**全部**会话，返回吊销了几条。
- *
- * 这就是改密码时调的那个 —— 删掉之后，那个人的所有 refresh token
- * 都在 `isSessionActive` 里查不到了，refresh 中间件会拒绝它们。
- */
-export async function revokeAllSessions(db: D1Database, userId: string): Promise<number> {
-  const before = await db
-    .prepare(`SELECT COUNT(*) AS n FROM ${TABLE} WHERE userId = ?1`)
-    .bind(userId)
-    .first<{ n: number }>()
-
-  await db.prepare(`DELETE FROM ${TABLE} WHERE userId = ?1`).bind(userId).run()
-
-  return before?.n ?? 0
-}
+let loginWrites = 0
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
+}
+
+async function closeSessionSockets(env: Env, userId: string, revoked: StoredSession[]): Promise<void> {
+  await Promise.all(revoked.flatMap(({ sessionId, rooms }) => {
+    if (sessionId === null) return []
+    const visitedRooms = JSON.parse(rooms) as string[]
+    return visitedRooms.map(async (room) => {
+      try {
+        const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName(room))
+        const response = await stub.fetch('https://chat-room.internal' + CLOSE_SESSION_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, sessionId }),
+        })
+        if (!response.ok) console.error('关闭已吊销的连接失败', { room, status: response.status })
+      } catch (error) {
+        console.error('关闭已吊销的连接失败', { room, error })
+      }
+    })
+  }))
+}
+
+/** 新登录替换旧会话，选中的设备由数据库事务顺序决定。 */
+export async function replaceSession(env: Env, userId: string, jti: string, expiresAt: number): Promise<string | null> {
+  const db = env.DB
+  const changes = [
+    db.prepare('DELETE FROM user_sessions WHERE userId = ?1 RETURNING sessionId, rooms').bind(userId),
+    db.prepare(`INSERT INTO user_sessions (jti, userId, expiresAt, sessionId)
+      SELECT ?1, id, ?3, ?1 FROM users WHERE id = ?2 RETURNING sessionId, rooms`)
+      .bind(jti, userId, expiresAt),
+  ]
+  if (++loginWrites % 16 === 0) {
+    changes.push(db.prepare('DELETE FROM user_sessions WHERE expiresAt < ?1').bind(nowSeconds()))
+  }
+  const [revoked, inserted] = await db.batch<StoredSession>(changes)
+  await closeSessionSockets(env, userId, revoked?.results ?? [])
+  return inserted?.results[0]?.sessionId ?? null
+}
+
+export async function isSessionActive(db: D1Database, jti: string): Promise<boolean> {
+  const row = await db.prepare('SELECT 1 FROM user_sessions WHERE jti = ?1 AND expiresAt >= ?2')
+    .bind(jti, nowSeconds()).first()
+  return row !== null
+}
+
+/** 刷新只更新传入令牌对应的现有行，所以并行登录或退出后，旧设备不能重新获得会话。 */
+export async function rotateSession(
+  db: D1Database,
+  userId: string,
+  previousJti: string,
+  nextJti: string,
+  expiresAt: number,
+): Promise<string | null> {
+  const [rotated] = await db.batch<StoredSession>([
+    db.prepare(`UPDATE user_sessions
+      SET sessionId = COALESCE(sessionId, jti), jti = ?3, expiresAt = ?4
+      WHERE userId = ?1 AND jti = ?2 AND expiresAt >= ?5
+        AND EXISTS (SELECT 1 FROM users WHERE id = ?1)
+        AND (sessionId IS NOT NULL OR NOT EXISTS (
+          SELECT 1 FROM user_sessions WHERE userId = ?1 AND sessionId IS NOT NULL
+        ))
+      RETURNING sessionId, rooms`).bind(userId, previousJti, nextJti, expiresAt, nowSeconds()),
+    // 升级前的多条会话中，只保留实际完成刷新的一条。
+    db.prepare(`DELETE FROM user_sessions WHERE userId = ?1 AND sessionId IS NULL
+      AND EXISTS (SELECT 1 FROM user_sessions WHERE jti = ?2 AND userId = ?1)`).bind(userId, nextJti),
+  ])
+  return rotated?.results[0]?.sessionId ?? null
+}
+
+const ACTIVE_SESSION = `FROM user_sessions AS s JOIN users AS u ON u.id = s.userId
+  WHERE s.userId = ?1 AND s.sessionId = ?2 AND s.expiresAt >= ?3`
+
+export async function isAccessActive(db: D1Database, userId: string, sessionId: string): Promise<boolean> {
+  return await db.prepare('SELECT 1 ' + ACTIVE_SESSION).bind(userId, sessionId, nowSeconds()).first() !== null
+}
+
+/** 记录房间和验证会话在同一事务内进行，避免登录替换时漏掉刚握手的房间。 */
+export async function openSessionRoom(
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  room: string,
+): Promise<{ username: string } | undefined> {
+  const now = nowSeconds()
+  const [, members] = await db.batch<{ username: string }>([
+    db.prepare(`UPDATE user_sessions SET rooms = json_insert(rooms, '$[#]', ?4)
+      WHERE userId = ?1 AND sessionId = ?2 AND expiresAt >= ?3
+        AND NOT EXISTS (SELECT 1 FROM json_each(rooms) WHERE value = ?4)`).bind(userId, sessionId, now, room),
+    db.prepare('SELECT u.username ' + ACTIVE_SESSION).bind(userId, sessionId, now),
+  ])
+  return members?.results[0]
+}
+
+/** 批量查验房间会话。D1 单条语句的绑定参数有限，按小批次查询。 */
+export async function currentSessions(db: D1Database, userIds: string[]): Promise<Map<string, string>> {
+  const statements: D1PreparedStatement[] = []
+  for (let offset = 0; offset < userIds.length; offset += 80) {
+    const group = userIds.slice(offset, offset + 80)
+    const bindings = group.map(() => '?').join(',')
+    statements.push(db.prepare(`SELECT s.userId, s.sessionId
+      FROM user_sessions AS s JOIN users AS u ON u.id = s.userId
+      WHERE s.expiresAt >= ? AND s.sessionId IS NOT NULL AND s.userId IN (${bindings})`)
+      .bind(nowSeconds(), ...group))
+  }
+  if (statements.length === 0) return new Map()
+  const results = await db.batch<{ userId: string; sessionId: string }>(statements)
+  return new Map(results.flatMap(({ results }) => results.map(({ userId, sessionId }) => [userId, sessionId])))
+}
+
+export async function revokeSession(env: Env, userId: string, field: 'sessionId' | 'jti', value: string): Promise<void> {
+  const revoked = await env.DB.prepare(`DELETE FROM user_sessions
+    WHERE userId = ?1 AND ${field} = ?2 RETURNING sessionId, rooms`).bind(userId, value).all<StoredSession>()
+  await closeSessionSockets(env, userId, revoked.results)
+}
+
+/** 账号注销或改密码与会话吊销一并提交，再关闭已建立的连接。 */
+export async function revokeAllSessions(env: Env, userId: string, updateUser: D1PreparedStatement): Promise<number> {
+  const [, revoked] = await env.DB.batch<StoredSession>([
+    updateUser,
+    env.DB.prepare('DELETE FROM user_sessions WHERE userId = ?1 RETURNING sessionId, rooms').bind(userId),
+  ])
+  const sessions = revoked?.results ?? []
+  await closeSessionSockets(env, userId, sessions)
+  return sessions.length
 }

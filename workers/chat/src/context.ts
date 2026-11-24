@@ -13,12 +13,11 @@ export type RoomPurgeModel = NanokaModel<typeof roomPurgeFields>
 export type UserPurgeModel = NanokaModel<typeof userPurgeFields>
 
 /**
- * access token 里只有 `sub` 和 `type`（`@nanokajs/auth` 就是这么签的），
- * 所以这里按 `Record<string, unknown>` 接，用到时再逐个做运行时收窄。
+ * 由 JWT 中间件验签后填入，使用时收窄 claim 的类型。
  */
 export type AppEnv = {
   Bindings: Env
-  Variables: { user: Record<string, unknown> }
+  Variables: { user: Record<string, unknown>; refreshJti?: string }
 }
 
 export type ChatApp = Nanoka<AppEnv>

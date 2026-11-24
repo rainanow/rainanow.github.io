@@ -197,6 +197,7 @@ console.log('\n后端源码不变量（顺序 / 包含关系这类没法用 HTTP
 
   const authSource = readSource('../src/routes/auth.ts')
   const roomSource = readSource('../src/room.ts')
+  const sessionSource = readSource('../src/sessions.ts')
   const typesSource = readSource('../src/types.ts')
   const moderationSource = readSource('../src/moderation.ts')
   const chatSource = readSource('../src/routes/chat.ts')
@@ -238,10 +239,11 @@ console.log('\n后端源码不变量（顺序 / 包含关系这类没法用 HTTP
     `try 在 ${tryAt}，fetch 在 ${fetchAt}`,
   )
 
-  // ④ WebSocket 的寿命上限：exp 记进 attachment，广播前踢掉过期的
+  // ④ WebSocket 绑定经过校验的设备会话，广播前清理过期和已撤销的连接。
   check('SocketAttachment 带上了令牌到期时间 exp', /exp:\s*number/.test(typesSource))
-  check('握手时确认这个人还有活着的会话', /FROM user_sessions WHERE userId = u\.id/.test(roomSource))
-  check('广播前会踢掉已过期的连接', /evictIfExpired\(ws\)/.test(roomSource))
+  check('握手时校验该连接所属的设备会话', /openSessionRoom\(this\.env\.DB, userId, sessionId, room\)/.test(roomSource) &&
+    /s\.userId = \?1 AND s\.sessionId = \?2 AND s\.expiresAt >= \?3/.test(sessionSource))
+  check('广播前会清理过期或已吊销的连接', /await this\.pruneSessions\(\)\s+this\.publish\(event\)/.test(roomSource))
 
   // ⑤ 禁言：必须区分「字段缺失」（400）与「显式 null」（解除禁言）
   check(

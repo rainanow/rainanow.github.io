@@ -15,6 +15,13 @@
     const mainTarget = control('main')
     const mini = control('mini')
     const controls = control('controls')
+    const preview = control('preview')
+    const qualityButton = control('quality')
+    const qualityPanel = control('quality-panel')
+    const composeButton = control('compose')
+    const composerPanel = control('composer-panel')
+    const composer = room.querySelector('[data-chat-composer]')
+    const input = composer.querySelector('[data-chat-input]')
     const overlay = control('overlay')
     const playerHint = control('player-hint')
     const compact = window.matchMedia?.('(max-width: 640px), (max-width: 940px) and (max-height: 520px)')
@@ -27,6 +34,7 @@
     let suppressClick = false
     let hasPeer = false
     let active = false
+    let previewMode = null
     let controlsTimer
     let hintTimer
     const messages = new Map()
@@ -45,7 +53,7 @@
 
     function scheduleControlsHide() {
       clearTimeout(controlsTimer)
-      if (!active) return
+      if (!active || previewMode !== null) return
       controlsTimer = setTimeout(() => {
         if (controlsHaveKeyboardFocus()) return
         controls.classList.add('is-idle')
@@ -53,7 +61,48 @@
       }, controlsIdleMs)
     }
 
-    mainTarget.addEventListener('click', showControls)
+    function setPreview(mode) {
+      if (previewMode === mode) return
+      previewMode = mode
+      preview.hidden = mode === null
+      preview.classList.toggle('chat__call-preview--compose', mode === 'compose')
+      preview.setAttribute('aria-label', mode === 'compose' ? '发消息' : '画质设置')
+      composerPanel.hidden = mode !== 'compose'
+      qualityPanel.hidden = mode !== 'quality'
+      composeButton.setAttribute('aria-expanded', String(mode === 'compose'))
+      qualityButton.setAttribute('aria-expanded', String(mode === 'quality'))
+      showControls()
+    }
+
+    function togglePreview(mode, focusTarget) {
+      if (previewMode === mode) {
+        setPreview(null)
+      } else {
+        setPreview(mode)
+        focusTarget.focus({ preventScroll: true })
+      }
+    }
+
+    mainTarget.addEventListener('click', () => {
+      if (previewMode !== null) setPreview(null)
+      else showControls()
+    })
+    composeButton.addEventListener('click', () => {
+      if (!composeButton.hidden) togglePreview('compose', input)
+    })
+    qualityButton.addEventListener('click', () => {
+      if (qualityButton.hidden) return
+      const selected = qualityPanel.querySelector('[data-call-resolution][aria-pressed="true"]')
+      togglePreview('quality', selected)
+    })
+    panel.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || previewMode === null) return
+      const opener = previewMode === 'compose' ? composeButton : qualityButton
+      event.preventDefault()
+      event.stopPropagation()
+      setPreview(null)
+      opener.focus({ preventScroll: true })
+    })
     controls.addEventListener('click', showControls)
     controls.addEventListener('focusin', () => {
       if (controlsHaveKeyboardFocus()) showControls()
@@ -121,7 +170,17 @@
       local.classList.toggle('is-small', thumbnail === local)
       remote.classList.toggle('is-small', thumbnail === remote)
       mainTarget.hidden = !hasPeer
-      room.classList.toggle('is-call-expanded', hasPeer && !!compact?.matches)
+      const expanded = hasPeer && !!compact?.matches
+      room.classList.toggle('is-call-expanded', expanded)
+      composeButton.hidden = !active || !expanded
+      qualityButton.hidden = !active
+      if (!active || (!expanded && previewMode === 'compose')) setPreview(null)
+      const composerParent = expanded ? composerPanel : room
+      if (composer.parentElement !== composerParent) {
+        composerParent.append(composer)
+        if (expanded) input.setAttribute('enterkeyhint', 'send')
+        else input.removeAttribute('enterkeyhint')
+      }
       fitViewport()
     }
 

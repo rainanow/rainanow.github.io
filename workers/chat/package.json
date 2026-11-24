@@ -12,6 +12,7 @@
     "migrate:remote": "wrangler d1 migrations apply yulo-chat --remote",
     "tail": "wrangler tail",
     "smoke": "node scripts/smoke.mjs",
+    "session-test": "node --test --test-isolation=none scripts/session-test.mjs",
     "call-ice-test": "node --test --test-isolation=none scripts/call-ice.test.mjs",
     "call-test": "node scripts/call-signaling.test.mjs",
     "call-browser-test": "node scripts/call-browser-test.mjs",

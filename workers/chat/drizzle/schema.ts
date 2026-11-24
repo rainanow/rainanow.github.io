@@ -16,6 +16,8 @@ export const users = sqliteTable('users', {
 export const user_sessions = sqliteTable('user_sessions', {
   jti: text('jti').primaryKey().notNull(),
   userId: text('userId').notNull(),
+  sessionId: text('sessionId'),
+  rooms: text('rooms').notNull().default("[]"),
   expiresAt: integer('expiresAt').notNull(),
   createdAt: integer('createdAt', { mode: 'timestamp_ms' }).notNull().default(sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`),
 })

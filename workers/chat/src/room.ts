@@ -14,10 +14,12 @@
 import { verify } from '@nanokajs/auth'
 
 import { CallSignaling, callSocketTags } from './calls/signaling'
+import type { CallDeparture } from './calls/signaling'
 import { ICE_ACCESS_PATH, iceAccessSchema } from './calls/ice'
-import { ACCESS_TOKEN_COOKIE, ACCESS_TOKEN_TTL_SECONDS, normalizeRoom } from './config'
+import { ACCESS_TOKEN_COOKIE, normalizeRoom } from './config'
 import type { Env } from './env'
 import { readAccessToken } from './origins'
+import { CLOSE_SESSION_PATH, currentSessions, isAccessActive, openSessionRoom } from './sessions'
 import {
   insertSystemMessage,
   joinNotice,
@@ -69,6 +71,7 @@ export class ChatRoom implements DurableObject {
     const { pathname } = new URL(request.url)
     if (pathname === BROADCAST_PATH) return this.handleBroadcast(request)
     if (pathname === ONLINE_PATH) return this.handleOnline()
+    if (pathname === CLOSE_SESSION_PATH) return this.handleCloseSession(request)
     if (pathname === ICE_ACCESS_PATH) {
       if (request.method !== 'POST') return new Response(null, { status: 405 })
       const access = iceAccessSchema.safeParse(await request.json().catch(() => undefined))
@@ -85,8 +88,26 @@ export class ChatRoom implements DurableObject {
   private async handleOnline(): Promise<Response> {
     // `members` 是后来加的（带用户名，让 Worker 不用再查 users 表）。
     // `userIds` 保留是为了兼容老调用方，但它现在只是 members 的投影，不额外遍历。
+    await this.pruneSessions()
     const members = this.onlineMembers()
     return Response.json({ userIds: members.map((m) => m.userId), members })
+  }
+
+  private async handleCloseSession(request: Request): Promise<Response> {
+    if (request.method !== 'POST') return new Response(null, { status: 405 })
+    const payload = await request.json<{ userId?: unknown; sessionId?: unknown }>().catch(() => null)
+    if (typeof payload?.userId !== 'string' || typeof payload.sessionId !== 'string') {
+      return new Response(null, { status: 400 })
+    }
+    const departures: Promise<void>[] = []
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = this.liveAttachment(ws)
+      if (attachment?.userId === payload.userId && attachment.sessionId === payload.sessionId) {
+        departures.push(this.closeRevokedSocket(ws))
+      }
+    }
+    await Promise.all(departures)
+    return new Response(null, { status: 204 })
   }
 
   /** Worker 校验并落库之后，把事件丢过来广播。DO 没有对外的 route，只有 Worker 能调到这里。 */
@@ -107,6 +128,7 @@ export class ChatRoom implements DurableObject {
       return new Response('Invalid event', { status: 400 })
     }
 
+    await this.pruneSessions()
     this.publish(event)
     return new Response(null, { status: 204 })
   }
@@ -124,65 +146,33 @@ export class ChatRoom implements DurableObject {
     const token = readAccessToken(request, ACCESS_TOKEN_COOKIE)
     if (token === undefined) return unauthorized('Missing token')
 
-    let payload: { sub?: unknown; type?: unknown; exp?: unknown }
+    let payload: { sub?: unknown; sid?: unknown; type?: unknown; exp?: unknown }
     try {
-      payload = await verify<{ sub?: unknown; type?: unknown; exp?: unknown }>(
-        token,
-        this.env.AUTH_SECRET,
-      )
+      payload = await verify<typeof payload>(token, this.env.AUTH_SECRET)
     } catch {
       return unauthorized('Invalid token')
     }
-    if (payload.type !== 'access' || typeof payload.sub !== 'string') {
+    const { sub: userId, sid: sessionId, exp } = payload
+    if (payload.type !== 'access' || typeof userId !== 'string' || typeof sessionId !== 'string' ||
+        typeof exp !== 'number' || exp <= Math.floor(Date.now() / 1000)) {
       return unauthorized('Invalid token')
     }
 
-    const nowSeconds = Math.floor(Date.now() / 1000)
-
-    /*
-     * 令牌的到期时间就是这条连接的寿命上限，所以要带走（见 SocketAttachment.exp）。
-     *
-     * 取不到 exp 时退回「从现在起 ACCESS_TOKEN_TTL_SECONDS」，**不是**直接拒绝：
-     * 宁可给一个偏宽的期限，也不能因为一个字段没读到就让整个聊天室连不上。
-     */
-    const exp = typeof payload.exp === 'number' ? payload.exp : nowSeconds + ACCESS_TOKEN_TTL_SECONDS
-    if (exp <= nowSeconds) return unauthorized('Token expired')
-
-    /*
-     * 一次查询同时回答两个问题：这个人还在不在、他名下的会话还有没有活的。
-     *
-     * 「还有没有活的会话」等价于「他是否仍然处于登录状态」。改密码会清空
-     * 他在 `user_sessions` 里的全部行（`revokeAllSessions`），注销账号也会 ——
-     * 于是这里判成 false，那把旧 access token 在过期之前**开不出新连接**。
-     * 少了这一条，改密码之后 30 分钟内照样能拿旧令牌重连，等于没改。
-     *
-     * 合成一条 SQL 而不是两条：D1 按查询次数计费，免费套餐单次调用又只有
-     * 50 次查询的预算，能省就省。
-     */
-    const row = await this.env.DB.prepare(
-      `SELECT u.username AS username,
-              EXISTS (SELECT 1 FROM user_sessions WHERE userId = u.id AND expiresAt >= ?2) AS live
-       FROM users AS u WHERE u.id = ?1`,
-    )
-      .bind(payload.sub, nowSeconds)
-      .first<{ username: string; live: number }>()
-    if (row === null) return unauthorized('Unknown user')
-    if (row.live !== 1) return unauthorized('Session revoked')
-
-    /*
-     * 房间名从握手 URL 的查询参数上取。
-     *
-     * DO 的实例名是外部用 `idFromName(room)` 算出来的，而实例**没有任何 API
-     * 能问出自己叫哪个房间**（没有 `this.name` 这种东西）。所以唯一知道房间名的
-     * 时刻就是握手这一下 —— 取到之后立刻记进 attachment，让房间名跟着连接走。
-     * 这样即便 DO 中途被驱逐（内存全丢），断开时触发的离场提示仍然写得对房间。
-     */
     const room = normalizeRoom(new URL(request.url).searchParams.get('room'))
+    await this.pruneSessions()
+    // 防止这次查验与 socket 注册之间插入会话吊销请求，导致旧设备漏关。
+    return this.ctx.blockConcurrencyWhile(() => this.acceptConnection(userId, sessionId, room, exp))
+  }
+
+  private async acceptConnection(userId: string, sessionId: string, room: string, exp: number): Promise<Response> {
+    const member = await openSessionRoom(this.env.DB, userId, sessionId, room)
+    if (member === undefined) return unauthorized('Session revoked')
     const connectionId = this.calls.enabled(room) ? crypto.randomUUID() : undefined
 
     const attachment: SocketAttachment = {
-      userId: payload.sub,
-      username: row.username,
+      userId,
+      username: member.username,
+      sessionId,
       exp,
       room,
       ...(connectionId === undefined ? {} : { connectionId }),
@@ -196,11 +186,11 @@ export class ChatRoom implements DurableObject {
      * 是三条 WebSocket，但「雨落 加入了房间」在一份聊天记录里出现三次是荒谬的。
      * 同理离线那边（见 handleDeparture）。
      */
-    const alreadyOnline = this.hasConnectionFor(payload.sub)
+    const alreadyOnline = this.hasConnectionFor(userId)
 
     const pair = new WebSocketPair()
     const server = pair[1]
-    const tags = connectionId === undefined ? undefined : callSocketTags(payload.sub, connectionId)
+    const tags = connectionId === undefined ? undefined : callSocketTags(userId, connectionId)
     this.ctx.acceptWebSocket(server, tags)
     // 休眠会把内存里的东西全丢掉，只有 attachment 会被持久化下来。
     server.serializeAttachment(attachment)
@@ -211,6 +201,7 @@ export class ChatRoom implements DurableObject {
       ready.accessExpiresAt = exp * 1000
     }
     server.send(JSON.stringify(ready))
+    if (connectionId !== undefined) this.calls.sendRoomSnapshot(server)
 
     /*
      * 这里有两种播报，去重只落在后面那一种上：
@@ -229,7 +220,12 @@ export class ChatRoom implements DurableObject {
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     // 心跳的 "ping" 已经被 setWebSocketAutoResponse 拦掉了，根本走不到这里。
-    if (this.evictIfExpired(ws)) return
+    const attachment = this.liveAttachment(ws)
+    if (attachment === null) return
+    if (!await isAccessActive(this.env.DB, attachment.userId, attachment.sessionId)) {
+      await this.closeRevokedSocket(ws)
+      return
+    }
     await this.calls.receive(ws, message)
   }
 
@@ -244,7 +240,7 @@ export class ChatRoom implements DurableObject {
     } catch {
       // 已经关了，无所谓。
     }
-    await this.handleDeparture(ws)
+    await this.handleDeparture(ws, code === 1000 && reason === 'page closed' ? 'page-closed' : undefined)
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
@@ -267,7 +263,7 @@ export class ChatRoom implements DurableObject {
    * 用 WeakSet 按连接对象去重、**不持久化**：DO 被驱逐后集合清空，
    * 最坏结果只是多播一次 leave，不影响正确性；用 storage 持久化反而多一次写。
    */
-  private async handleDeparture(ws: WebSocket): Promise<void> {
+  private async handleDeparture(ws: WebSocket, departure?: CallDeparture): Promise<void> {
     if (this.departed.has(ws)) return
     this.departed.add(ws)
 
@@ -291,32 +287,45 @@ export class ChatRoom implements DurableObject {
     if (!this.hasConnectionFor(attachment.userId, ws)) {
       this.notifyPresence('leave', attachment.username, attachment.room)
     }
-    await this.calls.departure(attachment)
+    await this.calls.departure(attachment, departure)
   }
 
   /**
-   * 这张凭证已经过期的话，把连接关掉。
-   *
-   * 返回 true 表示「已经关掉了，别再往它发东西」。
-   * 老代码不查这个，于是被注销/改过密码的账号只要不刷新页面就一直在接收消息。
-   *
-   * attachment 里没有 exp（比如是本改动之前建的老连接）时**不关** ——
-   * `undefined <= number` 恒为 false，这里用 typeof 把意图显式写出来，
-   * 免得下一个人以为少写了一个判断。
+   * 计数和广播共用同一个有效连接判定。旧版本尚未绑定会话的连接也要重新握手。
    */
-  private evictIfExpired(ws: WebSocket): boolean {
+  private liveAttachment(ws: WebSocket): (SocketAttachment & { sessionId: string }) | null {
+    if (this.departed.has(ws) || ws.readyState !== WebSocket.OPEN) return null
     const attachment = ws.deserializeAttachment() as SocketAttachment | null
-    if (attachment === null || typeof attachment.exp !== 'number') return false
-    if (attachment.exp > Math.floor(Date.now() / 1000)) return false
-
-    try {
-      // 4401 是个自定义码，语义是「你的凭证没了」。前端重连前本来就会先刷新一次
-      // 令牌，所以给什么码都不影响它走对路；给个可辨认的码只是让日志对得上。
-      ws.close(4401, 'session expired')
-    } catch {
-      // 已经关了
+    if (attachment === null) return null
+    const { sessionId, exp } = attachment
+    if (typeof sessionId === 'string' && exp > Math.floor(Date.now() / 1000)) {
+      return { ...attachment, sessionId }
     }
-    return true
+    this.closeSocket(ws, 4401, 'session expired')
+    return null
+  }
+
+  private closeSocket(ws: WebSocket, code: number, reason: string): void {
+    try { ws.close(code, reason) } catch { /* 已关。 */ }
+  }
+
+  private async closeRevokedSocket(ws: WebSocket): Promise<void> {
+    try {
+      ws.send(JSON.stringify({ type: 'session-revoked' } satisfies ChatServerEvent))
+    } catch { /* 已关闭的连接无需通知。 */ }
+    this.closeSocket(ws, 4403, 'session revoked')
+    await this.handleDeparture(ws, 'session-revoked')
+  }
+
+  /** 会话通知偶尔未送达时，下一次读名单或广播会从数据库收敛到真实状态。 */
+  private async pruneSessions(): Promise<void> {
+    const sockets = this.ctx.getWebSockets().flatMap((ws) => {
+      const attachment = this.liveAttachment(ws)
+      return attachment === null ? [] : [{ ws, attachment }]
+    })
+    const active = await currentSessions(this.env.DB, [...new Set(sockets.map(({ attachment }) => attachment.userId))])
+    await Promise.all(sockets.filter(({ attachment }) => active.get(attachment.userId) !== attachment.sessionId)
+      .map(({ ws }) => this.closeRevokedSocket(ws)))
   }
 
   /**
@@ -376,7 +385,7 @@ export class ChatRoom implements DurableObject {
     // 要按 userId 去重（和 onlineCount 的口径一致），同时留住第一次见到的用户名。
     const seen = new Map<string, string>()
     for (const ws of this.ctx.getWebSockets()) {
-      const attachment = ws.deserializeAttachment() as SocketAttachment | null
+      const attachment = this.liveAttachment(ws)
       if (attachment === null || attachment.userId.length === 0) continue
       if (!seen.has(attachment.userId)) seen.set(attachment.userId, attachment.username)
     }
@@ -402,7 +411,7 @@ export class ChatRoom implements DurableObject {
   private hasConnectionFor(userId: string, except?: WebSocket): boolean {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === except) continue
-      const attachment = ws.deserializeAttachment() as SocketAttachment | null
+      const attachment = this.liveAttachment(ws)
       if (attachment !== null && attachment.userId === userId) return true
     }
     return false
@@ -412,19 +421,11 @@ export class ChatRoom implements DurableObject {
     return this.onlineUserIds().length
   }
 
-  /**
-   * 把事件推给房间里所有**凭证还有效**的连接。
-   *
-   * 推之前先踢掉过期的：这一步就是「人已经被注销了，内容却还在往外流」的解药。
-   * 放在广播路径上而不是开个 alarm 定时扫，是因为
-   * **没有广播的时候也就没有内容可漏**，而广播一来 DO 必然醒着 ——
-   * 等于零额外唤醒、零额外查询。代价是过期连接在被关掉之前最多
-   * 多活「到下一条消息为止」，而这段时间里房间里本来就没有新内容。
-   */
+  /** 推送房间事件时跳过正在关闭或已过期的连接。 */
   private publish(event: ChatServerEvent): void {
     const data = JSON.stringify(event)
     for (const ws of this.ctx.getWebSockets()) {
-      if (this.evictIfExpired(ws)) continue
+      if (this.liveAttachment(ws) === null) continue
       try {
         ws.send(data)
       } catch {

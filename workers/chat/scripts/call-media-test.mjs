@@ -81,17 +81,29 @@ function fixture(user, options) {
   const sinks = []
   const timers = new Set()
   const received = { audio: 0, video: 0 }
+  const cameraRequests = []
+  const applied = []
+  const playback = { local: 0, remote: 0 }
+  let localFrames = 0
+  let visibility = 'visible'
   let denyNext = false
+  let busyNext = false
   let shorten = Boolean(options.shorten)
   const sent = { resume: 0, refresh: 0 }
   Object.defineProperty(window, 'isSecureContext', { value: true })
-  window.HTMLMediaElement.prototype.play = async () => {}
+  Object.defineProperty(window.document, 'visibilityState', { get: () => visibility })
+  window.HTMLMediaElement.prototype.play = async function () {
+    if (this.hasAttribute('data-call-local')) playback.local++
+    if (this.hasAttribute('data-call-remote')) playback.remote++
+  }
+  window.HTMLVideoElement.prototype.getVideoPlaybackQuality = function () {
+    return { totalVideoFrames: this.hasAttribute('data-call-local') ? localFrames : 0 }
+  }
   window.MediaStream = rtc.MediaStream
 
-  function captureTrack(source, feed, spacing, facingMode) {
+  function captureTrack(source, feed, spacing) {
     const track = source.createTrack()
     tracks.push(track)
-    if (facingMode) Object.defineProperty(track, 'getSettings', { value: () => ({ facingMode }) })
     const timer = setInterval(() => {
       if (track.readyState === 'live') {
         feed()
@@ -121,16 +133,37 @@ function fixture(user, options) {
         }), 10))
       }
       if (video) {
+        cameraRequests.push(video)
+        if (!audio && busyNext) {
+          busyNext = false
+          throw new window.DOMException('camera still in use', 'NotReadableError')
+        }
         const source = new RTCVideoSource()
         const width = 160
         const height = 90
         const data = new Uint8ClampedArray(width * height * 1.5).fill(128)
         let frames = 0
         const facing = video.facingMode?.exact ?? video.facingMode?.ideal ?? 'user'
-        output.push(captureTrack(source, () => {
+        const track = captureTrack(source, () => {
           data.fill(70 + frames++ % 60, 0, width * height)
           source.onFrame({ width, height, data })
-        }, 85, facing))
+        }, 85)
+        // The test camera tops out at 720p, regardless of the requested ideal height.
+        let settings
+        function chooseSettings(constraints) {
+          const height = Math.min(720, constraints.height?.ideal ?? 720)
+          const ratio = constraints.aspectRatio?.ideal ?? 16 / 9
+          settings = { width: Math.round(height * ratio), height, facingMode: facing }
+        }
+        chooseSettings(video)
+        Object.defineProperties(track, {
+          getSettings: { value: () => settings },
+          applyConstraints: { value: async (constraints) => {
+            applied.push({ track, constraints })
+            chooseSettings(constraints)
+          } },
+        })
+        output.push(track)
       }
       return new rtc.MediaStream(output)
     },
@@ -209,8 +242,14 @@ function fixture(user, options) {
   window.eval(script)
 
   return {
-    select, tracks, sockets, peers, received, signals, sent, errors,
+    select, tracks, sockets, peers, received, signals, sent, errors, cameraRequests, applied, playback,
     deny: () => { denyNext = true },
+    cameraBusy: () => { busyNext = true },
+    qualityOption: (setting, value) => select(`[data-call-${setting}="${value}"]`),
+    foreground: () => {
+      for (visibility of ['hidden', 'visible']) window.document.dispatchEvent(new window.Event('visibilitychange'))
+    },
+    advanceFrames: () => { localFrames++ },
     pageHide: () => window.dispatchEvent(new window.Event('pagehide')),
     close: () => {
       window.dispatchEvent(new window.Event('pagehide'))
@@ -228,21 +267,30 @@ function phase(page, state) {
   return waitFor(() => page.select('[data-chat-call]').dataset.phase === state, '通话状态 ' + state)
 }
 
-async function invite(page, name) {
-  const toggle = await waitFor(() => {
-    const node = page.select('[data-chat-members-toggle]')
+async function invite(page) {
+  const button = await waitFor(() => {
+    const node = page.select('[data-chat-call-invite]')
     return node && !node.hidden && node
-  }, '成员列表入口')
-  if (toggle.getAttribute('aria-expanded') !== 'true') toggle.click()
-  const button = await waitFor(() => page.select('[aria-label="呼叫 ' + name + '"]'), '视频呼叫按钮')
+  }, '视频邀请入口')
+  button.click()
+  await phase(page, 'outgoing')
+}
+
+function invitation(page, name) {
+  const cards = page.select('[data-chat-call-cards]').querySelectorAll('.chat__call-card')
+  return Array.from(cards).find((card) => card.querySelector('.chat__call-card-title').textContent.startsWith(name + ' '))
+}
+
+async function join(page, name) {
+  const button = await waitFor(() => invitation(page, name)?.querySelector('.chat__call-card-action'), '可加入的视频邀请卡片')
   button.click()
 }
 
-function released(page) {
+function released(page, timeout) {
   return waitFor(() => page.select('[data-chat-call]').hidden &&
     page.tracks.every((track) => track.readyState === 'ended') &&
     page.select('[data-call-local]').srcObject === null &&
-    page.select('[data-call-remote]').srcObject === null, '已释放通话媒体')
+    page.select('[data-call-remote]').srcObject === null, '已释放通话媒体', timeout)
 }
 
 async function mediaPath(page, relay) {
@@ -278,35 +326,35 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
     pages.push(a, b)
     await Promise.all([a, b].map((page) => waitFor(() =>
       page.signals.includes('hello') && !page.select('[data-chat-room]').hidden, '房间已连接')))
-    return { a, b, receiver: right.username }
+    return { a, b, caller: left.username }
   }
 
   try {
     const direct = await two({})
-    const { a, b, receiver } = direct
+    const { a, b, caller } = direct
+    await invite(a)
+    await waitFor(() => invitation(b, caller), '房间收到邀请卡片')
+    assert.equal(a.tracks.length, 0, '公开邀请发送时未启用设备')
+    assert.equal(b.tracks.length, 0, '看到邀请卡片时未启用设备')
+    a.select('[data-call-hangup]').click()
+    await released(a)
+    await waitFor(() => !invitation(b, caller), '取消后移除邀请卡片')
+
     a.deny()
-    await invite(a, receiver)
+    await invite(a)
+    await join(b, caller)
     await waitFor(() => a.select('[data-chat-notice]').textContent.includes('请允许使用'), '设备权限拒绝')
-    await released(a)
-    assert.equal(b.tracks.length, 0)
-    await invite(a, receiver)
-    await phase(b, 'incoming')
-    assert.equal(b.tracks.length, 0, '被叫响铃期间未启用设备')
-    assert.equal(b.select('[data-call-hangup]').getAttribute('aria-label'), '拒绝通话')
-    b.select('[data-call-hangup]').click()
-    await released(a)
-    await delay(4100)
-    await invite(a, receiver)
-    await phase(b, 'incoming')
-    b.select('[data-call-accept]').click()
+    await Promise.all([released(a), released(b)])
+    await invite(a)
+    await join(b, caller)
     await Promise.all([phase(a, 'active'), phase(b, 'active')])
     t.diagnostic('直连收发 ' + JSON.stringify(await Promise.all([mediaPath(a, false), mediaPath(b, false)])))
 
     const local = a.select('[data-call-local]').srcObject
     const remote = a.select('[data-call-remote]').srcObject
     const callButtons = Array.from(a.select('[data-call-controls]').querySelectorAll('button:not([hidden])'))
-    assert.equal(callButtons.length, 3)
-    for (const [index, name] of ['mic', 'hangup', 'camera'].entries()) {
+    assert.equal(callButtons.length, 4)
+    for (const [index, name] of ['mic', 'hangup', 'camera', 'quality'].entries()) {
       const button = callButtons[index]
       assert.equal(button, a.select('[data-call-' + name + ']'))
       assert.ok(button.querySelector('svg'))
@@ -336,24 +384,83 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
       !page.select('[data-chat-messages]').textContent.includes(caption), '撤回同步移除浮动消息与聊天记录')))
     t.diagnostic('互换画面保持媒体流，浮动消息同步发送和撤回')
 
+    const video = local.getVideoTracks()[0]
+    const audio = local.getAudioTracks()[0]
+    assert.equal(a.cameraRequests[0].height.ideal, 720)
+    assert.equal(a.cameraRequests[0].aspectRatio.ideal, 16 / 9)
+    a.select('[data-call-quality]').click()
+    const fullHd = a.qualityOption('resolution', '1080p')
+    fullHd.click()
+    await waitFor(() => fullHd.getAttribute('aria-disabled') === 'false', '应用 1080p')
+    assert.equal(fullHd.getAttribute('aria-pressed'), 'true')
+    assert.equal(video.getSettings().height, 720, '模拟摄像头的实际采集上限是 720p')
+    const fourThree = a.qualityOption('ratio', '4:3')
+    fourThree.click()
+    await waitFor(() => fourThree.getAttribute('aria-disabled') === 'false', '应用 4:3')
+    assert.equal(local.getVideoTracks()[0], video)
+    assert.equal(a.applied.at(-1).track, video)
+    assert.equal(a.applied.at(-1).constraints.width.ideal, 1440)
+    assert.equal(a.applied.at(-1).constraints.height.ideal, 1080)
+    assert.equal(a.applied.at(-1).constraints.aspectRatio.ideal, 4 / 3)
+    assert.equal(video.getSettings().width, 960)
+    a.select('[data-call-main]').click()
+
     a.select('[data-call-mic]').click()
-    assert.equal(local.getAudioTracks()[0].enabled, false)
+    assert.equal(audio.enabled, false)
     assert.equal(a.select('[data-call-mic]').getAttribute('aria-pressed'), 'true')
-    a.select('[data-call-mic]').click()
-    assert.equal(local.getAudioTracks()[0].enabled, true)
+    a.foreground()
+    a.advanceFrames()
+    await delay(1100)
+    assert.equal(local.getVideoTracks()[0], video, '已恢复帧时保留当前摄像头轨道')
+    const playbackCount = { ...a.playback }
+    const captureCount = a.cameraRequests.length
+    a.cameraBusy()
+    a.foreground()
+    await waitFor(() => local.getVideoTracks()[0] && local.getVideoTracks()[0] !== video, '回到前台时恢复停滞摄像头')
+    assert.equal(video.readyState, 'ended')
+    assert.ok(a.playback.local > playbackCount.local && a.playback.remote > playbackCount.remote)
+    assert.equal(local.getAudioTracks()[0], audio)
+    assert.equal(audio.enabled, false)
+    assert.equal(a.peers.length, 1)
+    assert.equal(a.cameraRequests.length, captureCount + 2, '设备短暂占用时延迟重试一次')
+    assert.equal(a.cameraRequests.at(-1).height.ideal, 1080)
+    assert.equal(a.cameraRequests.at(-1).aspectRatio.ideal, 4 / 3)
+    const peerFrames = b.received.video
+    await waitFor(() => b.received.video > peerFrames + 1, '前台恢复后对方继续收视频')
     a.select('[data-call-camera]').click()
     await waitFor(() => local.getVideoTracks().length === 0 &&
       a.select('[data-call-camera]').getAttribute('aria-pressed') === 'true', '关闭摄像头')
+    a.select('[data-call-quality]').click()
+    a.qualityOption('resolution', '480p').click()
+    a.qualityOption('ratio', '16:9').click()
+    const captures = a.cameraRequests.length
+    a.foreground()
+    await delay(1100)
+    assert.equal(a.cameraRequests.length, captures, '切回前台不重开手动关掉的摄像头')
+    assert.equal(local.getVideoTracks().length, 0)
+    a.select('[data-call-main]').click()
     a.select('[data-call-camera]').click()
     await waitFor(() => local.getVideoTracks().length === 1 &&
       a.select('[data-call-camera]').getAttribute('aria-pressed') === 'false', '恢复摄像头')
+    assert.equal(a.cameraRequests.at(-1).width.ideal, 854)
+    assert.equal(a.cameraRequests.at(-1).height.ideal, 480)
+    assert.equal(local.getVideoTracks()[0].getSettings().height, 480)
+    assert.equal(audio.enabled, false)
+    a.select('[data-call-mic]').click()
+    assert.equal(audio.enabled, true)
+    a.select('[data-call-quality]').click()
+    const hd = a.qualityOption('resolution', '720p')
+    hd.click()
+    await waitFor(() => hd.getAttribute('aria-disabled') === 'false', '切换到 720p')
+    assert.equal(a.applied.at(-1).constraints.height.ideal, 720)
+    assert.equal(local.getVideoTracks()[0].getSettings().height, 720)
     a.sockets[0].close(4000, 'local test')
     await waitFor(() => a.sent.resume > 0 && a.select('[data-call-status]').textContent === '通话中', '认证重连')
     assert.equal(a.peers.length, 1)
     assert.ok(a.sent.refresh > 0)
     b.select('[data-call-hangup]').click()
     await Promise.all([released(a), released(b)])
-    t.diagnostic('权限拒绝、拒接、麦克风与视频轨道控制、重连和挂断通过')
+    t.diagnostic('邀请取消、权限拒绝、画质设置、前台恢复、麦克风与视频轨道控制、重连和挂断通过')
 
     const secretPath = process.env.RTC_TEST_TURN_KEY
     if (secretPath) {
@@ -376,9 +483,8 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
         signed++
       }
       const relay = await two({ relay: true, shorten: true, prepareIce })
-      await invite(relay.a, relay.receiver)
-      await phase(relay.b, 'incoming')
-      relay.b.select('[data-call-accept]').click()
+      await invite(relay.a)
+      await join(relay.b, relay.caller)
       await Promise.all([phase(relay.a, 'active'), phase(relay.b, 'active')])
       assert.equal(signed, 2)
       t.diagnostic('中继收发 ' + JSON.stringify(await Promise.all([mediaPath(relay.a, true), mediaPath(relay.b, true)])))
@@ -386,7 +492,8 @@ test('主聊天室完成一对一通话生命周期', { timeout: 135000 }, async
         relay.a.sockets[0].readyState === WebSocket.CLOSED, '客户端主动续期')
       assert.equal(relay.a.peers.length, 1)
       relay.b.pageHide()
-      await Promise.all([released(relay.a), released(relay.b)])
+      // The page can close before its hangup is dispatched. Allow the server's 15s resume grace.
+      await Promise.all([released(relay.a, 25_000), released(relay.b)])
       t.diagnostic('TURN 凭证、主动续期和离页释放通过')
     } else {
       t.diagnostic('设置 RTC_TEST_TURN_KEY 以运行中继测试')

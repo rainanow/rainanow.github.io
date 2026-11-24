@@ -57,6 +57,13 @@
       "when": 1791462115760,
       "tag": "0007_large_vin_gonzales",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1795495149287,
+      "tag": "0008_single_device_sessions",
+      "breakpoints": true
     }
   ]
 }

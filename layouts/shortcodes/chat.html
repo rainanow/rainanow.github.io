@@ -121,6 +121,7 @@
       </button>
       <button type="button" class="chat__button chat__button--ghost" data-chat-logout hidden>退出</button>
     </span>
+    <div class="chat__active-calls" data-chat-active-calls role="status" hidden></div>
   </div>
 
   {{- /*
@@ -252,12 +253,35 @@
                 aria-label="拖动小窗，点击互换画面" title="拖动小窗，点击互换画面" hidden></button>
         <div class="chat__call-overlay" data-call-overlay aria-hidden="true"></div>
         <p class="chat__call-play-hint" data-call-play-hint role="status" hidden>点按主画面播放通话</p>
+        <div class="chat__call-preview" id="chat-call-preview" data-call-preview role="region" aria-label="通话预览" hidden>
+          <div class="chat__call-quality" data-call-quality-panel hidden>
+            <div class="chat__call-quality-options" role="group" aria-label="画质">
+              <button class="chat__call-quality-option" type="button" data-call-resolution="1080p" aria-pressed="false">1080p</button>
+              <button class="chat__call-quality-option" type="button" data-call-resolution="720p" aria-pressed="true">720p</button>
+              <button class="chat__call-quality-option" type="button" data-call-resolution="480p" aria-pressed="false">480p</button>
+            </div>
+            <div class="chat__call-quality-options" role="group" aria-label="画面比例和视频码率">
+              <button class="chat__call-quality-option" type="button" data-call-ratio="16:9" aria-pressed="true">16:9</button>
+              <button class="chat__call-quality-option" type="button" data-call-ratio="4:3" aria-pressed="false">4:3</button>
+              <button class="chat__call-bitrate" type="button" data-call-bitrate
+                      aria-label="切换视频发送码率上限" aria-disabled="true">—</button>
+            </div>
+          </div>
+          <div class="chat__call-composer" data-call-composer-panel hidden></div>
+        </div>
       </div>
       <p class="chat__call-player-hint" data-call-player-hint role="status" hidden>在网页通话界面可以拖动小窗、互换双画面。</p>
       <div class="chat__call-controls" id="chat-call-controls" data-call-controls role="group" aria-label="通话控制">
         <button class="chat__call-button chat__call-button--accept" type="button" data-call-accept aria-label="接听" title="接听" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
             <path d="M6 3h3l1.5 4.5-2 1.8a13 13 0 0 0 6.2 6.2l1.8-2L21 15v3a3 3 0 0 1-3.2 3A17 17 0 0 1 3 6.2 3 3 0 0 1 6 3Z"/>
+          </svg>
+        </button>
+        <button class="chat__call-button" type="button" data-call-compose aria-label="发消息" title="发消息"
+                aria-controls="chat-call-preview" aria-expanded="false" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M21 11.5a7.5 7.5 0 0 1-7.5 7.5H9l-5 2v-4a7.5 7.5 0 0 1 4.5-13h5a7.5 7.5 0 0 1 7.5 7.5Z"/>
+            <path d="M8 10h8m-8 3h5"/>
           </svg>
         </button>
         <button class="chat__call-button" type="button" data-call-mic aria-label="静音麦克风" aria-pressed="false" title="静音" hidden>
@@ -287,12 +311,20 @@
             </g>
           </svg>
         </button>
+        <button class="chat__call-button" type="button" data-call-quality aria-label="画质设置" title="画质设置"
+                aria-controls="chat-call-preview" aria-expanded="false" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="2.5" y="5" width="19" height="14" rx="3"/>
+            <path d="M6.5 9v6m4.5-6v6m-4.5-3H11m3.5-3h1.3a2.7 2.7 0 0 1 2.7 2.7v.6a2.7 2.7 0 0 1-2.7 2.7h-1.3Z"/>
+          </svg>
+        </button>
       </div>
     </section>
 
     <div class="chat__messages" data-chat-messages>
       <button type="button" class="chat__button chat__more" data-chat-more hidden>加载更早的消息</button>
       <p class="chat__empty" data-chat-empty>还没有人说话，来开场吧。</p>
+      <div class="chat__call-cards" data-chat-call-cards hidden></div>
     </div>
 
     <div class="chat__resize" data-chat-resize role="separator" tabindex="0"
@@ -300,16 +332,16 @@
          title="拖动调整聊天区高度；双击恢复默认，也可用上下方向键调整"></div>
 
       <form class="chat__composer" data-chat-composer>
-        {{- /* 「+」放在输入框内部左下角，所以 textarea 和它包在一个定位盒子里 */ -}}
+        {{- /* 上传和视频邀请放在输入框的左侧。 */ -}}
         <div class="chat__composer-box">
           {{- /*
             maxlength 从 hugo.toml 的 params.chat.maxMessageLength 读，不在模板里写死。
             它必须和后端 config.ts 的 MAX_MESSAGE_LENGTH 一致，
             一致性由 npm run verify-build 的第 6 项自动检查。
           */ -}}
-          <textarea data-chat-input rows="2"
+          <textarea data-chat-input rows="2" aria-label="说点什么"
                     maxlength="{{ site.Params.chat.maxMessageLength | default 500 }}" required
-                    placeholder="说点什么…（Enter 发送，Shift + Enter 换行）"></textarea>
+                    placeholder="说点什么"></textarea>
           {{- /*
             title / aria-label 里**不写具体大小**：上限按角色分档
             （普通用户 16 MB、管理员 100 MB），而模板在构建时不知道访客是谁。
@@ -317,8 +349,18 @@
             设置 el.upload.title 的那几行。这里留一个不含数字的默认值，
             免得未登录/未启用 JS 时露出一个错的数字。
           */ -}}
-          <button type="button" class="chat__upload" data-chat-upload
-                  title="上传图片或文件" aria-label="上传图片或文件">+</button>
+          <div class="chat__composer-tools">
+            <button type="button" class="chat__call-invite" data-chat-call-invite
+                    title="发送视频通话邀请" aria-label="发送视频通话邀请" hidden>
+              <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" focusable="false"
+                   fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="6" width="12" height="12" rx="2"/>
+                <path d="m15 10 6-3v10l-6-3"/>
+              </svg>
+            </button>
+            <button type="button" class="chat__upload" data-chat-upload
+                    title="上传图片或文件" aria-label="上传图片或文件">+</button>
+          </div>
         </div>
 
         {{- /* 真正干活的是这个藏起来的 file input，点 + 只是去戳它 */ -}}

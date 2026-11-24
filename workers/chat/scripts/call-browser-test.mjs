@@ -54,8 +54,21 @@ async function createUser() {
 }
 
 function observeBrowser({ relay }) {
-  const audit = { pcs: [], sockets: [], tracks: [], signals: [], readyMessages: new Map(), denyNext: false }
+  const audit = { pcs: [], sockets: [], tracks: [], signals: [], quality: [], readyMessages: new Map(), denyNext: false }
   window.callTest = audit
+  const applyConstraints = MediaStreamTrack.prototype.applyConstraints
+  MediaStreamTrack.prototype.applyConstraints = async function (requested) {
+    const change = { requested }
+    audit.quality.push(change)
+    try {
+      await applyConstraints.call(this, requested)
+      const { width, height } = this.getSettings()
+      change.applied = { width, height }
+    } catch (error) {
+      change.error = error.name
+      throw error
+    }
+  }
   const play = HTMLMediaElement.prototype.play
   HTMLMediaElement.prototype.play = function () {
     if (audit.blockRemotePlayback && this.matches('[data-call-remote]')) {
@@ -136,10 +149,17 @@ async function showControls(page) {
   await page.locator('[data-call-controls]:not(.is-idle)').waitFor()
 }
 
-async function invite(page, username) {
-  const toggle = page.locator('[data-chat-members-toggle]')
-  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click()
-  await page.getByRole('button', { name: '呼叫 ' + username, exact: true }).click()
+async function invite(page) {
+  await page.locator('[data-chat-call-invite]').click()
+  await callPanel(page, 'outgoing').waitFor()
+}
+
+function invitation(page, username) {
+  return page.locator('[data-chat-call-cards] .chat__call-card').filter({ hasText: username + ' 发起了视频通话' })
+}
+
+async function join(page, username) {
+  await invitation(page, username).getByRole('button', { name: '加入通话', exact: true }).click()
 }
 
 async function mediaStats(page, shouldRelay) {
@@ -160,6 +180,13 @@ async function mediaStats(page, shouldRelay) {
       (relay ? (local.candidateType === 'relay' && remote.candidateType === 'relay')
         : (local.candidateType !== 'relay' && remote.candidateType !== 'relay'))
   }, shouldRelay, { timeout: 20_000 })
+}
+
+async function videoBitrateLimit(page, mbps) {
+  await page.waitForFunction((bps) => {
+    const sender = window.callTest.pcs.at(-1)?.getSenders().find((entry) => entry.track?.kind === 'video')
+    return sender?.getParameters().encodings[0]?.maxBitrate === bps
+  }, mbps * 1_000_000, { timeout: 7000 })
 }
 
 async function released(page) {
@@ -183,27 +210,29 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   })
   t.after(() => browser.close())
   const errors = []
-  const [alice, bob] = await Promise.all([createUser(), createUser()])
+  const [alice, bob, spectator] = await Promise.all([createUser(), createUser(), createUser()])
   const a = await openPage(browser, alice, { relay: false })
   const b = await openPage(browser, bob, { relay: false, mobile: true })
-  for (const { page } of [a, b]) page.on('pageerror', (error) => errors.push(error.message))
+  const viewer = await openPage(browser, spectator, { relay: false })
+  for (const { page } of [a, b, viewer]) page.on('pageerror', (error) => errors.push(error.message))
   await a.page.evaluate(() => { window.callTest.denyNext = true })
-  await invite(a.page, bob.username)
+  await invite(a.page)
+  await invitation(viewer.page, alice.username).waitFor()
+  assert.equal(await a.page.evaluate(() => window.callTest.tracks.length), 0, '公开邀请尚未打开摄像头')
+  assert.equal(await b.page.evaluate(() => window.callTest.tracks.length), 0, '收到邀请尚未打开摄像头')
+  await join(b.page, alice.username)
   await a.page.getByText('请允许使用摄像头和麦克风后重试').waitFor()
-  await released(a.page)
-  assert.equal(await b.page.evaluate(() => window.callTest.tracks.length), 0)
-
-  await invite(a.page, bob.username)
-  await callPanel(b.page, 'incoming').waitFor()
-  assert.equal(await b.page.evaluate(() => window.callTest.tracks.length), 0, '响铃不启用被叫的设备')
-  await b.page.getByRole('button', { name: '拒绝通话', exact: true }).click()
-  await a.page.getByText('对方拒绝了通话').waitFor()
+  await Promise.all([released(a.page), released(b.page)])
+  await delay(4100)
+  await invite(a.page)
+  await invitation(b.page, alice.username).waitFor()
+  await a.page.locator('[data-call-hangup]').click()
+  await invitation(viewer.page, alice.username).waitFor({ state: 'hidden' })
   await released(a.page)
   await delay(4100)
-  await invite(a.page, bob.username)
-  await callPanel(b.page, 'incoming').waitFor()
+  await invite(a.page)
   await b.page.evaluate(() => { window.callTest.blockRemotePlayback = true })
-  await b.page.locator('[data-call-accept]').click()
+  await join(b.page, alice.username)
   await Promise.all([callPanel(a.page, 'active').waitFor(), callPanel(b.page, 'active').waitFor()])
   await b.page.locator('[data-chat-notice]').waitFor({ state: 'hidden' })
   await b.page.locator('[data-call-play-hint]').waitFor()
@@ -211,6 +240,9 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   await showControls(b.page)
   await b.page.locator('[data-call-play-hint]').waitFor({ state: 'hidden' })
   await Promise.all([mediaStats(a.page, false), mediaStats(b.page, false)])
+  const activeStrip = viewer.page.locator('[data-chat-active-calls]')
+  await activeStrip.filter({ hasText: alice.username + '、' + bob.username + '正在视频通话' }).waitFor()
+  assert.equal(await invitation(viewer.page, alice.username).getByRole('button', { name: '加入通话' }).count(), 0)
   const mobilePanel = await callPanel(b.page).boundingBox()
   assert.ok(mobilePanel.width <= 390 && mobilePanel.x + mobilePanel.width <= 391)
   const mobileStage = await b.page.locator('[data-call-stage]').boundingBox()
@@ -218,13 +250,87 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   assert.ok(mobileStage.height >= 844 * 0.68)
   assert.ok(Math.abs(mobileMini.y - mobileStage.y - 8) <= 1)
   assert.ok(Math.abs(mobileStage.x + mobileStage.width - mobileMini.x - mobileMini.width - 8) <= 1)
-  assert.equal(await b.page.locator('[data-call-controls] button:not([hidden]) svg').count(), 3)
+  assert.equal(await b.page.locator('[data-call-controls] button:not([hidden]) svg').count(), 5)
+  assert.equal(await a.page.locator('[data-call-controls] button:not([hidden]) svg').count(), 4)
+  await a.page.locator('[data-chat-input]').waitFor({ state: 'visible' })
+  await a.page.locator('[data-chat-send]').waitFor({ state: 'visible' })
   await b.page.locator('[data-call-controls].is-idle').waitFor()
   await showControls(b.page)
   await b.page.locator('[data-call-mini]').tap()
   assert.equal(await b.page.locator('[data-call-stage]').getAttribute('data-main'), 'local')
-  await b.page.locator('[data-chat-input]').waitFor({ state: 'visible' })
+  await b.page.locator('[data-chat-input]').waitFor({ state: 'hidden' })
+  await b.page.locator('[data-call-compose]').click()
+  const mobileInput = b.page.locator('[data-call-preview] [data-chat-input]')
+  await mobileInput.waitFor()
+  await b.page.locator('[data-call-preview] [data-chat-send]').waitFor({ state: 'hidden' })
+  assert.equal(await b.page.locator('[data-call-preview]').evaluate((preview) =>
+    getComputedStyle(preview).backgroundColor), 'rgba(0, 0, 0, 0)')
+  assert.equal(await mobileInput.getAttribute('placeholder'), '说点什么')
+  assert.equal(await mobileInput.getAttribute('enterkeyhint'), 'send')
   const screenshots = process.env.RTC_TEST_SCREENSHOTS
+  const caption = '通话预览消息' + randomUUID().slice(0, 6)
+  await mobileInput.fill(caption)
+  await mobileInput.dispatchEvent('keydown', { key: 'Enter', isComposing: true })
+  assert.equal(await mobileInput.inputValue(), caption)
+  await mobileInput.press('Shift+Enter')
+  assert.equal(await mobileInput.inputValue(), caption + '\n')
+  if (screenshots) await b.page.screenshot({ path: resolve(screenshots, 'mobile-message.png') })
+  await mobileInput.press('Enter')
+  await a.page.locator('[data-call-overlay]').filter({ hasText: caption }).waitFor()
+  const imeCaption = '输入法发送' + randomUUID().slice(0, 6)
+  await mobileInput.fill(imeCaption)
+  assert.equal(await mobileInput.evaluate((input) => input.dispatchEvent(new InputEvent('beforeinput', {
+    inputType: 'insertLineBreak', bubbles: true, cancelable: true,
+  }))), false)
+  await a.page.locator('[data-call-overlay]').filter({ hasText: imeCaption }).waitFor()
+  await showControls(b.page)
+  await b.page.locator('[data-call-quality]').click()
+  const resolution = b.page.getByRole('group', { name: '画质', exact: true }).getByRole('button', { name: '480p' })
+  const ratio = b.page.locator('[data-call-ratio="4:3"]')
+  try {
+    await resolution.click()
+    await b.page.waitForFunction(() => window.callTest.quality.some(({ requested, applied }) =>
+      requested.height?.ideal === 480 && requested.width?.ideal === 854 && applied?.width > 0 && applied?.height > 0),
+      null, { timeout: 7000 })
+    await ratio.click()
+    await b.page.waitForFunction(() => window.callTest.quality.some(({ requested, applied }) =>
+      requested.width?.ideal === 640 && Math.abs(requested.aspectRatio?.ideal - 4 / 3) < 0.001 && applied?.height > 0),
+      null, { timeout: 7000 })
+    assert.equal(await resolution.getAttribute('aria-pressed'), 'true')
+    assert.equal(await ratio.getAttribute('aria-pressed'), 'true')
+    assert.equal(await b.page.locator('[data-call-quality-panel] button[aria-pressed="true"]').count(), 2)
+    const bitrate = b.page.locator('[data-call-bitrate]')
+    await videoBitrateLimit(b.page, 2)
+    await bitrate.filter({ hasText: '2M' }).waitFor()
+    for (const limit of [3, 4, 5, 1, 2]) {
+      await bitrate.tap()
+      await bitrate.filter({ hasText: `${limit}M` }).waitFor()
+      await videoBitrateLimit(b.page, limit)
+    }
+    if (screenshots) await b.page.screenshot({ path: resolve(screenshots, 'mobile-quality.png') })
+    await b.page.evaluate(() => {
+      const sender = window.callTest.pcs.at(-1).getSenders().find((entry) => entry.track?.kind === 'video')
+      sender.setParameters = () => {
+        delete sender.setParameters
+        return Promise.reject(new DOMException('Test bitrate rejection', 'OperationError'))
+      }
+    })
+    await bitrate.tap()
+    await b.page.locator('[data-chat-notice]').filter({ hasText: '无法调整视频发送码率' }).waitFor()
+    assert.equal(await bitrate.textContent(), '2M')
+    await videoBitrateLimit(b.page, 2)
+  } catch (error) {
+    t.diagnostic(JSON.stringify(await b.page.evaluate(() => ({
+      quality: window.callTest.quality,
+      bitrate: document.querySelector('[data-call-bitrate]')?.textContent,
+      resolution: document.querySelector('[data-call-resolution][aria-pressed="true"]')?.dataset.callResolution,
+      ratio: document.querySelector('[data-call-ratio][aria-pressed="true"]')?.dataset.callRatio,
+      phase: document.querySelector('[data-chat-call]').dataset.phase,
+    }))))
+    throw error
+  }
+  await showControls(b.page)
+  await b.page.locator('[data-call-preview]').waitFor({ state: 'hidden' })
   if (screenshots) {
     await Promise.all([showControls(a.page), showControls(b.page)])
     await Promise.all([
@@ -233,6 +339,10 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
     ])
   }
 
+  await showControls(a.page)
+  await a.page.locator('[data-call-quality]').click()
+  await a.page.locator('[data-call-bitrate]').click()
+  await videoBitrateLimit(a.page, 3)
   await showControls(a.page)
   await a.page.locator('[data-call-mic]').click()
   assert.equal(await a.page.evaluate(() =>
@@ -246,6 +356,16 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   await a.page.locator('[data-call-camera][aria-pressed="true"]').click()
   await a.page.waitForFunction(() =>
     document.querySelector('[data-call-local]').srcObject.getVideoTracks().length === 1)
+  await videoBitrateLimit(a.page, 3)
+  const priorCaptureCount = await a.page.evaluate(() => {
+    document.querySelector('[data-call-local]').srcObject.getVideoTracks()[0].stop()
+    document.dispatchEvent(new Event('visibilitychange'))
+    return window.callTest.tracks.length
+  })
+  await a.page.waitForFunction((previous) => window.callTest.tracks.length > previous &&
+    document.querySelector('[data-call-local]').srcObject.getVideoTracks().some((track) => track.readyState === 'live'), priorCaptureCount)
+  await videoBitrateLimit(a.page, 3)
+  assert.equal(await a.page.evaluate(() => window.callTest.pcs.length), 1)
 
   const previousSocket = await a.page.evaluate(() => {
     const { sockets } = window.callTest
@@ -260,8 +380,9 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   await showControls(b.page)
   await b.page.locator('[data-call-hangup]').click()
   await Promise.all([released(a.page), released(b.page)])
-  await Promise.all([a.context.close(), b.context.close()])
-  t.diagnostic('直连双向音视频、主画面恢复播放和唤出控制、手机小窗互换、设备开关及重连释放通过')
+  await activeStrip.waitFor({ state: 'hidden' })
+  await Promise.all([a.context.close(), b.context.close(), viewer.context.close()])
+  t.diagnostic('公开邀请、全房间通话状态、预览消息和画质、后台媒体恢复、直连和释放通过')
 
   const turnSecretPath = process.env.RTC_TEST_TURN_KEY
   if (!turnSecretPath) {
@@ -292,17 +413,21 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   const c = await openPage(browser, carol, { relay: true }, prepareIce)
   const d = await openPage(browser, dan, { relay: true }, prepareIce)
   for (const { page } of [c, d]) page.on('pageerror', (error) => errors.push(error.message))
-  await invite(c.page, dan.username)
-  await callPanel(d.page, 'incoming').waitFor()
-  await d.page.locator('[data-call-accept]').click()
+  await invite(c.page)
+  await join(d.page, carol.username)
   await Promise.all([callPanel(c.page, 'active').waitFor(), callPanel(d.page, 'active').waitFor()])
   assert.equal(signed, 2)
   await Promise.all([mediaStats(c.page, true), mediaStats(d.page, true)])
+  await videoBitrateLimit(c.page, 2)
+  await showControls(c.page)
+  await c.page.locator('[data-call-quality]').click()
+  await c.page.locator('[data-call-bitrate]').click()
+  await videoBitrateLimit(c.page, 3)
   t.diagnostic('临时凭证签名和 TURN UDP 双向音视频通过')
 
   const originalSocket = await c.page.evaluate(() => {
     const { sockets, signals, readyMessages } = window.callTest
-    const { index } = signals.findLast((frame) => frame.action === 'invite')
+    const { index } = signals.findLast((frame) => frame.action === 'invite-room')
     const socket = sockets[index]
     const ready = readyMessages.get(socket)
     if (!ready) throw new Error('The active socket does not have a ready message')
@@ -313,6 +438,7 @@ test('本地聊天室 Chromium 音视频直连与 TURN 中继', { timeout: 150_0
   })
   await c.page.waitForFunction((index) => window.callTest.sockets[index].readyState === WebSocket.CLOSED &&
     window.callTest.signals.some((frame) => frame.index > index && frame.action === 'resume'), originalSocket)
+  await videoBitrateLimit(c.page, 3)
   assert.equal(await c.page.evaluate(() => window.callTest.pcs.length), 1)
   await d.page.close()
   await released(c.page)

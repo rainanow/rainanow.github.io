@@ -37,6 +37,10 @@ export const userSessionFields = {
    */
   jti: t.string().primary(),
   userId: t.uuid(),
+  /** 刷新时保持稳定。升级前的行在下一次刷新时取得会话 ID。 */
+  sessionId: t.string().optional(),
+  /** 会话访问过的房间，供吊销时关闭连接。 */
+  rooms: t.string().default('[]'),
   /** 这个 token 自己的过期时间（秒，Unix）。清理过期行时用。 */
   expiresAt: t.integer(),
   createdAt: t.timestamp().defaultNow().readOnly(),

@@ -63,6 +63,7 @@
    * 同样的 `message` 事件、同样的 `insertMessage()` 排序去重，只有渲染不同。
    */
   var KIND_SYSTEM = 'system'
+  var SESSION_REVOKED_TEXT = '登录会话已失效，请重新登录'
   /** 图片压缩后的最长边。1600 够看清内容，又不至于把手机流量吃光。 */
   var IMAGE_MAX_EDGE = 1600
 
@@ -75,6 +76,9 @@
     resize: root.querySelector('[data-chat-resize]'),
     more: root.querySelector('[data-chat-more]'),
     empty: root.querySelector('[data-chat-empty]'),
+    callInvite: root.querySelector('[data-chat-call-invite]'),
+    callCards: root.querySelector('[data-chat-call-cards]'),
+    activeCalls: root.querySelector('[data-chat-active-calls]'),
     form: root.querySelector('[data-chat-form]'),
     username: root.querySelector('[data-chat-username]'),
     password: root.querySelector('[data-chat-password]'),
@@ -139,6 +143,8 @@
   var oldestCreatedAt = null
   var oldestId = null
   var hasMore = false
+  var latestPresence = new Map()
+  var roomCalls = []
   /** 本次连接是不是重连连上的。重连成功后要补拉一次历史，见 catchUp()。 */
   var pendingCatchUp = false
   var membersLoading = false
@@ -159,9 +165,7 @@
         send: sendVideoFrame,
         reconnect: reconnectVideoSocket,
         renew: renewVideoSocket,
-        availabilityChanged: function () {
-          if (memberCache.length > 0) renderMembers(memberCache)
-        }
+        availabilityChanged: renderRoomCalls
       })
     : null
 
@@ -212,7 +216,14 @@
 
   // --- 网络层 ---------------------------------------------------------------
 
-  /** 单飞的 refresh：多个请求同时撞 401 时只发一次刷新。 */
+  function requestRefresh() {
+    return fetch(API + '/auth/refresh', { method: 'POST', credentials: 'include' })
+      .then(function (response) {
+        if (response.status === 429) return 'retry'
+        return response.ok ? 'ok' : 'expired'
+      })
+  }
+
   /**
    * 刷新会话。返回三态而不是布尔：
    *
@@ -225,14 +236,10 @@
    */
   function refreshSession() {
     if (refreshInFlight === null) {
-      refreshInFlight = fetch(API + '/auth/refresh', {
-        method: 'POST',
-        credentials: 'include'
-      })
-        .then(function (response) {
-          if (response.status === 429) return 'retry'
-          return response.ok ? 'ok' : 'expired'
-        })
+      var locks = navigator.locks
+      // 同一浏览器标签页共享 Cookie，用锁避免两页同时用已轮换的 refresh token。
+      refreshInFlight = (locks && typeof locks.request === 'function'
+        ? locks.request('yulo-chat-refresh:' + API, requestRefresh) : requestRefresh())
         .catch(function () {
           // 网络错误也没法判断，当成可重试 —— 宁可让用户等，不要误登出
           return 'retry'
@@ -318,9 +325,11 @@
   function api(path, options, allowRetry) {
     var init = normalizeBody(options || {})
     init.credentials = 'include'
+    var profile = me
     return fetch(API + path, init).then(function (response) {
-      if (response.status !== 401 || allowRetry === false || me === null) return response
+      if (response.status !== 401 || allowRetry === false || profile === null || me !== profile) return response
       return refreshSession().then(function (state) {
+        if (me !== profile) return response
         if (state === 'ok') return api(path, options, false)
         if (state === 'expired') handleSignedOut()
         return response
@@ -338,11 +347,19 @@
     oldestCreatedAt = null
     oldestId = null
     hasMore = false
+    latestPresence.clear()
     updateMoreButton()
     // 空状态提示要一起复位：它被 insertMessage() 隐藏过之后就一直是 hidden，
     // 不清回来的话，退出登录再进一个真的没人的房间，消息区会是一片纯空白
     // （连「还没有人说话」都没有），看起来像页面坏了。
-    if (el.empty !== null) el.empty.hidden = false
+    updateEmptyMessage()
+  }
+
+  function updateEmptyMessage() {
+    if (el.empty === null) return
+    var hasCards = el.callCards !== null && !el.callCards.hidden
+    var hasMessages = el.messages !== null && el.messages.querySelector('.chat__message') !== null
+    el.empty.hidden = hasCards || hasMessages
   }
 
   function updateMoreButton() {
@@ -626,8 +643,6 @@
   /** 按 createdAt 插入，保证「自己发的 HTTP 响应」和「WebSocket 广播」乱序到达时顺序依然正确。 */
   function insertMessage(message) {
     if (el.messages === null || findByID(message.id) !== null) return
-    var node = renderMessage(message)
-    node.dataset.createdAt = String(message.createdAt)
 
     /*
      * 游标是 `(createdAt, id)` 复合键，取「字典序最小的那一条」。
@@ -644,18 +659,97 @@
       oldestId = message.id
     }
 
+    // 历史页被隐藏的进出提示也参与分页，翻页才不会卡在同一页。
+    var presence = message.kind === KIND_SYSTEM && /^(.+) (?:加入|离开)了房间$/.exec(message.body)
+    if (presence) {
+      var latest = latestPresence.get(presence[1])
+      if (latest !== undefined) {
+        var latestAt = sortKey(latest)
+        if (message.createdAt < latestAt || (message.createdAt === latestAt && message.id <= latest.dataset.id)) return
+        latest.remove()
+      }
+    }
+
+    var node = renderMessage(message)
+    node.dataset.createdAt = String(message.createdAt)
+    if (presence) latestPresence.set(presence[1], node)
+
     var existing = el.messages.querySelectorAll('.chat__message')
     var placed = false
     for (var i = existing.length - 1; i >= 0; i -= 1) {
-      if (sortKey(existing[i]) <= message.createdAt) {
+      var createdAt = sortKey(existing[i])
+      if (createdAt < message.createdAt || (createdAt === message.createdAt && existing[i].dataset.id < message.id)) {
         existing[i].insertAdjacentElement('afterend', node)
         placed = true
         break
       }
     }
-    if (!placed) el.messages.insertBefore(node, el.messages.firstChild)
+    if (!placed) el.messages.insertBefore(node, existing[0] || el.callCards)
 
     if (el.empty !== null) el.empty.hidden = true
+  }
+
+  function renderRoomCalls() {
+    var ready = me !== null && videoCalls !== null && videoCalls.canInvite() &&
+      socket !== null && socket.readyState === WebSocket.OPEN
+    if (el.callInvite !== null) el.callInvite.hidden = !ready
+
+    var cards = document.createDocumentFragment()
+    var statuses = document.createDocumentFragment()
+    roomCalls.forEach(function (call) {
+      if (call.phase === 'active' && call.callee && typeof call.callee.username === 'string') {
+        var status = document.createElement('p')
+        status.className = 'chat__active-call-status'
+        status.textContent = call.caller.username + '、' + call.callee.username + '正在视频通话'
+        statuses.appendChild(status)
+      }
+      if (!call.publicInvite) return
+
+      var card = document.createElement('article')
+      card.className = 'chat__call-card'
+      var copy = document.createElement('div')
+      copy.className = 'chat__call-card-copy'
+      var title = document.createElement('strong')
+      title.className = 'chat__call-card-title'
+      title.textContent = call.caller.username + ' 发起了视频通话'
+      var detail = document.createElement('p')
+      detail.className = 'chat__call-card-status'
+      detail.textContent = call.phase === 'ringing' ? '等待成员加入' :
+        call.phase === 'connecting' ? '正在连接' : '通话中'
+      copy.append(title, detail)
+      card.appendChild(copy)
+
+      if (ready && call.phase === 'ringing' && call.caller.userId !== me.id) {
+        var join = document.createElement('button')
+        join.type = 'button'
+        join.className = 'chat__button chat__call-card-action'
+        join.textContent = '加入通话'
+        join.addEventListener('click', function () { videoCalls.joinRoomCall(call) })
+        card.appendChild(join)
+      }
+      cards.appendChild(card)
+    })
+
+    if (el.activeCalls !== null) {
+      el.activeCalls.hidden = !statuses.hasChildNodes()
+      el.activeCalls.replaceChildren(statuses)
+    }
+    if (el.callCards !== null) {
+      el.callCards.hidden = !cards.hasChildNodes()
+      el.callCards.replaceChildren(cards)
+    }
+    updateEmptyMessage()
+  }
+
+  function updateRoomCalls(calls) {
+    var shouldStick = nearBottom()
+    roomCalls = Array.isArray(calls) ? calls.filter(function (call) {
+      return call && typeof call.callId === 'string' && call.caller &&
+        typeof call.caller.userId === 'string' && typeof call.caller.username === 'string' &&
+        (call.phase === 'ringing' || call.phase === 'connecting' || call.phase === 'active')
+    }) : []
+    renderRoomCalls()
+    if (shouldStick) scrollToBottom()
   }
 
   function nearBottom() {
@@ -694,8 +788,10 @@
    * 读代码的人只能停下来确认一遍「是不是哪里会改它」——已经删掉，直接滚。
    */
   function loadInitialHistory() {
+    var profile = me
+    clearMessages()
     return loadHistory(null).then(function (page) {
-      clearMessages()
+      if (me !== profile) return
       page.messages.forEach(function (message) {
         insertMessage(message)
       })
@@ -719,9 +815,11 @@
    * 那种情况刷新页面即可，不值得为它单独加一个增量接口。
    */
   function catchUp() {
+    var profile = me
     var shouldStick = nearBottom()
     loadHistory(null)
       .then(function (page) {
+        if (me !== profile) return
         page.messages.forEach(function (message) {
           insertMessage(message)
         })
@@ -1308,17 +1406,6 @@
       item.appendChild(tag)
     }
 
-    if (videoCalls !== null && videoCalls.canInvite() && me !== null &&
-        member.id !== me.id && member.online === true && muted === null) {
-      var callButton = document.createElement('button')
-      callButton.type = 'button'
-      callButton.className = 'chat__button chat__member-call'
-      callButton.textContent = '视频'
-      callButton.setAttribute('aria-label', '呼叫 ' + member.username)
-      callButton.addEventListener('click', function () { videoCalls.invite(member) })
-      item.appendChild(callButton)
-    }
-
     // 管理员操作按钮靠右（margin-left:auto），所以「不显示」时名字和
     // 次要信息自然贴左——不能给它留空占位，那样普通用户看着会莫名多一段空白。
     if (me !== null && me.role === 'admin' && member.id !== me.id) {
@@ -1700,13 +1787,13 @@
 
   // --- WebSocket ------------------------------------------------------------
 
-  function closeSocket() {
+  function closeSocket(reason) {
     if (abortVideoHandoff !== null) abortVideoHandoff()
     if (socket !== null) {
       var closing = socket
       socket = null
       try {
-        closing.close(1000)
+        closing.close(1000, reason)
       } catch (error) {
         /* 已经关了 */
       }
@@ -1715,9 +1802,14 @@
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
+    updateRoomCalls([])
   }
 
   function handleEvent(event) {
+    if (event.type === 'session-revoked') {
+      handleSignedOut(SESSION_REVOKED_TEXT)
+      return
+    }
     if (event.type === 'ready') {
       setStatus(onlineStatus(event.online), 'online')
       if (videoCalls !== null) videoCalls.ready(event)
@@ -1726,6 +1818,10 @@
         pendingCatchUp = false
         catchUp()
       }
+      return
+    }
+    if (event.type === 'call-room') {
+      updateRoomCalls(event.calls)
       return
     }
     if (event.type === 'call' || event.type === 'webrtc') {
@@ -1755,6 +1851,7 @@
     if (event.type === 'deleted') {
       var node = findByID(event.id)
       if (node !== null) node.remove()
+      updateEmptyMessage()
       if (videoCalls !== null) videoCalls.removeMessage(event.id)
     }
     if (event.type === 'purged') {
@@ -1767,18 +1864,20 @@
 
   function scheduleReconnect() {
     if (me === null || reconnectTimer !== null) return
+    var profile = me
     var delay = reconnectDelay
     reconnectDelay = Math.min(reconnectDelay * 2, 15000)
 
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null
-      if (me === null) return
+      if (me !== profile) return
       // 握手是 DO 直接拿 Cookie 校验的，access token 过期会 401。
       // 所以重连之前先换一张新的，否则会一直连不上。
       //
       // 只有 'expired' 才登出：被限流（429）说明刷新得太勤、稍后重试即可，
       // 那时把人踢回登录页纯属自伤 —— 密码是对的，会话也是好的。
       refreshSession().then(function (state) {
+        if (me !== profile) return
         if (state === 'expired') {
           handleSignedOut()
           return
@@ -1823,6 +1922,7 @@
 
       var next
       var readyEvent
+      var roomEvent
       try { next = new WebSocket(socketUrl()) } catch (error) { return }
       var timeout = setTimeout(cancel, 7000)
       abortVideoHandoff = cancel
@@ -1843,9 +1943,14 @@
         var event
         try { event = JSON.parse(message.data) } catch (error) { return }
         if (!event) return
+        if (event.type === 'session-revoked') return handleSignedOut(SESSION_REVOKED_TEXT)
         if (event.type === 'ready') {
           readyEvent = event
           if (!event.videoCalls || !sendVideoFrame({ type: 'call', action: 'hello' }, next)) cancel()
+          return
+        }
+        if (event.type === 'call-room') {
+          roomEvent = event
           return
         }
         if (event.type !== 'call') return
@@ -1869,6 +1974,7 @@
           wireSocket(next)
           videoCalls.replaced(readyEvent, event)
           setStatus(onlineStatus(readyEvent.online), 'online')
+          if (roomEvent) updateRoomCalls(roomEvent.calls)
           try { previous.close(1000) } catch (error) { /* 已断开 */ }
           catchUp()
         }
@@ -1915,10 +2021,15 @@
       if (event !== null) handleEvent(event)
     })
 
-    ws.addEventListener('close', function () {
+    ws.addEventListener('close', function (event) {
       if (socket !== ws) return
       socket = null
+      if (event.code === 4403) {
+        handleSignedOut(SESSION_REVOKED_TEXT)
+        return
+      }
       if (videoCalls !== null) videoCalls.disconnected()
+      updateRoomCalls([])
       setStatus('连接已断开，正在重连…', 'connecting')
       scheduleReconnect()
     })
@@ -2027,9 +2138,9 @@
     showAuth()
   }
 
-  function handleSignedOut() {
+  function handleSignedOut(reason) {
     resetToAuthPanel()
-    notice('登录已过期，请重新登录', 'error')
+    notice(reason || '登录已过期，请重新登录', 'error')
   }
 
   function loadMe() {
@@ -2236,12 +2347,33 @@
     })
   }
 
+  if (el.callInvite !== null) {
+    el.callInvite.addEventListener('click', function () {
+      if (videoCalls !== null && videoCalls.canInvite()) videoCalls.inviteRoom()
+    })
+  }
+
   if (el.input !== null) {
+    var keepLineBreak = false
     el.input.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-        event.preventDefault()
-        sendMessage()
-      }
+      if (event.key !== 'Enter') return
+      keepLineBreak = event.shiftKey
+      if (keepLineBreak || event.isComposing || event.keyCode === 229) return
+      event.preventDefault()
+      sendMessage()
+    })
+    el.input.addEventListener('keyup', function (event) {
+      if (event.key === 'Enter') keepLineBreak = false
+    })
+    el.input.addEventListener('blur', function () {
+      keepLineBreak = false
+    })
+    // 部分软键盘用 beforeinput 插入换行，不会派发 Enter 键。
+    el.input.addEventListener('beforeinput', function (event) {
+      if (el.input.getAttribute('enterkeyhint') !== 'send' || keepLineBreak || event.isComposing || !event.cancelable) return
+      if (event.inputType !== 'insertLineBreak' && event.inputType !== 'insertParagraph') return
+      event.preventDefault()
+      sendMessage()
     })
   }
 
@@ -2495,7 +2627,7 @@
   // 从后台切回前台时，如果连接已经掉了就立刻重连，不用等退避计时器
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible' || me === null) return
-    if (videoCalls !== null) videoCalls.check()
+    if (videoCalls !== null) videoCalls.foreground()
     // 从后台切回来也当作重连处理：休眠期间连接可能已经悄悄断了。
     if (socket === null && reconnectTimer === null) connect(true)
   })
@@ -2503,7 +2635,7 @@
   window.addEventListener('pagehide', function () {
     if (videoCalls !== null) {
       videoCalls.leave()
-      closeSocket()
+      closeSocket('page closed')
     }
   })
 

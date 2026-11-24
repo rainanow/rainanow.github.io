@@ -208,8 +208,7 @@ export function registerModerationRoutes({ app, User, Message, UserPurge, auth }
       .where(eq(Message.table.userId, targetId))
       .returning({ id: Message.table.id })
 
-    await revokeAllSessions(c.env.DB, targetId)
-    await app.db.delete(User.table).where(eq(User.table.id, targetId))
+    await revokeAllSessions(c.env, targetId, c.env.DB.prepare('DELETE FROM users WHERE id = ?1').bind(targetId))
 
     // 审计写在最后：它要记 purgedMessages，而这个数来自上面的 returning。
     // 万一这步失败，账号已经删了 —— 只记日志，不能因此报错，

@@ -1,11 +1,12 @@
-import { verify } from '@nanokajs/auth'
-import { deleteCookie, getCookie } from 'hono/cookie'
+import { sign, verify } from '@nanokajs/auth'
+import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
 import { z } from 'zod'
 
 import { revokeRefreshToken } from '../blacklist'
 import {
   ACCESS_TOKEN_COOKIE,
+  ACCESS_TOKEN_TTL_SECONDS,
   REFRESH_TOKEN_COOKIE,
   REFRESH_TOKEN_TTL_SECONDS,
   USERNAME_PATTERN,
@@ -14,7 +15,7 @@ import type { AppEnv, ChatContext } from '../context'
 import { scryptHasher } from '../hasher'
 import { clientIp } from '../middleware'
 import { consumeRateLimit, effectiveLimit, peekRateLimit } from '../rate-limit'
-import { isSessionActive, registerSession } from '../sessions'
+import { isSessionActive, replaceSession, revokeSession, rotateSession } from '../sessions'
 
 /** 登录失败限额：同一 IP + 同一用户名，1 小时内最多 10 次。 */
 const LOGIN_FAILURE_LIMIT = 10
@@ -183,9 +184,9 @@ const refreshThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
    * 它本来就会拒。少一处判断就少一处不一致。
    */
   if (pendingJti !== null && !(await isSessionActive(c.env.DB, pendingJti))) {
-    deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
     return c.json({ error: '登录状态已失效，请重新登录' }, 401)
   }
+  if (pendingJti !== null) c.set('refreshJti', pendingJti)
 
   await next()
 }
@@ -258,18 +259,7 @@ const logoutThrottle: MiddlewareHandler<AppEnv> = async (c, next) => {
 }
 
 /**
- * 登录 / 刷新成功后，把新签发的 refresh token 登记进「有效会话」表。
- *
- * ## 为什么需要这么绕
- *
- * `@nanokajs/auth` 在 handler 内部签好 JWT、塞进 Set-Cookie，没有「签发后回调」的钩子。
- * 所以只能在 handler **之前**挂一个中间件：`await next()` 让它跑完，
- * 然后从 `c.res` 的 Set-Cookie 里把 refresh token 抠出来、解出 jti、登记。
- *
- * 挂在前面而不是后面，是因为 Hono 里 handler 一旦返回 Response就不再往下走，
- * 写在后面的中间件根本不会被调用。`await next()` 之后 `c.res` 才是完整的。
- *
- * 换来的好处是**不用 fork 那个库**。
+ * 库负责校验密码和轮换 refresh token。登记成功后签一张与当前设备会话绑定的 access token。
  */
 const trackSession: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next()
@@ -280,29 +270,31 @@ const trackSession: MiddlewareHandler<AppEnv> = async (c, next) => {
     c.res.headers as unknown as { getSetCookie?: () => string[] }
   ).getSetCookie?.() ?? []
 
-  for (const line of setCookies) {
-    if (!line.startsWith(`${REFRESH_TOKEN_COOKIE}=`)) continue
-    const value = line.slice(REFRESH_TOKEN_COOKIE.length + 1).split(';')[0]
-    if (value === undefined || value.length === 0) continue
-    try {
-      const payload = await verify<{ sub?: unknown; jti?: unknown; exp?: unknown }>(
-        value,
-        c.env.AUTH_SECRET,
-      )
-      if (
-        typeof payload.sub === 'string' &&
-        typeof payload.jti === 'string' &&
-        typeof payload.exp === 'number'
-      ) {
-        await registerSession(c.env.DB, payload.jti, payload.sub, payload.exp)
-      }
-    } catch (error) {
-      // 登记失败不影响登录本身：最坏情况是这个 token 没被记进有效列表，
-      // 于是下次 refresh 会被判成失效、要求重新登录。可接受。
-      console.error('登记会话失败', error)
-    }
+  const refreshCookie = setCookies.find((line) => line.startsWith(`${REFRESH_TOKEN_COOKIE}=`))
+  const refreshToken = refreshCookie?.slice(REFRESH_TOKEN_COOKIE.length + 1).split(';')[0]
+  c.header('Set-Cookie', undefined)
+  if (!refreshCookie || !refreshToken) {
+    c.res = c.json({ error: '无法建立登录会话，请重试' }, 503)
     return
   }
+  const { sub, jti, exp } = await verify<{ sub?: unknown; jti?: unknown; exp?: unknown }>(refreshToken, c.env.AUTH_SECRET)
+  if (typeof sub !== 'string' || typeof jti !== 'string' || typeof exp !== 'number') {
+    c.res = c.json({ error: '无法建立登录会话，请重试' }, 503)
+    return
+  }
+  const previousJti = c.get('refreshJti')
+  const sessionId = c.req.path === '/auth/login' ? await replaceSession(c.env, sub, jti, exp)
+    : previousJti === undefined ? null : await rotateSession(c.env.DB, sub, previousJti, jti, exp)
+  if (sessionId === null) {
+    c.res = c.json({ error: '登录状态已失效，请重新登录' }, 401)
+    return
+  }
+  const token = await sign({ sub, type: 'access', sid: sessionId }, c.env.AUTH_SECRET, { expiresIn: ACCESS_TOKEN_TTL_SECONDS })
+  c.header('Set-Cookie', refreshCookie, { append: true })
+  setCookie(c, ACCESS_TOKEN_COOKIE, token, {
+    path: '/', httpOnly: true, secure: c.env.COOKIE_SECURE !== 'false', sameSite: 'Lax',
+    maxAge: ACCESS_TOKEN_TTL_SECONDS,
+  })
 }
 
 export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
@@ -374,29 +366,23 @@ export function registerAuthRoutes({ app, User, auth }: ChatContext): void {
    * 之后 `refreshHandler()` 内部的 `hasForSubject` 就会拒绝它。
    */
   app.post('/auth/logout', logoutThrottle, async (c) => {
+    const accessToken = getCookie(c, ACCESS_TOKEN_COOKIE)
+    const access = accessToken && await verify<{ sub?: unknown; type?: unknown; sid?: unknown }>(
+      accessToken, c.env.AUTH_SECRET,
+    ).catch(() => null)
+    if (access && access.type === 'access' && typeof access.sub === 'string' && typeof access.sid === 'string') {
+      await revokeSession(c.env, access.sub, 'sessionId', access.sid)
+    }
+
     const refreshToken = getCookie(c, REFRESH_TOKEN_COOKIE)
     if (refreshToken !== undefined && refreshToken.length > 0) {
-      try {
-        const payload = await verify<{
-          sub?: unknown
-          type?: unknown
-          jti?: unknown
-          exp?: unknown
-        }>(refreshToken, c.env.AUTH_SECRET)
-
-        if (
-          payload.type === 'refresh' &&
-          typeof payload.sub === 'string' &&
-          typeof payload.jti === 'string'
-        ) {
-          const expiresAt =
-            typeof payload.exp === 'number'
-              ? payload.exp
-              : Math.floor(Date.now() / 1000) + REFRESH_TOKEN_TTL_SECONDS
-          await revokeRefreshToken(c.env.DB, payload.jti, payload.sub, expiresAt)
-        }
-      } catch {
-        // 令牌本来就无效或已过期，不需要吊销，照常清 Cookie 即可。
+      const payload = await verify<{ sub?: unknown; type?: unknown; jti?: unknown; exp?: unknown }>(
+        refreshToken, c.env.AUTH_SECRET,
+      ).catch(() => null)
+      if (payload?.type === 'refresh' && typeof payload.sub === 'string' && typeof payload.jti === 'string') {
+        await revokeSession(c.env, payload.sub, 'jti', payload.jti)
+        const expiresAt = typeof payload.exp === 'number' ? payload.exp : Math.floor(Date.now() / 1000) + REFRESH_TOKEN_TTL_SECONDS
+        await revokeRefreshToken(c.env.DB, payload.jti, payload.sub, expiresAt)
       }
     }
 

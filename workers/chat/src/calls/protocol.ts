@@ -16,7 +16,9 @@ const candidate = z.strictObject({
 const schema = z.discriminatedUnion('action', [
   z.strictObject({ type: call, action: z.literal('hello') }),
   z.strictObject({ type: call, action: z.literal('invite'), requestId: id, userId }),
+  z.strictObject({ type: call, action: z.literal('invite-room'), requestId: id }),
   z.strictObject({ type: call, action: z.literal('accept'), callId }),
+  z.strictObject({ type: call, action: z.literal('join'), callId }),
   z.strictObject({ type: call, action: z.literal('reject'), callId }),
   z.strictObject({ type: call, action: z.literal('cancel'), callId }),
   z.strictObject({ type: call, action: z.literal('media-ready'), callId }),
@@ -46,13 +48,29 @@ export interface CallPeer {
   username: string
 }
 
+/** 房间成员可见的邀请卡片与通话状态。 */
+export interface RoomCall {
+  callId: string
+  caller: CallPeer
+  callee?: CallPeer
+  phase: CallPhase
+  createdAt: number
+  expiresAt?: number
+  publicInvite: boolean
+}
+
+export interface RoomCallSnapshot {
+  type: 'call-room'
+  calls: RoomCall[]
+}
+
 export type CallEvent =
   | { type: 'call'; action: 'available' }
-  | { type: 'call'; action: 'invited'; callId: string; requestId: string; peer: CallPeer; expiresAt: number }
+  | { type: 'call'; action: 'invited'; callId: string; requestId: string; peer?: CallPeer; expiresAt: number }
   | { type: 'call'; action: 'incoming'; callId: string; peer: CallPeer; expiresAt: number }
   | {
       type: 'call'; action: 'accepted'; callId: string; role: 'caller' | 'callee';
-      resumeToken: string; expiresAt: number
+      resumeToken: string; expiresAt: number; peer?: CallPeer
     }
   | { type: 'call'; action: 'negotiate' | 'active'; callId: string }
   | {

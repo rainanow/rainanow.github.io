@@ -5,6 +5,7 @@ import type { Context } from 'hono'
 import { z } from 'zod'
 
 import {
+  ACCESS_TOKEN_COOKIE,
   DELETE_ALLOWED_PER_WINDOW,
   DELETE_WINDOW_SECONDS,
   EXPORT_LIMIT,
@@ -778,11 +779,9 @@ export function registerChatRoutes({ app, User, Message, RoomPurge, auth }: Chat
       }
 
       const hash = await scryptHasher.hash(newPassword)
-      await User.update(user.id, { password: hash })
-
-      // 吊销这个账号所有还活着的 refresh token，让改密码**真的**生效。
-      // 不吊销的话，密码改了，之前泄露的 token 照样能换出新 access token。
-      const revoked = await revokeAllSessions(c.env.DB, user.id)
+      const revoked = await revokeAllSessions(c.env, user.id,
+        c.env.DB.prepare('UPDATE users SET password = ?1 WHERE id = ?2').bind(hash, user.id))
+      deleteCookie(c, ACCESS_TOKEN_COOKIE, { path: '/' })
       deleteCookie(c, REFRESH_TOKEN_COOKIE, { path: '/' })
 
       return c.json({ ok: true, revokedSessions: revoked })

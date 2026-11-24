@@ -23,6 +23,7 @@ import { registerAuthRoutes } from './routes/auth'
 import { registerChatRoutes } from './routes/chat'
 import { registerMediaRoutes } from './routes/media'
 import { registerModerationRoutes } from './moderation'
+import { isAccessActive } from './sessions'
 
 export function buildChatApp(env: Env): ChatContext {
   if (typeof env.AUTH_SECRET !== 'string' || env.AUTH_SECRET.length < 32) {
@@ -38,7 +39,7 @@ export function buildChatApp(env: Env): ChatContext {
   const RoomPurge = app.model(roomPurgeTableName, roomPurgeFields)
   const UserPurge = app.model(userPurgeTableName, userPurgeFields)
 
-  const auth = createAuth({
+  const tokenAuth = createAuth({
     model: User,
     secret: env.AUTH_SECRET,
     // 这两个名字是**一物两用**的：既用来读请求体（body[fields.password]），
@@ -71,6 +72,17 @@ export function buildChatApp(env: Env): ChatContext {
     },
     blacklist: d1BlacklistStore(env.DB),
   })
+  const verifyAccess = tokenAuth.middleware()
+  const auth: ChatContext['auth'] = {
+    ...tokenAuth,
+    middleware: () => (c, next) => verifyAccess(c, async () => {
+      const { sub, sid } = c.get('user')
+      if (typeof sub !== 'string' || typeof sid !== 'string' || !await isAccessActive(c.env.DB, sub, sid)) {
+        throw new HTTPException(401, { message: '登录状态已失效，请重新登录' })
+      }
+      await next()
+    }),
+  }
 
   app.use(
     '*',

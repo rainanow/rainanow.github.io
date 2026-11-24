@@ -21,6 +21,8 @@ export interface ChatMessage {
 export type ChatServerEvent =
   /** 握手成功，附带当前在线人数 */
   | { type: 'ready'; online: number; room: string; videoCalls?: true; accessExpiresAt?: number }
+  /** 设备会话已吊销，通知页面先于底层关闭握手。 */
+  | { type: 'session-revoked' }
   /** 有新消息（普通消息和系统消息都走这里） */
   | { type: 'message'; message: ChatMessage }
   /**
@@ -38,6 +40,8 @@ export type ChatServerEvent =
 export interface SocketAttachment {
   userId: string
   username: string
+  /** 稳定的登录会话 ID。部署前已打开的连接需要续期后重新握手。 */
+  sessionId?: string
   /** 仅视频信令启用后的新连接分配 ID。hello 后才加入可呼叫列表。 */
   connectionId?: string
   callReady?: true
@@ -52,15 +56,7 @@ export interface SocketAttachment {
    * attachment 是跟着连接持久化的，休眠唤醒后照样读得到，不受驱逐影响。
    */
   room: string
-  /**
-   * 建起这条连接的那张 access token 的到期时间（epoch **秒**，和 JWT 的 `exp` 同口径）。
-   *
-   * 为什么要把它一起存下来：WebSocket 只在握手时验一次令牌，之后 DO 再也不看它。
-   * 于是「令牌过期」「改密码吊销了会话」「账号被管理员注销」这三件事
-   * 对一条**已经建好**的连接毫无影响 —— 人已经被删了，只要他不刷新页面
-   * 就能一直收消息。记下 exp，广播时顺手对一下，洞就堵上了：
-   * **连接的最长寿命 = 它凭以建立的那张凭证的寿命。**
-   */
+  /** 建立连接时 access token 的过期时间，单位为 Unix 秒。 */
   exp: number
 }
 

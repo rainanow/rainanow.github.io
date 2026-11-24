@@ -2,7 +2,7 @@ import type { SocketAttachment } from '../types'
 import { callRooms } from './ice'
 import type { IceAccess } from './ice'
 import { parseCallMessage } from './protocol'
-import type { CallEnd, CallError, CallEvent, CallInput, CallPeer, CallPhase } from './protocol'
+import type { CallEnd, CallError, CallEvent, CallInput, CallPeer, CallPhase, RoomCall, RoomCallSnapshot } from './protocol'
 
 const RING_MS = 30_000
 const CONNECT_MS = 45_000
@@ -16,13 +16,16 @@ const SESSION = 'video:session:'
 const USER = 'video:user:'
 const TEMP = 'video:temp:'
 
-type Connection = SocketAttachment & { connectionId: string }
-type Invite = Extract<CallInput, { action: 'invite' }>
-type Accept = Extract<CallInput, { action: 'accept' }>
+type Connection = SocketAttachment & { connectionId: string; sessionId: string }
+type CallAccount = Pick<Connection, 'userId' | 'sessionId'>
+export type CallDeparture = 'session-revoked' | 'page-closed'
+type Invite = Extract<CallInput, { action: 'invite' | 'invite-room' }>
+type Accept = Extract<CallInput, { action: 'accept' | 'join' }>
 type Resume = Extract<CallInput, { action: 'resume' }>
 
 interface Binding {
   connectionId: string
+  sessionId?: string
   expiresAt: number
   tokenDigest?: string
   reconnectBy?: number
@@ -38,8 +41,10 @@ interface Session {
   id: string
   room: string
   phase: CallPhase
+  createdAt?: number
+  publicInvite?: true
   deadline?: number
-  participants: [Participant, Participant]
+  participants: [Participant, Participant?]
   ringing: string[]
   offerSent?: true
   answerSent?: true
@@ -53,7 +58,7 @@ interface Temporary<T> {
 interface InviteReceipt {
   callId: string
   connectionId: string
-  userId: string
+  userId?: string
 }
 
 interface Budget {
@@ -66,7 +71,7 @@ function peer(identity: CallPeer): CallPeer {
 }
 
 function bind(identity: Connection, tokenDigest?: string): Binding {
-  return { connectionId: identity.connectionId, expiresAt: identity.exp * 1000, tokenDigest }
+  return { connectionId: identity.connectionId, sessionId: identity.sessionId, expiresAt: identity.exp * 1000, tokenDigest }
 }
 
 async function digest(token: string): Promise<string> {
@@ -99,14 +104,49 @@ export class CallSignaling {
     return this.rooms.has(room)
   }
 
+  sendRoomSnapshot(ws: WebSocket): void {
+    const identity = this.connection(ws)
+    if (identity === undefined || !this.enabled(identity.room)) return
+    this.sendJson(ws, JSON.stringify(this.roomSnapshot(identity.room)))
+  }
+
+  private roomSnapshot(room: string): RoomCallSnapshot {
+    const calls: RoomCall[] = []
+    const now = Date.now()
+    for (const [, session] of this.kv.list<Session>({ prefix: SESSION })) {
+      if (session.room !== room || (!session.publicInvite && session.phase !== 'active') ||
+          (session.deadline !== undefined && session.deadline <= now)) continue
+      const [caller, callee] = session.participants
+      if (callee === undefined && session.phase !== 'ringing') continue
+      calls.push({
+        callId: session.id,
+        caller: peer(caller),
+        callee: callee === undefined ? undefined : peer(callee),
+        phase: session.phase,
+        createdAt: session.createdAt ?? 0,
+        expiresAt: session.deadline,
+        publicInvite: session.publicInvite === true,
+      })
+    }
+    calls.sort((left, right) => left.createdAt - right.createdAt || left.callId.localeCompare(right.callId))
+    return { type: 'call-room', calls }
+  }
+
+  private publishRoom(room: string): void {
+    const payload = JSON.stringify(this.roomSnapshot(room))
+    for (const ws of this.ctx.getWebSockets()) {
+      if (this.connection(ws)?.room === room) this.sendJson(ws, payload)
+    }
+  }
+
   async canIssueIce(input: IceAccess): Promise<boolean> {
     if (!this.enabled(input.room)) return false
     const tokenDigest = await digest(input.resumeToken)
     const session = this.iceSession(input, tokenDigest)
-    if (session === undefined ||
-        !await this.accountsCanCall(session.participants[0].userId, session.participants[1].userId)) {
-      return false
-    }
+    if (session === undefined) return false
+    const caller = this.participantAccount(session.participants[0])
+    const callee = this.participantAccount(session.participants[1])
+    if (caller === undefined || callee === undefined || !await this.accountsCanCall(caller, callee)) return false
     // 账号查询期间会话可能已经挂断。签发前以当前状态为准。
     const current = this.iceSession(input, tokenDigest)
     if (current === undefined) return false
@@ -118,7 +158,7 @@ export class CallSignaling {
   private iceSession(input: IceAccess, tokenDigest: string): Session | undefined {
     const session = this.kv.get<Session>(SESSION + input.callId)
     if (session === undefined || session.room !== input.room || session.phase === 'ringing') return
-    const participant = session.participants.find((member) => member.userId === input.userId)
+    const participant = session.participants.find((member) => member?.userId === input.userId)
     if (participant?.binding?.tokenDigest === tokenDigest && this.boundSocket(participant.binding) !== undefined) {
       return session
     }
@@ -144,9 +184,9 @@ export class CallSignaling {
         this.send(ws, { type: 'call', action: 'available' })
       } else if (!identity.callReady) {
         this.error(ws, 'not-ready', input)
-      } else if (input.action === 'invite') {
+      } else if (input.action === 'invite' || input.action === 'invite-room') {
         await this.invite(ws, identity, input)
-      } else if (input.action === 'accept') {
+      } else if (input.action === 'accept' || input.action === 'join') {
         await this.accept(ws, identity, input)
       } else if (input.action === 'resume') {
         await this.resume(ws, identity, input)
@@ -162,11 +202,20 @@ export class CallSignaling {
     }
   }
 
-  async departure(identity: SocketAttachment): Promise<void> {
+  async departure(identity: SocketAttachment, departure?: CallDeparture): Promise<void> {
     if (identity.connectionId === undefined || !identity.callReady) return
     const session = this.sessionForUser(identity.userId)
     if (session === undefined) return
-    this.reconcile(session, Date.now())
+    const binding = session.participants.find((member) => member?.userId === identity.userId)?.binding
+    const boundSocket = binding?.connectionId === identity.connectionId
+    if (departure === 'session-revoked' && binding !== undefined &&
+        (binding.sessionId === identity.sessionId || boundSocket)) {
+      this.finish(session, 'disconnected')
+    } else if (departure === 'page-closed' && boundSocket) {
+      this.finish(session, 'hangup')
+    } else {
+      this.reconcile(session, Date.now())
+    }
     await this.armAlarm()
   }
 
@@ -184,17 +233,19 @@ export class CallSignaling {
   }
 
   private async invite(ws: WebSocket, identity: Connection, input: Invite): Promise<void> {
-    if (identity.userId === input.userId) return this.error(ws, 'invalid-target', input)
+    const targetId = input.action === 'invite' ? input.userId : undefined
+    if (identity.userId === targetId) return this.error(ws, 'invalid-target', input)
     const receiptKey = 'request:' + identity.userId + ':' + input.requestId
-    const cooldownKey = 'recipient:' + identity.userId + ':' + input.userId
+    const cooldownKey = targetId === undefined ? undefined : 'recipient:' + identity.userId + ':' + targetId
     let now = Date.now()
     if (this.replyToRetry(ws, identity, input, receiptKey, now)) return
-    if (!this.takeInvite(identity.userId, now) || this.getTemporary(cooldownKey, now) !== undefined) {
+    if (!this.takeInvite(identity.userId, now) ||
+        (cooldownKey !== undefined && this.getTemporary(cooldownKey, now) !== undefined)) {
       return this.error(ws, 'rate-limited', input)
     }
     await this.armAlarm()
-    if (this.callableSockets(input.userId, identity.room).length === 0 ||
-        !await this.accountsCanCall(identity.userId, input.userId)) {
+    const target = targetId === undefined ? undefined : this.callableSockets(targetId, identity.room)[0]?.identity
+    if ((targetId !== undefined && target === undefined) || !await this.accountsCanCall(identity, target)) {
       return this.error(ws, 'unavailable', input)
     }
 
@@ -202,37 +253,44 @@ export class CallSignaling {
     now = Date.now()
     if (this.connection(ws) === undefined) return
     if (this.replyToRetry(ws, identity, input, receiptKey, now)) return
-    const recipients = this.callableSockets(input.userId, identity.room)
+    const recipients = target === undefined ? [] : this.callableSockets(target.userId, identity.room)
+      .filter((entry) => entry.identity.sessionId === target.sessionId)
     const callee = recipients[0]?.identity
-    if (callee === undefined) return this.error(ws, 'unavailable', input)
-    if (this.isBusy(identity.userId, now) || this.isBusy(callee.userId, now)) {
+    if (targetId !== undefined && callee === undefined) return this.error(ws, 'unavailable', input)
+    if (this.isBusy(identity.userId, now) || (callee !== undefined && this.isBusy(callee.userId, now))) {
       return this.error(ws, 'busy', input)
     }
-    if (this.getTemporary(cooldownKey, now) !== undefined) return this.error(ws, 'rate-limited', input)
+    if (cooldownKey !== undefined && this.getTemporary(cooldownKey, now) !== undefined) {
+      return this.error(ws, 'rate-limited', input)
+    }
 
     const expiresAt = now + RING_MS
     const session: Session = {
       id: crypto.randomUUID(),
       room: identity.room,
       phase: 'ringing',
+      createdAt: now,
       deadline: expiresAt,
-      participants: [{ ...peer(identity), binding: bind(identity) }, peer(callee)],
+      participants: [{ ...peer(identity), binding: bind(identity) }],
       ringing: recipients.map((entry) => entry.identity.connectionId),
     }
+    if (callee === undefined) session.publicInvite = true
+    else session.participants[1] = peer(callee)
     this.ctx.storage.transactionSync(() => {
       this.save(session)
       this.kv.put(USER + identity.userId, session.id)
-      this.kv.put(USER + callee.userId, session.id)
+      if (callee !== undefined) this.kv.put(USER + callee.userId, session.id)
       this.putTemporary<InviteReceipt>(
-        receiptKey, { callId: session.id, connectionId: identity.connectionId, userId: callee.userId },
+        receiptKey, { callId: session.id, connectionId: identity.connectionId, userId: targetId },
         now + REQUEST_TTL_MS,
       )
-      this.putTemporary(cooldownKey, true, now + RECIPIENT_COOLDOWN_MS)
+      if (cooldownKey !== undefined) this.putTemporary(cooldownKey, true, now + RECIPIENT_COOLDOWN_MS)
     })
     this.send(ws, {
       type: 'call', action: 'invited', callId: session.id, requestId: input.requestId,
-      peer: peer(callee), expiresAt,
+      peer: callee === undefined ? undefined : peer(callee), expiresAt,
     })
+    if (session.publicInvite) this.publishRoom(session.room)
     for (const recipient of recipients) {
       this.send(recipient.ws, {
         type: 'call', action: 'incoming', callId: session.id, peer: peer(identity), expiresAt,
@@ -245,7 +303,8 @@ export class CallSignaling {
   ): boolean {
     const receipt = this.getTemporary<InviteReceipt>(key, now)
     if (receipt === undefined) return false
-    if (identity.connectionId !== receipt.connectionId || input.userId !== receipt.userId) {
+    const targetId = input.action === 'invite' ? input.userId : undefined
+    if (identity.connectionId !== receipt.connectionId || targetId !== receipt.userId) {
       this.error(ws, 'invalid-state', input)
       return true
     }
@@ -253,9 +312,10 @@ export class CallSignaling {
     if (session === undefined || !this.reconcile(session, now)) {
       this.error(ws, 'ended', input)
     } else if (session.phase === 'ringing' && session.deadline !== undefined) {
+      const callee = session.participants[1]
       this.send(ws, {
         type: 'call', action: 'invited', callId: session.id, requestId: input.requestId,
-        peer: peer(session.participants[1]), expiresAt: session.deadline,
+        peer: callee === undefined ? undefined : peer(callee), expiresAt: session.deadline,
       })
     } else if (session.participants[0].binding?.connectionId === identity.connectionId) {
       this.sendStatus(ws, session, 0, 'status', input.requestId)
@@ -267,30 +327,55 @@ export class CallSignaling {
 
   private attending(ws: WebSocket, identity: Connection, input: Accept): Session | undefined {
     const session = this.kv.get<Session>(SESSION + input.callId)
-    if (!this.matches(session, identity) || session.participants[1].userId !== identity.userId) {
+    const joining = input.action === 'join'
+    if (joining && session === undefined) {
+      this.error(ws, 'ended', input)
+      return
+    }
+    if (!this.matches(session, identity)) {
+      this.error(ws, 'forbidden', input)
+      return
+    }
+    const [caller, callee] = session.participants
+    const eligible = joining ? session.publicInvite && caller.userId !== identity.userId
+      : !session.publicInvite && callee?.userId === identity.userId
+    if (!eligible) {
       this.error(ws, 'forbidden', input)
       return
     }
     if (session.phase !== 'ringing') {
-      if (session.participants[1].binding?.connectionId === identity.connectionId &&
+      if (callee?.binding?.connectionId === identity.connectionId &&
           this.reconcile(session, Date.now())) this.sendStatus(ws, session, 1)
       else this.error(ws, 'invalid-state', input)
       return
     }
-    if (!session.ringing.includes(identity.connectionId)) {
+    if (!joining && !session.ringing.includes(identity.connectionId)) {
       this.error(ws, 'forbidden', input)
       return
     }
-    return this.reconcile(session, Date.now()) ? session : undefined
+    const now = Date.now()
+    if (!this.reconcile(session, now)) {
+      if (joining) this.error(ws, 'ended', input)
+      return
+    }
+    if (joining && this.isBusy(identity.userId, now)) {
+      this.error(ws, 'busy', input)
+      return
+    }
+    return session
   }
 
   private async accept(ws: WebSocket, identity: Connection, input: Accept): Promise<void> {
     const ringing = this.attending(ws, identity, input)
     if (ringing === undefined) return
-    if (!await this.accountsCanCall(ringing.participants[0].userId, identity.userId)) {
+    const callerConnection = this.boundConnection(ringing.participants[0].binding)
+    if (callerConnection === undefined || !await this.accountsCanCall(callerConnection, identity)) {
       // 校验期间另一标签页可能已接听，保留已提交的决定。
       const current = this.attending(ws, identity, input)
-      if (current !== undefined) this.finish(current, 'disconnected')
+      if (current !== undefined) {
+        if (input.action === 'join') this.error(ws, 'unavailable', input)
+        else this.finish(current, 'disconnected')
+      }
       return
     }
     const callerToken = crypto.randomUUID()
@@ -299,28 +384,36 @@ export class CallSignaling {
     if (this.connection(ws) === undefined) return
     const session = this.attending(ws, identity, input)
     if (session === undefined) return
-    const [caller, callee] = session.participants
-    if (caller.binding === undefined) return
+    const [caller, invited] = session.participants
+    const binding = caller.binding
+    if (binding === undefined) return
+    const callee: Participant = invited ?? peer(identity)
 
     const otherTabs = this.ringingSockets(session).filter((socket) => socket !== ws)
     const expiresAt = Date.now() + CONNECT_MS
-    caller.binding.tokenDigest = callerDigest
-    callee.binding = bind(identity, calleeDigest)
-    session.phase = 'connecting'
-    session.deadline = expiresAt
-    session.ringing = []
-    this.save(session)
+    // 异步校验结束后重新读状态，紧接着同时写入第二位参与者和账号锁。
+    this.ctx.storage.transactionSync(() => {
+      binding.tokenDigest = callerDigest
+      callee.binding = bind(identity, calleeDigest)
+      session.participants[1] = callee
+      session.phase = 'connecting'
+      session.deadline = expiresAt
+      session.ringing = []
+      this.save(session)
+      if (session.publicInvite) this.kv.put(USER + identity.userId, session.id)
+    })
     this.sendTo(caller, {
       type: 'call', action: 'accepted', role: 'caller', callId: session.id,
-      resumeToken: callerToken, expiresAt,
+      resumeToken: callerToken, expiresAt, peer: peer(callee),
     })
     this.send(ws, {
       type: 'call', action: 'accepted', role: 'callee', callId: session.id,
-      resumeToken: calleeToken, expiresAt,
+      resumeToken: calleeToken, expiresAt, peer: peer(caller),
     })
     for (const tab of otherTabs) {
       this.send(tab, { type: 'call', action: 'ended', callId: session.id, reason: 'answered-elsewhere' })
     }
+    if (session.publicInvite) this.publishRoom(session.room)
   }
 
   private async resume(ws: WebSocket, identity: Connection, input: Resume): Promise<void> {
@@ -332,7 +425,9 @@ export class CallSignaling {
     }
     const index = session.participants[0].userId === identity.userId ? 0 : 1
     const participant = session.participants[index]
-    if (participant.userId !== identity.userId || participant.binding?.tokenDigest !== tokenDigest) {
+    const binding = participant?.binding
+    if (participant?.userId !== identity.userId || binding?.tokenDigest !== tokenDigest ||
+        (binding.sessionId !== undefined && binding.sessionId !== identity.sessionId)) {
       return this.error(ws, 'forbidden', input)
     }
     if (!this.reconcile(session, Date.now())) return this.error(ws, 'ended', input)
@@ -352,10 +447,10 @@ export class CallSignaling {
     const [caller, callee] = session.participants
     const index = caller.userId === identity.userId ? 0 : 1
     const participant = session.participants[index]
-    const isSelected = participant.userId === identity.userId &&
+    const isSelected = participant?.userId === identity.userId &&
       participant.binding?.connectionId === identity.connectionId
-    const canReject = input.action === 'reject' && session.phase === 'ringing' &&
-      callee.userId === identity.userId && session.ringing.includes(identity.connectionId)
+    const canReject = input.action === 'reject' && session.phase === 'ringing' && !session.publicInvite &&
+      callee?.userId === identity.userId && session.ringing.includes(identity.connectionId)
     if (!isSelected && !canReject) return this.error(ws, 'forbidden', input)
     if (!this.reconcile(session, Date.now())) return
 
@@ -368,7 +463,8 @@ export class CallSignaling {
         if (canReject) return this.finish(session, 'rejected')
         break
       case 'cancel':
-        if (index === 0 && session.phase === 'ringing') return this.finish(session, 'canceled')
+        // 发出取消时，另一位可能已经接受邀请，客户端尚未收到 accepted。
+        if (index === 0 && session.phase !== 'active') return this.finish(session, 'canceled')
         break
       case 'hangup':
         if (session.phase !== 'ringing') return this.finish(session, input.reason ?? 'hangup')
@@ -376,13 +472,14 @@ export class CallSignaling {
       case 'check':
         return this.sendStatus(ws, session, index)
       case 'media-ready':
-        if (session.phase !== 'connecting') break
+        if (session.phase !== 'connecting' || participant === undefined || callee === undefined) break
         if (participant.ready) return
         participant.ready = true
         this.save(session)
         if (caller.ready && callee.ready) this.sendBoth(session, { type: 'call', action: 'negotiate', callId: session.id })
         return
       case 'connected':
+        if (participant === undefined || callee === undefined) break
         if (participant.connected) return
         if (session.phase !== 'connecting' || !session.answerSent) break
         participant.connected = true
@@ -392,6 +489,7 @@ export class CallSignaling {
           this.save(session)
           console.info({ event: 'video_call_connected', room: session.room, callId: session.id })
           this.sendBoth(session, { type: 'call', action: 'active', callId: session.id })
+          this.publishRoom(session.room)
         } else {
           this.save(session)
         }
@@ -403,7 +501,7 @@ export class CallSignaling {
   private relay(
     ws: WebSocket, session: Session, index: 0 | 1, input: Extract<CallInput, { type: 'webrtc' }>,
   ): void {
-    if (session.phase === 'ringing' || !session.participants.every((participant) => participant.ready)) {
+    if (session.phase === 'ringing' || !session.participants.every((participant) => participant?.ready)) {
       return this.error(ws, 'invalid-state', input)
     }
     if (input.action === 'offer') {
@@ -429,17 +527,18 @@ export class CallSignaling {
         return this.end(session, session.phase === 'ringing' ? 'no-answer' : 'connection-timeout')
       }
       const calleePresent = session.phase === 'ringing'
-        ? this.ringingSockets(session).length > 0
-        : this.boundSocket(callee.binding) !== undefined
+        ? session.publicInvite || this.ringingSockets(session).length > 0
+        : this.boundSocket(callee?.binding) !== undefined
       if (this.boundSocket(caller.binding) === undefined || !calleePresent) {
         return this.end(session, 'disconnected')
       }
       return true
     }
 
+    if (callee === undefined) return this.end(session, 'disconnected')
     let changed = false
     for (const participant of session.participants) {
-      const binding = participant.binding
+      const binding = participant?.binding
       if (binding === undefined) return this.end(session, 'disconnected')
       if (binding.reconnectBy === undefined && this.boundSocket(binding) === undefined) {
         binding.reconnectBy = Math.min(now, binding.expiresAt) + RESUME_MS
@@ -466,6 +565,7 @@ export class CallSignaling {
     this.ctx.storage.transactionSync(() => {
       this.kv.delete(SESSION + session.id)
       for (const participant of session.participants) {
+        if (participant === undefined) continue
         const key = USER + participant.userId
         if (this.kv.get<string>(key) === session.id) this.kv.delete(key)
       }
@@ -475,6 +575,7 @@ export class CallSignaling {
     const event = { type: 'call', action: 'ended', callId: session.id, reason } as const
     this.sendBoth(session, event)
     for (const ws of this.ringingSockets(session)) this.send(ws, event)
+    if (session.publicInvite || session.phase === 'active') this.publishRoom(session.room)
   }
 
   private matches(session: Session | undefined, identity: Connection): session is Session {
@@ -501,7 +602,8 @@ export class CallSignaling {
     let next = Infinity
     for (const [, session] of this.kv.list<Session>({ prefix: SESSION })) {
       next = Math.min(next, session.deadline ?? Infinity)
-      for (const { binding } of session.participants) {
+      for (const participant of session.participants) {
+        const binding = participant?.binding
         if (binding !== undefined) next = Math.min(next, binding.reconnectBy ?? binding.expiresAt)
       }
     }
@@ -527,8 +629,9 @@ export class CallSignaling {
   private connection(ws: WebSocket): Connection | undefined {
     if (ws.readyState !== WebSocket.OPEN || this.departed.has(ws)) return
     const identity = ws.deserializeAttachment() as SocketAttachment | null
-    if (identity?.connectionId === undefined || !(identity.exp * 1000 > Date.now())) return
-    return { ...identity, connectionId: identity.connectionId }
+    if (identity?.connectionId === undefined || typeof identity.sessionId !== 'string' ||
+        !(identity.exp * 1000 > Date.now())) return
+    return { ...identity, connectionId: identity.connectionId, sessionId: identity.sessionId }
   }
 
   private callableSockets(userId: string, room: string): { ws: WebSocket; identity: Connection }[] {
@@ -552,6 +655,17 @@ export class CallSignaling {
     return this.socketById(binding.connectionId)
   }
 
+  private boundConnection(binding: Binding | undefined): Connection | undefined {
+    const socket = this.boundSocket(binding)
+    return socket === undefined ? undefined : this.connection(socket)
+  }
+
+  private participantAccount(participant: Participant | undefined): CallAccount | undefined {
+    if (participant === undefined) return
+    const sessionId = participant.binding?.sessionId ?? this.boundConnection(participant.binding)?.sessionId
+    return sessionId === undefined ? undefined : { userId: participant.userId, sessionId }
+  }
+
   private ringingSockets(session: Session): WebSocket[] {
     const sockets: WebSocket[] = []
     for (const id of session.ringing) {
@@ -561,8 +675,8 @@ export class CallSignaling {
     return sockets
   }
 
-  private sendTo(participant: Participant, event: CallEvent): void {
-    const ws = this.boundSocket(participant.binding)
+  private sendTo(participant: Participant | undefined, event: CallEvent): void {
+    const ws = this.boundSocket(participant?.binding)
     if (ws !== undefined) this.send(ws, event)
   }
 
@@ -572,7 +686,7 @@ export class CallSignaling {
 
   private sendStatusToPeer(session: Session, index: 0 | 1): void {
     const opposite = index === 0 ? 1 : 0
-    const ws = this.boundSocket(session.participants[opposite].binding)
+    const ws = this.boundSocket(session.participants[opposite]?.binding)
     if (ws !== undefined) this.sendStatus(ws, session, opposite)
   }
 
@@ -582,13 +696,17 @@ export class CallSignaling {
   ): void {
     this.send(ws, {
       type: 'call', action, callId: session.id, phase: session.phase, requestId,
-      peerReconnecting: session.participants[index === 0 ? 1 : 0].binding?.reconnectBy !== undefined,
+      peerReconnecting: session.participants[index === 0 ? 1 : 0]?.binding?.reconnectBy !== undefined,
     })
   }
 
   private send(ws: WebSocket, event: CallEvent): void {
+    this.sendJson(ws, JSON.stringify(event))
+  }
+
+  private sendJson(ws: WebSocket, json: string): void {
     try {
-      ws.send(JSON.stringify(event))
+      ws.send(json)
     } catch {
       // 连接关闭后的清理由 departure 或 Alarm 处理。
     }
@@ -602,14 +720,16 @@ export class CallSignaling {
     })
   }
 
-  private async accountsCanCall(caller: string, callee: string): Promise<boolean> {
+  private async accountsCanCall(caller: CallAccount, callee?: CallAccount): Promise<boolean> {
     const now = Date.now()
     const { results } = await this.db.prepare(
       `SELECT u.id FROM users AS u
        WHERE u.id IN (?1, ?2) AND (u.mutedUntil IS NULL OR u.mutedUntil <= ?3)
-         AND EXISTS (SELECT 1 FROM user_sessions WHERE userId = u.id AND expiresAt >= ?4)`,
-    ).bind(caller, callee, now, Math.floor(now / 1000)).all<{ id: string }>()
-    return results.length === 2
+         AND EXISTS (SELECT 1 FROM user_sessions WHERE userId = u.id AND expiresAt >= ?4
+           AND sessionId = CASE WHEN u.id = ?1 THEN ?5 ELSE ?6 END)`,
+    ).bind(caller.userId, callee?.userId ?? null, now, Math.floor(now / 1000), caller.sessionId,
+      callee?.sessionId ?? null).all<{ id: string }>()
+    return results.length === (callee === undefined ? 1 : 2)
   }
 
   private getTemporary<T>(key: string, now: number): T | undefined {
